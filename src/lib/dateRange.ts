@@ -162,7 +162,7 @@ export function addZonedDays(iso: string, days: number): string {
   return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
 }
 
-function endOfZonedDay(iso: string, timeZone: string): Date {
+export function endOfZonedDay(iso: string, timeZone: string): Date {
   const [y, m, d] = iso.split("-").map(Number);
   return zonedTimeToUtc(y!, m!, d!, 23, 59, 59, 999, timeZone);
 }

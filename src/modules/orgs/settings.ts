@@ -78,6 +78,13 @@ export const orgSettingsSchema = z
       .strict()
       .nullable(),
 
+    // P5.3 (§20.14). The month the financial year starts in, 1-12. An Indian
+    // company reports April-March, and a report that silently used the
+    // calendar year would put Q4 in the wrong year for every customer this
+    // product is built for. Stored as a number rather than a date because it
+    // is a recurring boundary, not an instant.
+    fiscalYearStartMonth: z.number().int().min(1).max(12).nullable(),
+
     // P5.2 (§22). Above this, an action stops being housekeeping and becomes
     // a decision that needs a second pair of eyes. Configurable because
     // "material" is a fact about the business — a ₹25,000 default is right

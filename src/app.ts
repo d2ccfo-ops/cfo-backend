@@ -39,6 +39,7 @@ import { anomaliesRouter } from "./routes/anomalies.js";
 import { approvalsRouter } from "./routes/approvals.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { reconciliationRouter } from "./routes/reconciliation.js";
+import { reportsRouter } from "./routes/reports.js";
 import { settlementsRouter } from "./routes/settlements.js";
 import { clerkWebhookRouter } from "./routes/webhooks/clerk.js";
 import { clickpostWebhookRouter } from "./routes/webhooks/clickpost.js";
@@ -119,6 +120,7 @@ export function createApp() {
   app.use("/preferences", preferencesRouter);
   app.use("/legal-entities", legalEntitiesRouter);
   app.use("/reconciliation", reconciliationRouter);
+  app.use("/reports", reportsRouter);
   app.use("/settlements", settlementsRouter);
   app.use("/connections/shopify", shopifyConnectionRouter);
   app.use("/connections/razorpay", razorpayConnectionRouter);
