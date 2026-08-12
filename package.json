@@ -10,6 +10,9 @@
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run && tsc --noEmit",
+    "test:watch": "vitest",
+    "check:integration": "for f in scripts/check*.ts; do echo \"--- $f ---\"; npx tsx \"$f\" || exit 1; done",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio"
@@ -40,6 +43,7 @@
     "pino-pretty": "^13.0.0",
     "prisma": "^6.2.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.10"
   }
 }
