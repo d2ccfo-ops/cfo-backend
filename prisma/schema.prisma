@@ -1330,6 +1330,40 @@ model AgentRun {
   @@map("agent_runs")
 }
 
+// P4.5. One AI-written narrative per organisation per day.
+//
+// Stored rather than generated on request for two reasons that both come down
+// to the same thing — a brief is a shared artefact. Two people opening the
+// same morning's brief must read the same explanation of the same numbers, and
+// a founder who screenshots it must be able to point at what was said. A
+// narrative regenerated per page load is neither.
+//
+// A null narrative with a reason is a normal, expected row: "nothing moved",
+// "no snapshot history yet", "the narrative was discarded because it contained
+// a figure the snapshot did not produce". Those are answers, and recording
+// them stops the sweep retrying a question that already resolved.
+model AiDailyBrief {
+  id             String   @id @default(cuid())
+  organizationId String
+  // Day key in the organisation's timezone, YYYY-MM-DD. Not a DateTime: the
+  // brief is about a calendar day in Asia/Kolkata, and an instant would shift
+  // it by 5.5 hours on any server that thinks in UTC.
+  day            String
+  narrative      Json?
+  reason         String?
+  // How many figures the P4.7 harness checked before this was stored. Shown
+  // in the UI so it can say the figures were checked rather than assert it.
+  figuresChecked Int      @default(0)
+  model          String?
+  version        String   @default("v1")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, day])
+  @@index([organizationId, day])
+  @@map("ai_daily_briefs")
+}
+
 model AgentToolCall {
   id        String   @id @default(cuid())
   runId     String

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
+import { generateDailyBrief, readDailyBrief } from "../modules/ai/dailyBrief.js";
 import { ask, isAiConfigured } from "../modules/ai/orchestrator.js";
 import { TOOLS } from "../modules/ai/tools.js";
 
@@ -150,4 +151,28 @@ aiRouter.get("/conversations/:id", ...requireAuth, async (req, res) => {
       })),
     })),
   });
+});
+
+// ---------------------------------------------------------------------------
+// P4.5 daily brief narrative
+// ---------------------------------------------------------------------------
+// GET reads what the nightly sweep wrote. It never generates: a page load that
+// could trigger a model call would mean the first person in each morning waits
+// for one, and two people opening the brief before it was stored could read
+// two different explanations of the same numbers.
+aiRouter.get("/daily-brief", ...requireAuth, async (req, res) => {
+  res.json(await readDailyBrief(req.auth!.organizationId));
+});
+
+// The explicit "write it now" path, for the morning the sweep did not run.
+// POST, not GET, because it costs a model call and mutates a stored artefact.
+aiRouter.post("/daily-brief/generate", ...requireAuth, async (req, res, next) => {
+  let force = false;
+  try {
+    force = z.object({ force: z.boolean().optional() }).strict().parse(req.body ?? {}).force ?? false;
+  } catch (err) {
+    next(err);
+    return;
+  }
+  res.json(await generateDailyBrief(req.auth!.organizationId, new Date(), force));
 });

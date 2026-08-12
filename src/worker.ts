@@ -1,6 +1,7 @@
 import { logger } from "./lib/logger.js";
 import { prisma } from "./lib/prisma.js";
 import { redisConnection } from "./lib/redis.js";
+import { aiBriefSchedulerQueue, startAiBriefScheduler } from "./modules/queue/aiBriefScheduler.js";
 import { anomalySchedulerQueue, startAnomalyScheduler } from "./modules/queue/anomalyScheduler.js";
 import { notificationSchedulerQueue, startNotificationScheduler } from "./modules/queue/notificationScheduler.js";
 import { snapshotSchedulerQueue, startSnapshotScheduler } from "./modules/queue/snapshotScheduler.js";
@@ -35,6 +36,10 @@ const snapshotScheduler = startSnapshotScheduler();
 // CRITICAL open anomaly, so going first would notify about yesterday's
 // findings and miss tonight's.
 const notificationScheduler = startNotificationScheduler();
+// P4.5's narrative, last in the chain at 02:35. It describes the diff the
+// snapshot capture wrote thirty minutes earlier, so running it any earlier
+// would have it describe the day before yesterday while claiming yesterday.
+const aiBriefScheduler = startAiBriefScheduler();
 
 // Re-entrancy guard. Without it a second signal — or the same signal delivered
 // to both the `tsx watch` wrapper and this child, which is what happens on
@@ -59,6 +64,8 @@ async function shutdown(signal: string) {
     await snapshotSchedulerQueue.close();
     await notificationScheduler.close();
     await notificationSchedulerQueue.close();
+    await aiBriefScheduler.close();
+    await aiBriefSchedulerQueue.close();
     await worker.close();
     await redisConnection.quit();
     await prisma.$disconnect();
