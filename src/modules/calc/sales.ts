@@ -1,4 +1,5 @@
 import { resolveDateRange, shouldPersistSnapshot, type ResolvedRange } from "../../lib/dateRange.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import { getRevenueLadder } from "./revenueLadder.js";
 import { persistSnapshot } from "./snapshots.js";
 
@@ -40,9 +41,12 @@ const FORMULA_VERSION = "v3";
 
 export async function getSalesSummary(
   organizationId: string,
-  range: ResolvedRange = resolveDateRange({})
+  range: ResolvedRange = resolveDateRange({}),
+  // §12.2 (P5.6). Null means the whole organisation, which is what every
+  // caller passed before this existed and remains the default.
+  scope: EntityScope | null = null
 ) {
-  const ladder = await getRevenueLadder(organizationId, range);
+  const ladder = await getRevenueLadder(organizationId, range, scope);
 
   const gmv = ladder.ladder.gmv;
   const orders = ladder.orders;

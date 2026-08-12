@@ -1,4 +1,5 @@
 import { resolveDateRange, shouldPersistSnapshot, type ResolvedRange } from "../../lib/dateRange.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import { prisma } from "../../lib/prisma.js";
 import type { ShipmentStatus } from "@prisma/client";
 
@@ -48,19 +49,22 @@ function dispatchWindow(start: Date, end: Date) {
 
 export async function getRtoRateSummary(
   organizationId: string,
-  range: ResolvedRange = resolveDateRange({})
+  range: ResolvedRange = resolveDateRange({}),
+  // §12.2 (P5.6). Null means the whole organisation, which is what every
+  // caller passed before this existed and remains the default.
+  scope: EntityScope | null = null
 ) {
   const periodStart = range.from;
   const periodEnd = range.to;
 
   const [currentShipments, priorShipments] = await Promise.all([
     prisma.shipment.findMany({
-      where: { organizationId, status: { in: DISPATCHED_STATUSES }, ...dispatchWindow(periodStart, periodEnd) },
+      where: { ...scopeWhere(organizationId, scope), status: { in: DISPATCHED_STATUSES }, ...dispatchWindow(periodStart, periodEnd) },
       select: { status: true, pickedUpAt: true },
     }),
     prisma.shipment.findMany({
       where: {
-        organizationId,
+        ...scopeWhere(organizationId, scope),
         status: { in: DISPATCHED_STATUSES },
         ...dispatchWindow(range.priorFrom, range.priorTo),
       },

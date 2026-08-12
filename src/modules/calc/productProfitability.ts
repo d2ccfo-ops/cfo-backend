@@ -1,4 +1,5 @@
 import { resolveDateRange, type ResolvedRange, describeRange } from "../../lib/dateRange.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import { prisma } from "../../lib/prisma.js";
 import { paiseToRupees } from "./money.js";
 
@@ -46,11 +47,13 @@ function allocateByRevenue(total: bigint, lineValues: bigint[]): bigint[] {
 export async function getProductProfitability(
   organizationId: string,
   range: ResolvedRange = resolveDateRange({}),
-  limit = 10
+  limit = 10,
+  // §12.2 (P5.6). Null means the whole organisation.
+  scope: EntityScope | null = null
 ) {
   const orders = await prisma.order.findMany({
     where: {
-      organizationId,
+      ...scopeWhere(organizationId, scope),
       placedAt: { gte: range.from, lte: range.to },
       // §16 — cancelled orders contribute neither revenue nor cost.
       cancelledAt: null,

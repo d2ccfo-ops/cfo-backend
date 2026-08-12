@@ -1,4 +1,5 @@
 import { resolveDateRange, type ResolvedRange, describeRange } from "../../lib/dateRange.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import { prisma } from "../../lib/prisma.js";
 import { paiseToRupees, sumPaise } from "./money.js";
 import { getRevenueLadder } from "./revenueLadder.js";
@@ -47,14 +48,17 @@ interface Layer {
 
 export async function getContributionMargin(
   organizationId: string,
-  range: ResolvedRange = resolveDateRange({})
+  range: ResolvedRange = resolveDateRange({}),
+  // §12.2 (P5.6). Null means the whole organisation, which is what every
+  // caller passed before this existed and remains the default.
+  scope: EntityScope | null = null
 ) {
   const [ladder, lineItems, shipments, adSpend, payments] = await Promise.all([
-    getRevenueLadder(organizationId, range),
+    getRevenueLadder(organizationId, range, scope),
     prisma.orderLineItem.findMany({
       where: {
         order: {
-          organizationId,
+          ...scopeWhere(organizationId, scope),
           placedAt: { gte: range.from, lte: range.to },
           // §16: a cancelled order recognises neither revenue nor COGS, so its
           // lines must not appear in the cost side either.

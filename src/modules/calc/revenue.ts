@@ -1,4 +1,5 @@
 import { resolveDateRange, shouldPersistSnapshot, type ResolvedRange } from "../../lib/dateRange.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import { prisma } from "../../lib/prisma.js";
 import { paiseToRupees, sumPaise } from "./money.js";
 
@@ -60,7 +61,10 @@ function netRevenueOf(orders: RevenueOrder[]) {
 
 export async function getNetRevenueSummary(
   organizationId: string,
-  range: ResolvedRange = resolveDateRange({})
+  range: ResolvedRange = resolveDateRange({}),
+  // §12.2 (P5.6). Null means the whole organisation, which is what every
+  // caller passed before this existed and remains the default.
+  scope: EntityScope | null = null
 ) {
   const now = new Date();
   const periodStart = range.from;
@@ -68,11 +72,11 @@ export async function getNetRevenueSummary(
 
   const [currentOrders, priorOrders] = await Promise.all([
     prisma.order.findMany({
-      where: { organizationId, placedAt: { gte: periodStart, lte: periodEnd } },
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: periodStart, lte: periodEnd } },
       select: { grossAmount: true, taxAmount: true, refundedAmount: true, cancelledAt: true },
     }),
     prisma.order.findMany({
-      where: { organizationId, placedAt: { gte: range.priorFrom, lte: range.priorTo } },
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.priorFrom, lte: range.priorTo } },
       select: { grossAmount: true, taxAmount: true, refundedAmount: true, cancelledAt: true },
     }),
   ]);

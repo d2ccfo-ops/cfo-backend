@@ -1,4 +1,5 @@
 import { DEFAULT_TIMEZONE, resolveDateRange, type ResolvedRange, describeRange } from "../../lib/dateRange.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import {
   MAX_SPAN_DAYS,
   MIN_SPAN_DAYS,
@@ -334,15 +335,18 @@ function completeness(s: ReturnType<typeof summarise>) {
 
 export async function getRevenueLadder(
   organizationId: string,
-  range: ResolvedRange = resolveDateRange({})
+  range: ResolvedRange = resolveDateRange({}),
+  // §12.2 (P5.6). Null means the whole organisation, which is what every
+  // caller passed before this existed and remains the default.
+  scope: EntityScope | null = null
 ) {
   const [currentOrders, priorOrders] = await Promise.all([
     prisma.order.findMany({
-      where: { organizationId, placedAt: { gte: range.from, lte: range.to } },
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.from, lte: range.to } },
       select: ORDER_SELECT,
     }),
     prisma.order.findMany({
-      where: { organizationId, placedAt: { gte: range.priorFrom, lte: range.priorTo } },
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.priorFrom, lte: range.priorTo } },
       select: ORDER_SELECT,
     }),
   ]);
@@ -568,13 +572,13 @@ export async function getRevenueLadder(
 // same orders by week and then by day. Re-bucketing on the server, through this
 // one function, is what stops a zoomed-in day from summing differently to the
 // month that contains it.
-export async function getRevenueTrend(organizationId: string, window?: TrendWindow) {
+export async function getRevenueTrend(organizationId: string, window?: TrendWindow, scope: EntityScope | null = null) {
   const w = window ?? resolveTrendWindow({}, new Date(), DEFAULT_TIMEZONE);
   const { from, to, granularity, timeZone } = w;
 
   const [orders, credits, bankConnections, earliestCredit, earliestOrder] = await Promise.all([
     prisma.order.findMany({
-      where: { organizationId, placedAt: { gte: from, lte: to } },
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: from, lte: to } },
       select: { ...ORDER_SELECT, placedAt: true },
     }),
     prisma.bankTransaction.findMany({
