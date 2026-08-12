@@ -1,4 +1,4 @@
-import type { CostSource } from "@prisma/client";
+import { Prisma, type CostSource } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 
 // §19 COGS. Two rules, and both matter:
@@ -158,6 +158,21 @@ export async function getCostCoverage(organizationId: string) {
     select: { sku: true, totalAmount: true, cogsAmount: true, quantity: true },
   });
 
+  // Whose numbers are these? Coverage alone said "94.7% costed" while every
+  // one of those costs was a fabricated placeholder — the single most
+  // misleading thing this endpoint could do. Counted on each SKU's LATEST
+  // cost row (a SKU upgraded from ESTIMATED to a real source counts as real).
+  const sourceRows = await prisma.$queryRaw<Array<{ source: string; count: number }>>(Prisma.sql`
+    SELECT source, count(*)::int AS count FROM (
+      SELECT DISTINCT ON (sku) sku, source
+      FROM product_costs
+      WHERE "organizationId" = ${organizationId}
+      ORDER BY sku, "effectiveFrom" DESC
+    ) latest
+    GROUP BY source`);
+  const estimatedSkuCount = sourceRows.find((r) => r.source === "ESTIMATED")?.count ?? 0;
+  const costedSkuCount = sourceRows.reduce((n, r) => n + r.count, 0);
+
   let costedLines = 0;
   let costedValue = 0n;
   let totalValue = 0n;
@@ -198,5 +213,10 @@ export async function getCostCoverage(organizationId: string) {
     // reach zero — and it would disagree with the /costs/skus table by one.
     missingSkuCount: [...missing.keys()].filter((k) => k !== "(no SKU)").length,
     uncostableLineCount: missing.get("(no SKU)")?.lines ?? 0,
+    // Source honesty: how many costed SKUs rest on a placeholder vs a number
+    // someone actually entered. estimated === costed means every margin the
+    // app shows is an estimate end to end.
+    costedSkuCount,
+    estimatedSkuCount,
   };
 }
