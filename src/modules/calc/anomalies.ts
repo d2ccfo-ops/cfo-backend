@@ -1,5 +1,6 @@
 import type { AnomalySeverity, AnomalyType, Prisma } from "@prisma/client";
 import { DEFAULT_TIMEZONE, addZonedDays, resolveDateRange, zonedDayKey, type ResolvedRange } from "../../lib/dateRange.js";
+import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { getOrgSettings } from "../orgs/settings.js";
 import { getAdSpendSummary } from "./ads.js";
@@ -36,6 +37,14 @@ import { getRtoRateSummary } from "./shipments.js";
 // lists anomaly TYPES but no numbers (§17).
 
 const TRAILING_WINDOW_DAYS = 28;
+
+// Rupee subtraction on two paiseToRupees() results produces float artifacts
+// (12345.67 - 12325.67 = 20.000000000000004), and observedValue/expectedValue/
+// difference are rendered directly by the Exceptions page. Rounded to paise —
+// the smallest unit that exists — so nothing is lost and nothing leaks.
+function rupees2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
 
 export interface AnomalyCandidate {
   type: AnomalyType;
@@ -94,7 +103,7 @@ export function decideRevenueChange(summary: {
       severity: "CRITICAL",
       observedValue: summary.value,
       expectedValue: summary.priorValue,
-      difference: summary.value - summary.priorValue,
+      difference: rupees2(summary.value - summary.priorValue),
       evidence: { changePct: summary.changePct, valueMinor: summary.valueMinor, priorValueMinor: summary.priorValueMinor },
       recommendedInvestigation: "Check for a channel outage, a paused ad campaign, a stockout on a top SKU, or a checkout/payment failure in the last 28 days.",
     };
@@ -105,7 +114,7 @@ export function decideRevenueChange(summary: {
       severity: "INFO",
       observedValue: summary.value,
       expectedValue: summary.priorValue,
-      difference: summary.value - summary.priorValue,
+      difference: rupees2(summary.value - summary.priorValue),
       evidence: { changePct: summary.changePct, valueMinor: summary.valueMinor, priorValueMinor: summary.priorValueMinor },
       recommendedInvestigation: "Confirm this is real demand (a launch, a sale, a viral moment) and not a duplicate order import or a sync running twice.",
     };
@@ -140,7 +149,7 @@ export function decideAdSpendSpike(summary: {
     severity: "WARNING",
     observedValue: summary.value,
     expectedValue: summary.priorValue,
-    difference: summary.value - summary.priorValue,
+    difference: rupees2(summary.value - summary.priorValue),
     evidence: { changePct: summary.changePct, valueMinor: summary.valueMinor, priorValueMinor: summary.priorValueMinor, currency: summary.currency },
     recommendedInvestigation: "Check the ad platform for a budget cap that was raised, a new campaign left on auto-bid, or an accidental duplicate campaign.",
   };
@@ -263,7 +272,7 @@ export function decideCourierCostIncrease(input: {
     severity: "WARNING",
     observedValue: current,
     expectedValue: prior,
-    difference: current - prior,
+    difference: rupees2(current - prior),
     evidence: {
       changePct: Math.round(changePct * 10) / 10,
       currentPaise: input.currentPaise.toString(),
@@ -315,7 +324,7 @@ export function decideNegativeMarginSkus(
     difference: negative.length,
     evidence: {
       skus: negative.map((p) => ({ sku: p.sku, productName: p.productName, cm0: p.cm0, cm0Pct: p.cm0Pct, netRevenue: p.netRevenue })),
-      totalNegativeCm0,
+      totalNegativeCm0: rupees2(totalNegativeCm0),
       worst: { sku: worst.sku, productName: worst.productName, cm0Pct: worst.cm0Pct },
     },
     recommendedInvestigation: `Review pricing or landed cost for ${worst.productName} (${worst.sku}) first — it has the worst margin of ${negative.length} product${negative.length === 1 ? "" : "s"} currently selling below cost.`,
@@ -344,14 +353,20 @@ export function decideMissingSettlement(input: {
   // jitter once the multiplier is applied to a near-zero baseline.
   const baseline = Math.max(input.baselineGapDays, 1);
   if (input.daysSinceLast < baseline * 2) return null;
+  // Rounded for STORAGE, not just for the sentence: these two are what the
+  // Exceptions page renders as observed-vs-expected, and a card reading
+  // "5.770833321759259 days" is the kind of raw-float leak that makes a
+  // number look computed-at rather than reported.
+  const observed = Math.round(input.daysSinceLast * 10) / 10;
+  const expected = Math.round(baseline * 10) / 10;
   return {
     type: "MISSING_SETTLEMENT",
     severity: "WARNING",
-    observedValue: input.daysSinceLast,
-    expectedValue: baseline,
-    difference: input.daysSinceLast - baseline,
-    evidence: { connectionId: input.connectionId, label: input.label, baselineGapDays: baseline },
-    recommendedInvestigation: `${input.label} has gone ${input.daysSinceLast} days without a settlement, against a typical gap of ${baseline} — check the gateway dashboard for a payout hold, a KYC flag, or a bank-account mismatch.`,
+    observedValue: observed,
+    expectedValue: expected,
+    difference: Math.round((input.daysSinceLast - baseline) * 10) / 10,
+    evidence: { connectionId: input.connectionId, label: input.label, baselineGapDays: expected },
+    recommendedInvestigation: `${input.label} has gone ${observed} days without a settlement, against a typical gap of ${expected} — check the gateway dashboard for a payout hold, a KYC flag, or a bank-account mismatch.`,
   };
 }
 
@@ -532,7 +547,7 @@ export function decideCashBelowThreshold(input: {
     severity: "CRITICAL",
     observedValue: current,
     expectedValue: threshold,
-    difference: current - threshold,
+    difference: rupees2(current - threshold),
     evidence: { currentPaise: input.currentPaise.toString(), thresholdPaise: input.thresholdPaise.toString() },
     recommendedInvestigation: "Review the cash forecast for upcoming outflows (vendor bills, payroll, ad spend) against expected inflows before committing to new spend.",
   };
@@ -622,4 +637,54 @@ export async function runAnomalyRules(organizationId: string, now: Date = new Da
   }
 
   return { organizationId, ranAt: now, periodStart: range.from, periodEnd: range.to, created, updated, candidates };
+}
+
+// ---------------------------------------------------------------------------
+// The all-organisations sweep the nightly job runs
+// ---------------------------------------------------------------------------
+//
+// Lives HERE, not in modules/queue/anomalyScheduler.ts beside the job that
+// calls it, for the reason syncCadence.ts's header already spells out: the
+// scheduler constructs a BullMQ Queue at module scope, so importing it to
+// reach this function opens a Redis connection and keeps the process alive
+// forever. A check script that only wants to run the sweep and exit would
+// hang — verified directly, which is how this ended up in the right place.
+// Same split, same reason: logic that can be imported and reasoned about
+// without infrastructure stays out of the module that owns infrastructure.
+
+export interface AnomalySweepResult {
+  organizations: number;
+  ran: number;
+  failed: number;
+  created: number;
+  updated: number;
+}
+
+export async function runAnomalySweep(now: Date = new Date()): Promise<AnomalySweepResult> {
+  const organizations = await prisma.organization.findMany({ select: { id: true } });
+
+  const result: AnomalySweepResult = {
+    organizations: organizations.length,
+    ran: 0,
+    failed: 0,
+    created: 0,
+    updated: 0,
+  };
+
+  for (const org of organizations) {
+    try {
+      const run = await runAnomalyRules(org.id, now);
+      result.ran += 1;
+      result.created += run.created;
+      result.updated += run.updated;
+    } catch (err) {
+      // One organisation's failure must not abandon the rest of the sweep —
+      // the whole point is that this runs unattended, and a single org with
+      // malformed data should not cost every other org its nightly check.
+      result.failed += 1;
+      logger.error({ err, organizationId: org.id }, "anomaly_sweep_org_failed");
+    }
+  }
+
+  return result;
 }

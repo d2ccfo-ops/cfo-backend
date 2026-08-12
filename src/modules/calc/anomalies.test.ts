@@ -145,6 +145,20 @@ describe("decideMissingSettlement", () => {
     // baseline 0.1 days * 2 would be 0.2 — flooring to 1 means daysSinceLast must clear 2, not 0.2
     expect(decideMissingSettlement({ connectionId: "c1", label: "RAZORPAY", gapDays: 0.1, baselineGapDays: 0.1, daysSinceLast: 1.5 })).toBeNull();
   });
+
+  it("rounds the day counts it stores and renders — a raw float leaks into the UI", () => {
+    const r = decideMissingSettlement({
+      connectionId: "c1",
+      label: "GOKWIK",
+      gapDays: 1,
+      baselineGapDays: 1.002777777777778,
+      daysSinceLast: 5.770833321759259,
+    });
+    expect(r?.observedValue).toBe(5.8);
+    expect(r?.expectedValue).toBe(1);
+    expect(r?.recommendedInvestigation).toContain("5.8 days");
+    expect(r?.recommendedInvestigation).not.toContain("5.770833");
+  });
 });
 
 describe("decideDuplicatePayments", () => {

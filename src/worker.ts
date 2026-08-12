@@ -1,6 +1,7 @@
 import { logger } from "./lib/logger.js";
 import { prisma } from "./lib/prisma.js";
 import { redisConnection } from "./lib/redis.js";
+import { anomalySchedulerQueue, startAnomalyScheduler } from "./modules/queue/anomalyScheduler.js";
 import { startSyncScheduler, syncSchedulerQueue } from "./modules/queue/syncScheduler.js";
 import { startSyncWorker } from "./modules/queue/syncWorker.js";
 
@@ -19,6 +20,10 @@ const worker = startSyncWorker();
 // zero or crash without stopping the clock, and the sweep only ever talks to
 // Postgres and Redis — exactly what this process already does.
 const scheduler = startSyncScheduler();
+// §17's nightly anomaly pass, here for the same reason — it only talks to
+// Postgres and Redis, and the clock should not stop because the API tier is
+// being restarted or scaled to zero.
+const anomalyScheduler = startAnomalyScheduler();
 
 // Re-entrancy guard. Without it a second signal — or the same signal delivered
 // to both the `tsx watch` wrapper and this child, which is what happens on
@@ -33,10 +38,12 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   logger.info({ signal }, "sync_worker_shutting_down");
   try {
-    // Closed before the connections they use. The scheduler goes first so no
+    // Closed before the connections they use. The schedulers go first so no
     // new sweep can enqueue work into a queue that is about to disappear.
     await scheduler.close();
     await syncSchedulerQueue.close();
+    await anomalyScheduler.close();
+    await anomalySchedulerQueue.close();
     await worker.close();
     await redisConnection.quit();
     await prisma.$disconnect();

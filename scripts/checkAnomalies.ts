@@ -1,6 +1,12 @@
+import { readFile } from "node:fs/promises";
 import { zonedDayKey } from "../src/lib/dateRange.js";
 import { prisma } from "../src/lib/prisma.js";
-import { runAnomalyRules } from "../src/modules/calc/anomalies.js";
+// runAnomalySweep comes from the calc module, NOT from
+// modules/queue/anomalyScheduler.ts — that file builds a BullMQ Queue at
+// module scope, and importing it here would open a Redis connection this
+// script never closes, so the process would never exit. Same trap
+// syncCadence.ts documents.
+import { runAnomalyRules, runAnomalySweep } from "../src/modules/calc/anomalies.js";
 import { findDemoOrg } from "./lib/demoOrg.js";
 
 // P2.1 anomaly engine, against the DEMO org's real generated year of data —
@@ -110,6 +116,65 @@ async function main() {
   if (newIds.length > 0) {
     await prisma.anomaly.deleteMany({ where: { id: { in: newIds } } });
   }
+
+  console.log("\n[6] the nightly sweep covers every organisation, not just the demo one");
+  const orgCount = await prisma.organization.count();
+  // This writes REAL findings for REAL orgs — which is the point, not a side
+  // effect: it is exactly what the nightly job does in production, over each
+  // org's own real data. Nothing fabricated is inserted anywhere (cf. the
+  // DEMO-org-only rule, which governs generated DATA, not computed findings).
+  const sweep = await runAnomalySweep(now);
+  ok("sweep considered every organisation", sweep.organizations === orgCount, `${sweep.organizations} vs ${orgCount} orgs`);
+  ok("every organisation ran without throwing", sweep.failed === 0, `failed=${sweep.failed}`);
+  console.log(`  first sweep: ran=${sweep.ran} created=${sweep.created} updated=${sweep.updated}`);
+  // The idempotency claim has to be tested against the sweep's OWN prior
+  // state, not against whatever the earlier single-org steps left behind —
+  // the first sweep legitimately creates rows for the other 8 orgs, which
+  // steps [1]-[5] never touched.
+  const sweepAgain = await runAnomalySweep(now);
+  ok("an immediate second sweep creates nothing new (dedupeKey holds across every org)", sweepAgain.created === 0, `created=${sweepAgain.created}`);
+  ok("...and re-evaluates the same findings instead of skipping them", sweepAgain.updated === sweep.created + sweep.updated, `updated=${sweepAgain.updated}`);
+
+  // The shapes GET /anomalies depends on, exercised directly — same posture
+  // as checkReconciliation.ts's "the SQL shapes the route depends on". The
+  // route itself is a thin wrapper over these, and there is no Clerk session
+  // to make a real authenticated HTTP request with from a script.
+  console.log("\n[7] the query shapes GET /anomalies depends on");
+  const openPage = await prisma.anomaly.findMany({
+    where: { organizationId: org.id, status: "OPEN" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: 51,
+  });
+  ok("the default OPEN filter returns only OPEN rows", openPage.every((a) => a.status === "OPEN"), `${openPage.length} rows`);
+  const byStatus = await prisma.anomaly.groupBy({ by: ["status"], where: { organizationId: org.id }, _count: { _all: true } });
+  const statusTotal = byStatus.reduce((sum, r) => sum + r._count._all, 0);
+  const allForOrg = await prisma.anomaly.count({ where: { organizationId: org.id } });
+  ok("the status counts sum to the org's total", statusTotal === allForOrg, `${statusTotal} vs ${allForOrg}`);
+  const bySeverity = await prisma.anomaly.groupBy({ by: ["severity"], where: { organizationId: org.id, status: "OPEN" }, _count: { _all: true } });
+  ok(
+    "the open-by-severity counts sum to the OPEN count",
+    bySeverity.reduce((sum, r) => sum + r._count._all, 0) === (byStatus.find((r) => r.status === "OPEN")?._count._all ?? 0)
+  );
+
+  console.log("\n[8] an anomaly from another org is invisible to this one");
+  const otherOrgRow = await prisma.anomaly.findFirst({ where: { organizationId: { not: org.id } }, select: { id: true } });
+  if (otherOrgRow) {
+    // The exact scoping PATCH /anomalies/:id relies on: findFirst by id AND
+    // organizationId, so a cross-org id 404s rather than leaking or updating.
+    const leaked = await prisma.anomaly.findFirst({ where: { id: otherOrgRow.id, organizationId: org.id } });
+    ok("a cross-org id resolves to nothing under this org's scope", leaked === null);
+  } else {
+    console.log("  (skipped — no other org has anomalies to attempt a cross-org read with)");
+  }
+
+  console.log("\n[9] the calc module stays importable without opening a Redis connection");
+  // The trap syncCadence.ts documents, guarded so it cannot come back: if
+  // modules/calc/anomalies.ts ever imports the scheduler (or anything else
+  // that constructs a BullMQ Queue at module scope), every script importing
+  // the calc module starts hanging on exit instead of terminating.
+  const calcSource = await readFile(new URL("../src/modules/calc/anomalies.ts", import.meta.url), "utf8");
+  ok("calc/anomalies.ts does not import the queue layer", !/from\s+["'].*modules\/queue\//.test(calcSource));
+  ok("calc/anomalies.ts does not import bullmq or redis directly", !/from\s+["'](bullmq|.*lib\/redis)/.test(calcSource));
 
   console.log("\n" + "─".repeat(60));
   console.log(`${pass} passed, ${fail} failed`);
