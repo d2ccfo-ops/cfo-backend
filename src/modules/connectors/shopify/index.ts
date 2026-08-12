@@ -43,9 +43,17 @@ interface ShopifyMoneySet {
 }
 
 interface ShopifyRefundTransaction {
+  id?: number | string;
   kind?: string;
   status?: string;
   amount?: string;
+  gateway?: string;
+  processed_at?: string;
+  created_at?: string;
+  // Gateway-specific echo. Razorpay puts its own ids in here; most gateways
+  // put something, none of them agree on what, so it is read defensively and
+  // treated as a hint rather than as a key.
+  receipt?: Record<string, unknown> | null;
 }
 
 interface ShopifyRefundLineItem {
@@ -59,6 +67,9 @@ interface ShopifyRefundLineItem {
 }
 
 interface ShopifyRefund {
+  id?: number | string;
+  created_at?: string;
+  processed_at?: string;
   transactions?: ShopifyRefundTransaction[];
   refund_line_items?: ShopifyRefundLineItem[];
 }
@@ -100,6 +111,83 @@ function refundedTotal(refunds: ShopifyRefund[] | undefined): bigint {
     }
   }
   return total;
+}
+
+export interface MappedRefund {
+  externalRefundId: string;
+  amount: bigint;
+  currency: string;
+  processedAt: Date;
+  gateway: string | null;
+  gatewayRef: string | null;
+  raw: Record<string, unknown>;
+}
+
+/**
+ * P2.3a-pre: each refund TRANSACTION that actually moved money, as its own
+ * dated record.
+ *
+ * Same void rule as refundedTotal above, and it has to stay the same rule —
+ * two different definitions of "a refund happened" would put rows in this
+ * table that the order's refundedAmount does not account for, and the
+ * reconciliation leg would report them as unmatched forever. The reference
+ * store has 1,981 orders carrying refund records with no successful
+ * transaction; every one of them belongs out of here.
+ *
+ * The transaction id is the key, not the refund id: Shopify groups several
+ * transactions under one refund, and it is the transaction the gateway
+ * echoes. Matching at the group level would mean summing our side before
+ * comparing, which is exactly the aggregation that makes a mismatch
+ * impossible to localise.
+ */
+export function mapRefunds(order: ShopifyOrder): MappedRefund[] {
+  const out: MappedRefund[] = [];
+  for (const refund of order.refunds ?? []) {
+    for (const txn of refund.transactions ?? []) {
+      if (txn.kind !== "refund") continue;
+      if (txn.status && txn.status !== "success") continue;
+      const amount = toPaise(txn.amount);
+      if (amount <= 0n) continue;
+
+      // A transaction with no id cannot be given a stable key, and inventing
+      // one from the amount and date would collide the moment a store issues
+      // two identical refunds on an order — which is precisely the case this
+      // table exists to tell apart. Skipped rather than guessed.
+      if (txn.id == null) continue;
+
+      // processed_at is when the money moved; created_at is when the record
+      // was written. The reconciliation window is cut on the former, so the
+      // fallback chain runs from most to least specific and only reaches the
+      // order's own timestamp if the payload carries nothing else.
+      const when = txn.processed_at ?? txn.created_at ?? refund.processed_at ?? refund.created_at ?? order.created_at;
+
+      out.push({
+        externalRefundId: String(txn.id),
+        amount,
+        currency: order.currency ?? "INR",
+        processedAt: new Date(when),
+        gateway: txn.gateway ?? null,
+        gatewayRef: gatewayRefFrom(txn),
+        raw: { transaction: txn as unknown as Record<string, unknown>, refundId: refund.id ?? null },
+      });
+    }
+  }
+  return out;
+}
+
+// Gateways disagree completely on where they put their own identifier, and
+// several put nothing. Tried in order of usefulness for matching, and null
+// when none of them is present — the leg falls back to amount + date + order,
+// which is why a missing reference degrades the match rather than losing it.
+function gatewayRefFrom(txn: ShopifyRefundTransaction): string | null {
+  const receipt = txn.receipt;
+  if (!receipt || typeof receipt !== "object") return null;
+  for (const key of ["refund_id", "id", "payment_id", "gateway_reference", "transaction_id", "acquirer_reference_number"]) {
+    const v = (receipt as Record<string, unknown>)[key];
+    if (typeof v === "string" && v.length > 0) return v;
+    if (typeof v === "number") return String(v);
+  }
+  return null;
 }
 
 interface LineRefund {
@@ -375,6 +463,34 @@ async function batchUpsertOrders(ctx: ConnectorContext, orders: ShopifyOrder[]):
       await tx.$executeRaw`
         INSERT INTO order_line_items (id, "orderId", sku, "productName", quantity, "unitPrice", "totalAmount", "discountAmount", "taxAmount", "refundedAmount", "refundedTaxAmount", "refundedQuantity")
         VALUES ${Prisma.join(lineItemRows)}
+      `;
+    }
+
+    // P2.3a-pre refunds. UPSERTED rather than delete-and-recreate, unlike the
+    // line items above: a Refund row is referenced by MatchResult once the
+    // §15 leg 6 reconciliation has run, and deleting it on every re-sync would
+    // destroy that match — along with any human write-off or manual pairing
+    // attached to it. Line items carry no such references, which is why the
+    // wholesale replace is safe there and not here.
+    const refundRows = mapped.flatMap(({ raw, m }) => {
+      const orderId = orderIdByExternalId.get(m.externalOrderId);
+      if (!orderId) return [];
+      return mapRefunds(raw).map(
+        (r) =>
+          Prisma.sql`(${crypto.randomUUID()}, ${ctx.organizationId}, ${ctx.legalEntityId}, ${ctx.connectionId}, ${orderId}, ${r.externalRefundId}, ${r.amount}, ${r.currency}, ${r.processedAt}, ${r.gateway}, ${r.gatewayRef}, ${JSON.stringify(r.raw)}::jsonb, ${now}, ${now})`
+      );
+    });
+    if (refundRows.length > 0) {
+      await tx.$executeRaw`
+        INSERT INTO refunds (id, "organizationId", "legalEntityId", "connectionId", "orderId", "externalRefundId", amount, currency, "processedAt", gateway, "gatewayRef", raw, "createdAt", "updatedAt")
+        VALUES ${Prisma.join(refundRows)}
+        ON CONFLICT ("connectionId", "externalRefundId") DO UPDATE SET
+          amount = EXCLUDED.amount,
+          "processedAt" = EXCLUDED."processedAt",
+          gateway = EXCLUDED.gateway,
+          "gatewayRef" = EXCLUDED."gatewayRef",
+          raw = EXCLUDED.raw,
+          "updatedAt" = EXCLUDED."updatedAt"
       `;
     }
   });
@@ -715,6 +831,38 @@ export const shopifyConnector: Connector = {
     if (mapped.lineItems.length > 0) {
       await prisma.orderLineItem.createMany({
         data: mapped.lineItems.map((li) => ({ ...li, orderId: order.id })),
+      });
+    }
+
+    // A refund arrives as an orders/updated webhook on the SAME order, so this
+    // path has to persist refunds too — otherwise a refund would only ever be
+    // recorded if it already existed at first ingestion, which is the exact
+    // mistake the update branch of the order upsert above documents avoiding.
+    // Upsert, never delete-and-recreate: these rows get referenced by
+    // MatchResult once the leg has run.
+    for (const r of mapRefunds(payload as ShopifyOrder)) {
+      await prisma.refund.upsert({
+        where: { connectionId_externalRefundId: { connectionId: ctx.connectionId, externalRefundId: r.externalRefundId } },
+        create: {
+          organizationId: ctx.organizationId,
+          legalEntityId: ctx.legalEntityId,
+          connectionId: ctx.connectionId,
+          orderId: order.id,
+          externalRefundId: r.externalRefundId,
+          amount: r.amount,
+          currency: r.currency,
+          processedAt: r.processedAt,
+          gateway: r.gateway,
+          gatewayRef: r.gatewayRef,
+          raw: r.raw as object,
+        },
+        update: {
+          amount: r.amount,
+          processedAt: r.processedAt,
+          gateway: r.gateway,
+          gatewayRef: r.gatewayRef,
+          raw: r.raw as object,
+        },
       });
     }
 

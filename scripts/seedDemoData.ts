@@ -533,6 +533,12 @@ async function seed(target: Target) {
       // Refunds sit on delivered prepaid orders far more often than COD.
       const refunded = !cancelled && chance(isCod ? 0.012 : 0.048);
       const refundAmount = refunded ? (chance(0.6) ? grossIncl : Math.round(grossIncl * between(0.3, 0.7))) : 0;
+      // When the money actually went back. A refund never lands on the order
+      // date — the customer has to receive the goods and return them first —
+      // and the §15 leg 6 window is cut on this, so a refund stamped with the
+      // order's own timestamp would fall outside the window the gateway's
+      // refund line lands in and read as unmatched.
+      const refundedAt = new Date(placedAt.getTime() + intBetween(3, 21) * 86_400_000);
 
       // ~1.5% raised in the admin on payment terms. These are the orders that
       // used to be classified as "No payment found" and are the reason the
@@ -625,6 +631,53 @@ async function seed(target: Target) {
           // Only meaningful when something is still owed — an invoiced order.
           total_outstanding: onTerms ? grossIncl.toFixed(2) : "0.00",
           cancelled_at: cancelled ? new Date(placedAt.getTime() + intBetween(1, 40) * 3_600_000).toISOString() : null,
+          // P2.3a-pre. refundedAmount used to be written onto the column with
+          // NOTHING in refunds[] to back it — 154 demo orders claiming money
+          // went back with no transaction saying when, how much, or through
+          // which rail. mapRefunds() found nothing there and the §15 leg 6
+          // reconciliation would have reported every one as permanently
+          // unmatched, which is a demo artefact masquerading as a finding.
+          //
+          // A cancelled COD order is deliberately given a VOID rather than a
+          // refund: an uncaptured authorisation moves no money, and the real
+          // store has 1,981 orders of exactly that shape. The leg has to be
+          // seen ignoring them, not just told that it does.
+          refunds:
+            refundAmount > 0
+              ? [
+                  {
+                    id: Number(`77${orderNumber}`),
+                    created_at: refundedAt.toISOString(),
+                    processed_at: refundedAt.toISOString(),
+                    transactions: [
+                      {
+                        id: Number(`88${orderNumber}`),
+                        kind: "refund",
+                        status: "success",
+                        amount: refundAmount.toFixed(2),
+                        gateway: isCod ? "Cash on Delivery (COD)" : "razorpay",
+                        processed_at: refundedAt.toISOString(),
+                        // Present most of the time, absent sometimes — the leg
+                        // must degrade to amount+date matching, and a demo
+                        // where every row has a clean reference never exercises
+                        // that path.
+                        receipt: chance(0.75) ? { refund_id: `rfnd_demo${orderNumber}` } : null,
+                      },
+                    ],
+                    refund_line_items: [],
+                  },
+                ]
+              : cancelled && isCod
+                ? [
+                    {
+                      id: Number(`76${orderNumber}`),
+                      created_at: placedAt.toISOString(),
+                      processed_at: placedAt.toISOString(),
+                      transactions: [{ id: Number(`86${orderNumber}`), kind: "void", status: "success", amount: "0.00" }],
+                      refund_line_items: [],
+                    },
+                  ]
+                : [],
           ...(onTerms
             ? {
                 source_name: "shopify_draft_order",

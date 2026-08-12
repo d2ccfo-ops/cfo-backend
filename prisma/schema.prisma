@@ -308,6 +308,7 @@ model Order {
   lineItems OrderLineItem[]
   payments  Payment[]
   shipments Shipment[]
+  refunds   Refund[]
 
   @@unique([connectionId, externalOrderId])
   @@index([organizationId, legalEntityId])
@@ -316,6 +317,61 @@ model Order {
   // it's a full scan of every order the org has ever placed.
   @@index([organizationId, customerRef])
   @@map("orders")
+}
+
+// P2.3a-pre. A dated, individually-identified refund — the prerequisite the
+// refund reconciliation leg (§15 leg 6) could not exist without.
+//
+// Order.refundedAmount already carries a cumulative per-order total, and that
+// is enough to reduce revenue (§11/§66). It is NOT enough to reconcile: a
+// gateway refund line says "₹1,240 went back on 3 September against payment
+// pay_XYZ", and a cumulative order-level total has no date, no id, and no way
+// to tell one refund from a second one on the same order. Matching needs
+// discrete records on both sides, so this is the discrete record on ours.
+//
+// One row per refund TRANSACTION that moved money, not per refund object.
+// Shopify groups several transactions under one refund, and it is the
+// transaction the gateway echoes back — matching at the group level would mean
+// summing our side to compare against their rows, which is exactly the
+// aggregation that makes a mismatch impossible to localise.
+//
+// Voids never appear here. A void cancels an uncaptured authorisation
+// (overwhelmingly COD in this market) and moves no money at all — 1,981 orders
+// in the reference store carry refund records with no successful transaction.
+// Treating those as refunds would inflate the refund rate with orders nobody
+// ever paid for, and would put thousands of unmatchable rows into a leg whose
+// whole purpose is finding the ones that genuinely do not match.
+model Refund {
+  id               String   @id @default(cuid())
+  organizationId   String
+  legalEntityId    String?
+  connectionId     String
+  orderId          String
+  // The provider's id for this refund transaction. Unique per connection, and
+  // the value a gateway statement can be matched on.
+  externalRefundId String
+  amount           BigInt // paise, positive — the money that went back
+  currency         String   @default("INR")
+  // When the money actually moved, not when the refund record was created.
+  // The reconciliation window is cut on this.
+  processedAt      DateTime
+  // Which rail refunded it ("razorpay", "gokwik", "manual"). Kept separate
+  // from gatewayRef because the name is reliable and the reference is not.
+  gateway          String?
+  // The gateway's own identifier where the platform passes one through — a
+  // Razorpay refund id, or the payment id it was refunded against. Nullable
+  // and often null; the leg falls back to amount+date+order when it is.
+  gatewayRef       String?
+  raw              Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalRefundId])
+  @@index([organizationId, processedAt])
+  @@index([orderId])
+  @@map("refunds")
 }
 
 model OrderLineItem {
@@ -922,6 +978,13 @@ enum MatchType {
   // billing for a parcel this system has no record of — which is money leaving
   // for nothing, and the only place it would ever surface.
   SHIPMENT_FREIGHT
+  // §15 leg 6. Refund ↔ the gateway line that carries the money back out.
+  // Also runs both ways: our refund with no gateway line is money the store
+  // believes it returned and the gateway has no record of, and a gateway
+  // refund line with no refund of ours is money leaving against an order this
+  // system never saw refunded — a chargeback, or a refund issued straight from
+  // the gateway dashboard, both of which are invisible everywhere else.
+  REFUND_PAYMENT
 }
 
 enum MatchConfidence {
