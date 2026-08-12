@@ -29,6 +29,14 @@ model Organization {
   // revenue on a measured day. Defaults to IST because that is where this
   // product's merchants are; per-org because their accountants aren't always.
   timezone   String   @default("Asia/Kolkata")
+  // P2.0: org-wide settings, as opposed to DashboardLayout below (per-USER).
+  // One JSON bag rather than a column per setting, because the known
+  // consumers land on different plan items over multiple sessions (the
+  // cash-threshold anomaly rule now, notification digests and recurring
+  // outflows later) — a new setting is a key, not a migration. Validated on
+  // write by routes/preferences.ts's orgSettingsSchema, which is the actual
+  // source of truth for which keys exist; this column has none of its own.
+  settings   Json?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 

@@ -1,7 +1,9 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
+import type { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
+import { getOrgSettings, type OrgSettings, orgSettingsSchema } from "../modules/orgs/settings.js";
 
 export const preferencesRouter = Router();
 
@@ -51,11 +53,31 @@ function parsePageQuery(req: Request, _res: Response, next: NextFunction) {
   }
 }
 
+// P2.0: org-wide settings — everything above this point is per-USER
+// (DashboardLayout follows a person across devices); this follows the
+// ORGANIZATION instead. Schema lives in modules/orgs/settings.ts, shared with
+// every calc module that only needs to read a setting (starting with P2.1b's
+// cash-threshold anomaly rule).
+//
+// OWNER/ADMIN-writable is the intended gate once P5.1 (RBAC) lands. Until
+// then, per the plan, any authenticated member of the org may read and write
+// — same interim posture `/dashboard-layout` above never needed because it's
+// scoped to one user already.
+function parseOrgSettingsBody(req: Request, _res: Response, next: NextFunction) {
+  try {
+    parsedOn(req).orgSettings = orgSettingsSchema.parse(req.body);
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Lets the parsed values ride on the request without widening the global
-// Express type for something only these three routes use.
+// Express type for something only these routes use.
 interface ParsedPrefs {
   layout?: z.infer<typeof layoutBodySchema>;
   page?: (typeof PAGES)[number];
+  orgSettings?: OrgSettings;
 }
 function parsedOn(req: Request): ParsedPrefs {
   const r = req as Request & { parsedPrefs?: ParsedPrefs };
@@ -117,4 +139,27 @@ preferencesRouter.delete("/dashboard-layout", ...requireAuth, parsePageQuery, as
     where: { organizationId: req.auth!.organizationId, userId: req.auth!.userId, page },
   });
   res.json({ page, cardOrder: null, updatedAt: null });
+});
+
+// Returns {} rather than nulls-for-every-known-key when nothing has been set
+// — the schema of "what settings exist" lives in orgSettingsSchema, not
+// duplicated here as a set of defaults a consumer could drift out of sync
+// with.
+preferencesRouter.get("/org", ...requireAuth, async (req, res) => {
+  res.json({ settings: await getOrgSettings(req.auth!.organizationId) });
+});
+
+preferencesRouter.put("/org", ...requireAuth, parseOrgSettingsBody, async (req, res) => {
+  const patch = parsedOn(req).orgSettings!;
+  // A merge, not a replace: several unrelated features write different keys
+  // into this same JSON bag over time (cash threshold today; notification
+  // digest and recurring-outflow settings later), and a PUT carrying only
+  // one of them must not erase the others.
+  const merged: OrgSettings = { ...(await getOrgSettings(req.auth!.organizationId)), ...patch };
+  const updated = await prisma.organization.update({
+    where: { id: req.auth!.organizationId },
+    data: { settings: merged as Prisma.InputJsonValue },
+    select: { settings: true },
+  });
+  res.json({ settings: updated.settings });
 });
