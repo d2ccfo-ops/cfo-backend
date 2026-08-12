@@ -9,6 +9,7 @@ import { getCashReceivedSummary } from "../modules/calc/cash.js";
 import { getCashForecast } from "../modules/calc/cashForecast.js";
 import { getDataStatusMap, type MaterialMetricKey } from "../modules/calc/dataStatus.js";
 import { paiseToRupees } from "../modules/calc/money.js";
+import { buildLongTailEvidence, isLongTailMetric, LONG_TAIL_METRIC_KEYS } from "../modules/calc/evidenceLongTail.js";
 
 // §21 evidence. One envelope for the 5 material metrics — every figure a
 // founder might be challenged on can answer "show me the workings" with its
@@ -335,14 +336,40 @@ export function toCsv(rows: Array<Record<string, string | number | null>>): stri
 }
 
 evidenceRouter.get("/:metricKey", ...requireAuth, withDateRange, async (req, res) => {
-  const metric = req.params.metricKey as MaterialMetricKey;
+  const requested = req.params.metricKey ?? "";
+  const wantCsv = req.query.format === "csv";
+
+  // P6.8. The long tail is served from its own builder because these metrics
+  // have no reconciliationStatus to report — nothing external states a state's
+  // margin or a campaign's ROAS, so the envelope says NOT_RECONCILABLE with the
+  // reason rather than borrowing a status that would be read as verification.
+  if (isLongTailMetric(requested)) {
+    const built = await buildLongTailEvidence(
+      req.auth!.organizationId,
+      requested,
+      req.dateRange!,
+      wantCsv ? CSV_ROW_LIMIT : SAMPLE_LIMIT
+    );
+    if (wantCsv) {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="evidence-${requested}.csv"`);
+      res.send(toCsv(built.csvRows));
+      return;
+    }
+    const { csvRows: _csvRows, ...envelope } = built;
+    res.json(envelope);
+    return;
+  }
+
+  const metric = requested as MaterialMetricKey;
   if (!(metric in METRIC_TEXT)) {
     res.status(404).json({
-      error: `No evidence endpoint for "${metric}". Available: ${Object.keys(METRIC_TEXT).join(", ")}.`,
+      // Both sets listed. A caller that guessed "inventory_value" and got back
+      // only the material five would conclude the long tail does not exist.
+      error: `No evidence endpoint for "${metric}". Available: ${[...Object.keys(METRIC_TEXT), ...LONG_TAIL_METRIC_KEYS].join(", ")}.`,
     });
     return;
   }
-  const wantCsv = req.query.format === "csv";
   const { envelope, csvRows } = await buildEvidence(
     req.auth!.organizationId,
     req.auth!.timezone,

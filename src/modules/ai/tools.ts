@@ -8,7 +8,8 @@ import { getAvailableCashSummary, getCashReceivedSummary } from "../calc/cash.js
 import { DEFAULT_HORIZON, getCashForecast, isForecastHorizon } from "../calc/cashForecast.js";
 import { runCashScenario, type ScenarioParams } from "../calc/cashScenario.js";
 import { getContributionMargin } from "../calc/contribution.js";
-import { getDataStatusMap } from "../calc/dataStatus.js";
+import { getDataStatusMap, type MaterialMetricKey } from "../calc/dataStatus.js";
+import { buildLongTailEvidence, isLongTailMetric } from "../calc/evidenceLongTail.js";
 import { getDataFreshness } from "../calc/freshness.js";
 import { getPayablesSummary } from "../calc/payables.js";
 import { getProductProfitability } from "../calc/productProfitability.js";
@@ -70,6 +71,16 @@ export const EVIDENCE_ENVELOPE_METRICS = [
   "product_profitability",
   "cash_received",
   "cash_forecast",
+  // P6.8 extended the §21 envelope past the material five. These carry a
+  // definition, formula, sources and rows but NOT a reconciliation status —
+  // see modules/calc/evidenceLongTail.ts. Listed here so the agent may cite
+  // them; the set stays CLOSED because an evidence ref that 404s is worse than
+  // no citation. Eleven of seventeen used to.
+  "state_profitability",
+  "channel_profitability",
+  "campaign_profitability",
+  "cash_conversion_cycle",
+  "inventory_value",
 ] as const;
 
 export const EVIDENCE_PAGES = [
@@ -466,7 +477,23 @@ export const TOOLS: ToolDefinition[] = [
     z.object({ metric: z.enum(EVIDENCE_ENVELOPE_METRICS), from: z.string().optional(), to: z.string().optional() }).strict(),
     async (ctx, args) => {
       const a = args as { metric: (typeof EVIDENCE_ENVELOPE_METRICS)[number]; from?: string; to?: string };
-      const { envelope: built } = await buildEvidence(ctx.organizationId, ctx.timeZone, a.metric, rangeOf(ctx, a), false);
+      // P6.8 split the envelope in two: the material five carry a
+      // reconciliation status, the long tail carries NOT_RECONCILABLE with a
+      // reason. Dispatched here rather than merged, so a long-tail metric can
+      // never inherit a verification claim it has no basis for.
+      const metricKey = a.metric;
+      let built;
+      if (isLongTailMetric(metricKey)) {
+        const { csvRows: _csvRows, ...rest } = await buildLongTailEvidence(
+          ctx.organizationId,
+          metricKey,
+          rangeOf(ctx, a),
+          20
+        );
+        built = rest;
+      } else {
+        built = (await buildEvidence(ctx.organizationId, ctx.timeZone, metricKey as MaterialMetricKey, rangeOf(ctx, a), false)).envelope;
+      }
       // sampleTransactions carry customer-shaped columns on some metrics, so
       // this is exactly the payload §27's masking exists for. envelope() runs
       // it; nothing here bypasses that.
