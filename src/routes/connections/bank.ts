@@ -1,0 +1,79 @@
+import { Router } from "express";
+import { encryptSecret } from "../../lib/crypto.js";
+import { logger } from "../../lib/logger.js";
+import { prisma } from "../../lib/prisma.js";
+import { requireAuth } from "../../middleware/auth.js";
+import { ingestStatement } from "../../modules/connectors/bank/index.js";
+import { toConnectorContext } from "../../modules/connectors/types.js";
+import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
+
+export const bankConnectionRouter = Router();
+
+// No credential to validate against an external service — this just
+// registers which account statements will be uploaded for. credentialsRef
+// still goes through encryptSecret() for consistency with every other
+// connector, even though bankName/accountLast4 aren't really secret.
+bankConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
+  const { bankName, accountLast4 } = req.body ?? {};
+  if (!bankName || !accountLast4) {
+    res.status(400).json({ error: "missing_fields" });
+    return;
+  }
+
+  const organizationId = req.auth!.organizationId;
+  const legalEntity = await getOrCreateDefaultLegalEntity(organizationId);
+  const externalAccountId = `${bankName} •••${accountLast4}`;
+  const credentialsRef = encryptSecret(JSON.stringify({ bankName, accountLast4 }));
+
+  let connection = await prisma.connection.findFirst({
+    where: { organizationId, provider: "BANK", externalAccountId },
+  });
+  connection = connection
+    ? await prisma.connection.update({ where: { id: connection.id }, data: { credentialsRef, status: "ACTIVE" } })
+    : await prisma.connection.create({
+        data: {
+          organizationId,
+          legalEntityId: legalEntity.id,
+          provider: "BANK",
+          status: "ACTIVE",
+          externalAccountId,
+          credentialsRef,
+        },
+      });
+
+  res.json({ connected: true, connectionId: connection.id });
+});
+
+// Opening-balance anchor is set via PATCH /connections/:connectionId/opening-balance
+// on the generic connectionsRouter now (routes/connections/index.ts) — BANK_AA
+// needs the exact same endpoint, so it moved there instead of being
+// duplicated per provider.
+
+bankConnectionRouter.post("/:connectionId/upload", ...requireAuth, async (req, res) => {
+  const { csv } = req.body ?? {};
+  if (!csv || typeof csv !== "string") {
+    res.status(400).json({ error: "missing_csv" });
+    return;
+  }
+
+  const connection = await prisma.connection.findFirst({
+    where: { id: req.params.connectionId, organizationId: req.auth!.organizationId, provider: "BANK" },
+  });
+  if (!connection) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+
+  try {
+    const result = await ingestStatement(toConnectorContext(connection), csv);
+    await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+    logger.info(
+      { connectionId: connection.id, recordsFetched: result.recordsFetched, skipped: result.skipped },
+      "bank_statement_ingested"
+    );
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, "bank_statement_ingest_failed");
+    res.status(500).json({ error: "ingest_failed" });
+  }
+});

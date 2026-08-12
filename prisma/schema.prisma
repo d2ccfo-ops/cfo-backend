@@ -1,0 +1,1032 @@
+// Core canonical schema for CFOOS.
+// Rules baked into this schema on purpose:
+//  - All money columns are BigInt paise (never Float/Decimal-as-float) — see modules/calc/money.ts.
+//  - Every tenant-scoped table carries organizationId (and legalEntityId where the data is
+//    entity-specific) so every query can be scoped without relying on joins to infer tenancy.
+//  - Raw provider payloads are stored immutably on RawEvent before any processing, and processing
+//    is idempotent via the (connectionId, externalEventId) unique constraint.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id         String   @id @default(cuid())
+  clerkOrgId String   @unique // Clerk is the source of truth for org identity/membership
+  name       String
+  // §3. IANA zone that every reporting window is cut on. Not cosmetic: with
+  // windows cut on UTC, "Today" began at 05:30 IST and silently dropped the
+  // first 5½ hours of the Indian business day — 4 of 50 orders and 26% of
+  // revenue on a measured day. Defaults to IST because that is where this
+  // product's merchants are; per-org because their accountants aren't always.
+  timezone   String   @default("Asia/Kolkata")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  legalEntities LegalEntity[] @relation("OrgLegalEntities")
+
+  @@map("organizations")
+}
+
+// Which metric cards a user has pinned to a page, and in what order.
+//
+// Server-side on purpose: this is the one piece of dashboard state that has to
+// follow the person rather than the browser. A founder who curates the Overview
+// on a laptop and opens it on a phone should find the same cards in the same
+// order — localStorage cannot do that. (The date filter is the opposite case
+// and stays client-side: it is a transient "what am I looking at right now",
+// and having it follow you across devices would be surprising.)
+//
+// Keyed by userId AND organizationId: the same person advising two brands wants
+// a different dashboard for each, and inheriting one org's layout into another
+// would leak a signal about how they read the other business.
+model DashboardLayout {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String // Clerk user id, from the verified session claim
+  page           String // "overview" today; the model is page-agnostic on purpose
+  // Ordered card identities. Order IS the data — index 0 renders first.
+  // Absence of a card means the user removed it, which is why this replaces the
+  // default set wholesale rather than merging with it.
+  cardOrder      String[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, userId, page])
+  @@map("dashboard_layouts")
+}
+
+model LegalEntity {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  gstin          String?
+  pan            String?
+  category       String?
+  // The last two onboarding fields. Self-reported bands, not measurements —
+  // revenueRange is only ever a sanity check against what the connectors
+  // actually observe, and primaryChannel seeds channel expectations before any
+  // connector exists. Both nullable: an org that skipped onboarding, or one
+  // created before these columns existed, is a normal state, not an error.
+  revenueRange   String?
+  primaryChannel String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+
+  organization Organization @relation("OrgLegalEntities", fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+  @@map("legal_entities")
+}
+
+enum MembershipRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model Membership {
+  id             String         @id @default(cuid())
+  organizationId String
+  clerkUserId    String
+  email          String
+  role           MembershipRole @default(MEMBER)
+  createdAt      DateTime       @default(now())
+
+  @@unique([organizationId, clerkUserId])
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+// ---------------------------------------------------------------------------
+// Connections + raw ingestion
+// ---------------------------------------------------------------------------
+
+enum Provider {
+  SHOPIFY
+  RAZORPAY
+  META_ADS
+  GOOGLE_ADS
+  SHIPROCKET
+  BANK
+  DELHIVERY
+  BANK_AA
+  AMAZON
+  FLIPKART
+  CLICKPOST
+  ZOHO_BOOKS
+  BLUEDART
+  GOKWIK
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACTIVE
+  ERROR
+  DISCONNECTED
+}
+
+// Separate axis from ConnectionStatus above: ConnectionStatus is the
+// connection's overall health (has it ever connected, is the credential
+// still valid); SyncJobStatus is "what is the background queue doing with
+// this connection's sync job right now." A connection can be ACTIVE while
+// its most recent sync FAILED (transient API error) without the connection
+// itself needing to be torn down.
+enum SyncJobStatus {
+  IDLE
+  QUEUED
+  SYNCING
+  FAILED
+}
+
+model Connection {
+  id                String           @id @default(cuid())
+  organizationId    String
+  legalEntityId     String
+  provider          Provider
+  status            ConnectionStatus @default(PENDING)
+  externalAccountId String?
+  credentialsRef    String // reference into secret store — never the raw secret
+  lastSyncedAt      DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  // Background sync queue state — set by routes/connections/index.ts on
+  // enqueue and by modules/queue/syncWorker.ts as the job actually runs.
+  // See SyncJobStatus above.
+  syncStatus    SyncJobStatus @default(IDLE)
+  lastSyncError String?
+
+  // Real progress for the in-flight job, not a fake spinner — populated by
+  // the worker from an actual Shopify count.json call before it starts (see
+  // modules/connectors/shopify/index.ts's pull()), so a client can compute
+  // a genuine "X of Y, ~Z left" from measured throughput. Null whenever
+  // nothing is running, or when a connector doesn't support progress
+  // reporting (most don't yet — see modules/connectors/types.ts's optional
+  // ConnectorContext.reportProgress). This — not local browser state — is
+  // what lets the frontend correctly show "still syncing" after a page
+  // reload or navigating away and back; a sync job outlives any one tab.
+  syncProgressCurrent Int?
+  syncProgressTotal   Int?
+  syncStartedAt       DateTime?
+
+  // Only meaningful for provider: BANK or BANK_AA — an "available cash"
+  // figure needs a balance anchor, and nothing else in the schema provides
+  // one (BankTransaction only carries movements, not a running balance).
+  // Null until the founder sets it (see routes/connections/index.ts's PATCH
+  // /:connectionId/opening-balance); a bank connection with no opening
+  // balance set is excluded from the available-cash total rather than
+  // silently treated as zero — see modules/calc/cash.ts. BANK_AA gets
+  // transactions automatically via Setu, but Setu's FI data doesn't include
+  // a running balance either (only per-transaction `currentBalance` snapshots
+  // that this MVP doesn't parse out — see modules/connectors/setu), so the
+  // anchor is still founder-entered for both providers.
+  openingBalanceMinor BigInt?
+  openingBalanceDate  DateTime?
+
+  // Defense-in-depth against duplicate connections from a double-click or a
+  // racing callback — application code still does an explicit findFirst
+  // before writing (see connections/shopify.ts), since Prisma can't upsert
+  // cleanly against a compound key with a nullable member (same issue as
+  // MetricSnapshot — see modules/calc/revenue.ts).
+  @@unique([organizationId, provider, externalAccountId])
+  @@index([organizationId])
+  @@index([legalEntityId])
+  @@map("connections")
+}
+
+enum ProcessingStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+// Immutable landing zone for every inbound webhook/backfill payload, processed
+// idempotently by (connectionId, externalEventId).
+model RawEvent {
+  id               String           @id @default(cuid())
+  organizationId   String
+  connectionId     String
+  provider         Provider
+  externalEventId  String
+  eventType        String
+  payload          Json
+  receivedAt       DateTime         @default(now())
+  processedAt      DateTime?
+  processingStatus ProcessingStatus @default(PENDING)
+  processingError  String?
+
+  @@unique([connectionId, externalEventId])
+  @@index([organizationId])
+  @@index([processingStatus])
+  @@map("raw_events")
+}
+
+// ---------------------------------------------------------------------------
+// Commerce + payments (canonical, normalized — never mutate history, only append)
+// ---------------------------------------------------------------------------
+
+model Order {
+  id              String   @id @default(cuid())
+  organizationId  String
+  legalEntityId   String
+  connectionId    String
+  externalOrderId String
+  orderNumber     String
+  channel         String
+  status          String
+  currency        String   @default("INR")
+  // NOTE THE NAME IS MISLEADING and is kept only because renaming a column
+  // this widely referenced is a separate change: this is Shopify's
+  // `total_price`, i.e. what the customer actually pays — ALREADY net of
+  // discounts and INCLUSIVE of tax (these stores run taxes_included = true).
+  // It is not "gross" in the spec's sense. See itemsAmount below for the
+  // spec's GMV, and modules/calc/revenueLadder.ts for how the two relate.
+  grossAmount     BigInt // paise
+  discountAmount  BigInt   @default(0)
+  taxAmount       BigInt   @default(0)
+  placedAt        DateTime
+  raw             Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // --- Fields below exist to make the CFOOS Backend Finance Engine revenue
+  // ladder computable (spec §5–§11, §64, §66–§69). All were already present in
+  // the Shopify payload and were simply being dropped on the floor; they're
+  // normalised onto columns rather than re-parsed out of `raw` per query
+  // because §112 keeps raw and normalised layers separate.
+
+  // §5 GMV — line-item value BEFORE discounts (Shopify total_line_items_price).
+  // Sum of the order's line items, stored explicitly so GMV doesn't depend on
+  // line-item rows being complete.
+  itemsAmount BigInt @default(0) // paise
+
+  // §6/§7/§11 shipping charged TO the customer — revenue, not the cost of
+  // shipping (that's LogisticsCost). Must stay separate from itemsAmount or
+  // Net Order Value silently omits it.
+  shippingAmount BigInt @default(0) // paise
+
+  // §11/§66 revenue-reducing refunds actually processed against this order.
+  // Only successful `refund`-kind transactions — a Shopify "void" cancels an
+  // uncaptured (usually COD) authorisation and moves no money, so counting it
+  // would inflate the refund rate. §13: a return is operational, a refund is
+  // financial; this column is the financial one.
+  refundedAmount BigInt @default(0) // paise
+
+  // §16/§67 cancellation. Distinct from a refund: a cancel before shipment
+  // should recognise no revenue at all rather than revenue-then-refund.
+  cancelledAt DateTime?
+
+  // §68 prepaid vs COD mix. COD dominates Indian D2C and drives completely
+  // different economics (§29 COD cost, §18 RTO denominator, §51 COD ageing),
+  // so it can't be inferred later from a generic status.
+  paymentMode String? // PREPAID | COD | UNKNOWN
+
+  // §35/§69 customer identity, for repeat rate and new-customer CAC. The
+  // platform's own customer id, not an email — emails change and are PII we
+  // have no reason to copy into our own tables.
+  customerRef String?
+
+  lineItems OrderLineItem[]
+  payments  Payment[]
+  shipments Shipment[]
+
+  @@unique([connectionId, externalOrderId])
+  @@index([organizationId, legalEntityId])
+  @@index([placedAt])
+  // Repeat-customer rate (§69) groups by customer within an org; without this
+  // it's a full scan of every order the org has ever placed.
+  @@index([organizationId, customerRef])
+  @@map("orders")
+}
+
+model OrderLineItem {
+  id          String  @id @default(cuid())
+  orderId     String
+  sku         String?
+  productName String
+  quantity    Int
+  unitPrice   BigInt // paise
+  // paise, unitPrice * quantity — BEFORE discount, and INCLUSIVE of tax when
+  // the store prices tax-inclusive (Shopify taxes_included). §5 GMV at line level.
+  totalAmount BigInt
+  cogsAmount  BigInt? // paise, nullable until COGS mapping is configured
+
+  // Per-line figures the source system states outright, so §40 SKU revenue can
+  // be measured instead of allocated. Nullable on purpose: a connector that
+  // cannot supply them must never be mistaken for one reporting a genuine zero.
+  // When null the calc falls back to §41 revenue-weighted allocation and says
+  // so in the response.
+  discountAmount    BigInt? // paise, discount attributed to this line
+  taxAmount         BigInt? // paise, tax on this line
+  // paise, tax-INCLUSIVE, and only money-backed refunds — a void moves no money
+  // (§13/§14), so counting it would cut a product's revenue for a sale that was
+  // never refunded. Clamped so it can never exceed the order's refunded total.
+  refundedAmount    BigInt?
+  refundedTaxAmount BigInt? // paise, the tax contained within refundedAmount
+  refundedQuantity  Int? // units returned, money-backed refunds only
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("order_line_items")
+}
+
+model Payment {
+  id                String    @id @default(cuid())
+  organizationId    String
+  legalEntityId     String
+  connectionId      String
+  externalPaymentId String
+  orderId           String?
+  amount            BigInt // paise
+  currency          String    @default("INR")
+  method            String?
+  status            String
+  feeAmount         BigInt? // gateway fee, paise
+  capturedAt        DateTime?
+  raw               Json?
+  createdAt         DateTime  @default(now())
+
+  order           Order?           @relation(fields: [orderId], references: [id])
+  settlementLines SettlementLine[]
+
+  @@unique([connectionId, externalPaymentId])
+  @@index([organizationId, legalEntityId])
+  // The reconciliation items list computes paid-online per order with a
+  // lateral aggregate on this FK; without the index that is a sequential
+  // scan of payments per order row.
+  @@index([orderId])
+  @@map("payments")
+}
+
+model Settlement {
+  id                   String    @id @default(cuid())
+  organizationId       String
+  legalEntityId        String
+  connectionId         String
+  externalSettlementId String
+  amount               BigInt // paise, net settled
+  feeAmount            BigInt    @default(0)
+  utr                  String?
+  status               String
+  settledAt            DateTime?
+  raw                  Json?
+  createdAt            DateTime  @default(now())
+
+  // Which provider produced this payout, so a COD remittance from a courier is
+  // never confused with a gateway settlement — they reconcile against different
+  // things and the amounts are not comparable.
+  provider Provider @default(RAZORPAY)
+  // The batch's own kind, mirroring its lines. Stored on the parent so the
+  // reconciliation engine can select the right batches without joining lines.
+  kind     String   @default("GATEWAY") // GATEWAY | COD_REMITTANCE
+
+  lines SettlementLine[]
+
+  @@unique([connectionId, externalSettlementId])
+  @@index([organizationId, legalEntityId])
+  @@map("settlements")
+}
+
+// WHAT A PAYOUT IS MADE OF.
+//
+// Settlement records the money that arrived; this records WHY. Both of the
+// reconciliation legs that could not run were blocked on exactly this and
+// nothing else (see modules/calc/reconciliation.ts):
+//
+//   PAYMENT_SETTLEMENT  "payout composition cannot be inferred from amounts
+//                        without guessing"
+//   COD_REMITTANCE      "couriers remit many shipments in one transfer, so
+//                        individual shipments cannot be tied to a bank credit"
+//
+// Both are the same missing fact — a payout is a BATCH, and without its line
+// items the only way to attribute it is to guess at amounts. One table serves
+// both because a gateway settlement report and a courier COD remittance
+// statement are the same document: a total, a UTR, and the list of things it
+// paid for.
+//
+// Deliberately not merged into Settlement as a JSON column: these rows are
+// joined against Payment and Shipment by the reconciliation engine, and a
+// join is not something to do through jsonb when there are hundreds of
+// thousands of them.
+enum SettlementLineType {
+  // A gateway settlement line — one captured payment inside a payout.
+  PAYMENT
+  // A courier/aggregator COD remittance line — one delivered shipment's cash.
+  SHIPMENT_COD
+  // Money in the batch with no source row of its own: gateway fees, TDS,
+  // chargebacks, RTO freight recovery, shipping charges deducted at source.
+  // Modelled explicitly rather than dropped, because a payout whose lines do
+  // not sum to its total is indistinguishable from a parsing bug.
+  ADJUSTMENT
+}
+
+model SettlementLine {
+  id             String             @id @default(cuid())
+  organizationId String
+  settlementId   String
+  type           SettlementLineType
+
+  // The identifier the PROVIDER states — an AWB, a gateway payment id, or an
+  // adjustment code. Kept verbatim and separately from the resolved FKs below,
+  // because a line that fails to resolve is a real and reportable state (the
+  // courier remitted for a shipment we have never seen), not a row to discard.
+  externalReference String
+
+  // Resolved opportunistically. Null means "stated but not matched to anything
+  // we hold" — which the reconciliation engine surfaces rather than hides.
+  paymentId  String?
+  shipmentId String?
+
+  // Gross is what the line was worth; fee is what the provider took; net is
+  // what it contributed to the payout. All three are stored rather than two
+  // plus arithmetic, so a provider that reports them inconsistently is caught
+  // instead of silently reconciled.
+  grossAmount BigInt // paise
+  feeAmount   BigInt   @default(0)
+  netAmount   BigInt // paise
+  raw         Json?
+  createdAt   DateTime @default(now())
+
+  settlement Settlement @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+  payment    Payment?   @relation(fields: [paymentId], references: [id])
+  shipment   Shipment?  @relation(fields: [shipmentId], references: [id])
+
+  // Re-importing the same statement must update in place, not stack (§94).
+  @@unique([settlementId, type, externalReference])
+  @@index([organizationId, type])
+  @@index([paymentId])
+  @@index([shipmentId])
+  @@map("settlement_lines")
+}
+
+enum BankTxnDirection {
+  CREDIT
+  DEBIT
+}
+
+model BankTransaction {
+  id             String           @id @default(cuid())
+  organizationId String
+  legalEntityId  String
+  connectionId   String
+  externalTxnId  String
+  amount         BigInt // paise
+  direction      BankTxnDirection
+  valueDate      DateTime
+  description    String?
+  utr            String?
+  raw            Json?
+  createdAt      DateTime         @default(now())
+
+  @@unique([connectionId, externalTxnId])
+  @@index([organizationId, legalEntityId])
+  @@map("bank_transactions")
+}
+
+// Setu's Account Aggregator flow is notification-driven and asynchronous:
+// creating a data session (modules/connectors/setu.ts's createDataSession)
+// only returns a session id + PENDING status — the actual FI data shows up
+// later via a webhook that carries that same session id, not a consent id
+// or connection id. This table is the lookup this app owns to map a
+// dataSessionId back to the Connection it belongs to when that webhook
+// lands (see routes/webhooks/setu.ts). No org/legalEntity columns needed —
+// the Connection row looked up via connectionId already carries those.
+model BankAaDataSession {
+  id           String   @id // Setu's data session id, not ours
+  connectionId String
+  status       String   @default("PENDING") // mirrors Setu's combined session status: PENDING/PARTIAL/COMPLETED/EXPIRED/FAILED
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([connectionId])
+  @@map("bank_aa_data_sessions")
+}
+
+// Shared by both Meta Ads and Google Ads (see `provider`) — one row per ad
+// account per day, not per campaign. A per-campaign breakdown would need a
+// nullable externalCampaignId in the unique key, hitting the same Prisma
+// nullable-compound-key limitation documented on Connection/MetricSnapshot;
+// account-level daily spend is enough to feed a total ad-spend metric, and
+// campaign-level detail can be added later without migrating this table if
+// it turns out to matter.
+model AdSpend {
+  id                String   @id @default(cuid())
+  organizationId    String
+  legalEntityId     String
+  connectionId      String
+  provider          Provider // META_ADS or GOOGLE_ADS
+  externalAccountId String
+  date              DateTime // the day this spend covers, UTC midnight
+  spendAmount       BigInt // paise
+  impressions       Int?
+  clicks            Int?
+  currency          String   @default("INR")
+  raw               Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([connectionId, externalAccountId, date])
+  @@index([organizationId, legalEntityId])
+  @@index([date])
+  @@map("ad_spend")
+}
+
+// First real inventory data source (Shopify's products.json — see
+// modules/connectors/shopify/index.ts's pullProducts()). Deliberately
+// current-state only, not a time series: each sync overwrites `variants`'
+// `inventoryQuantity` in place rather than appending a dated row, same as
+// Shopify itself only ever tells you the *current* stock level, not a
+// history of it. That means there's no way to compute a "30 days ago"
+// comparison for inventory value the way revenue/cash-received can — see
+// modules/calc/inventory.ts. Split into Product + ProductVariant (not one
+// flat table) because Shopify's own model is two-level: a T-shirt is one
+// Product with a ProductVariant per size/color, each with its own SKU,
+// price, and stock count.
+model Product {
+  id                String   @id @default(cuid())
+  organizationId    String
+  legalEntityId     String
+  connectionId      String
+  externalProductId String
+  title             String
+  productType       String?
+  vendor            String?
+  status            String // Shopify: active | archived | draft
+  raw               Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  variants ProductVariant[]
+
+  @@unique([connectionId, externalProductId])
+  @@index([organizationId, legalEntityId])
+  @@map("products")
+}
+
+model ProductVariant {
+  id                String   @id @default(cuid())
+  productId         String
+  externalVariantId String
+  sku               String?
+  title             String // e.g. "Small / Red" — Shopify's own variant title, not the product title
+  price             BigInt // paise
+  // Total across every Shopify location, not location-level detail — this
+  // MVP doesn't model multi-location inventory (see modules/calc/inventory.ts).
+  inventoryQuantity Int      @default(0)
+  raw               Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id])
+
+  @@unique([productId, externalVariantId])
+  @@index([productId])
+  @@map("product_variants")
+}
+
+// §57 accounts payable. Vendor bills from an accounting system — the source
+// for "upcoming payments" and, with §74 expenses below, for burn and EBITDA.
+// Deliberately NOT merged into Payment/Settlement: those are money the business
+// RECEIVES; this is money it owes.
+model VendorBill {
+  id             String    @id @default(cuid())
+  organizationId String
+  legalEntityId  String
+  connectionId   String
+  externalBillId String
+  billNumber     String
+  vendorName     String
+  vendorRef      String?
+  billDate       DateTime
+  dueDate        DateTime?
+
+  // Both stored: §57 is `invoice total − payments applied − credit notes`, and
+  // the accounting system has already done that arithmetic in `balance`.
+  // Keeping the total alongside it means an ageing report can distinguish "big
+  // bill mostly paid" from "small bill untouched".
+  totalAmount   BigInt // minor units of `currency`, NOT necessarily paise
+  balanceAmount BigInt
+
+  // Zoho organisations can be multi-currency. Stored per row and never summed
+  // across currencies without a guard — the same rule modules/calc/ads.ts
+  // enforces for ad spend.
+  currency  String   @default("INR")
+  status    String // draft | open | overdue | paid | void | partially_paid
+  raw       Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([connectionId, externalBillId])
+  @@index([organizationId, dueDate])
+  @@index([organizationId, status])
+  @@map("vendor_bills")
+}
+
+// §74 operating expenses. Categories come from the accounting system's own
+// chart of accounts rather than a category list invented here — the whole
+// point of connecting accounting is to adopt the books' classification.
+model Expense {
+  id                String   @id @default(cuid())
+  organizationId    String
+  legalEntityId     String
+  connectionId      String
+  externalExpenseId String
+  expenseDate       DateTime
+  accountName       String // chart-of-accounts head, e.g. "Advertising", "Rent"
+  vendorName        String?
+  description       String?
+  amount            BigInt // minor units of `currency`
+  taxAmount         BigInt   @default(0)
+  currency          String   @default("INR")
+  status            String?
+  raw               Json?
+  createdAt         DateTime @default(now())
+
+  @@unique([connectionId, externalExpenseId])
+  @@index([organizationId, expenseDate])
+  @@map("expenses")
+}
+
+// §24's cost-source hierarchy, applied to product cost: always expose where a
+// number came from, so an estimate is never mistaken for an invoice.
+enum CostSource {
+  SHOPIFY // pulled from Shopify InventoryItem.cost ("Cost per item")
+  MANUAL // entered by a user in the UI
+  CSV_IMPORT // bulk upload
+  ESTIMATED // derived or assumed — lowest confidence
+}
+
+// §19 COGS: product cost as DATE-EFFECTIVE records, never a single mutable
+// "current cost" column on the variant. The whole point is that last quarter's
+// contribution margin must not change because today's purchase price changed —
+// so a new cost is a new row with a new effectiveFrom, and historical orders
+// keep resolving against the row that was in force when they were placed.
+//
+// §20's costing method (Weighted Average / FIFO / Specific Identification)
+// is NOT implemented: that needs purchase-lot tracking, which requires purchase
+// orders / GRNs this system has no source for. What's here is effectively
+// Specific Identification against the effective-dated rate — the honest subset,
+// and the spec's own suggested MVP default (Weighted Average) would still need
+// lot data to be meaningful.
+model ProductCost {
+  id             String @id @default(cuid())
+  organizationId String
+
+  // SKU is the practical key: it's what a founder has in a spreadsheet and
+  // what survives a product being deleted and recreated in Shopify. variantId
+  // is resolved opportunistically and may be null for a cost entered before
+  // the product has synced.
+  sku       String
+  variantId String?
+
+  effectiveFrom DateTime
+
+  // §19 landed cost components, stored separately rather than as one total so
+  // a founder can see why a unit costs what it does — and so freight/duty can
+  // later be revised without losing the purchase price.
+  purchaseCost   BigInt // paise
+  inboundFreight BigInt @default(0)
+  importDuty     BigInt @default(0)
+  otherCost      BigInt @default(0)
+  // Denormalised sum of the four components above. Stored rather than computed
+  // so that a historical row is a fixed record of what was charged, immune to
+  // a future change in how landed cost is defined.
+  landedCost     BigInt
+
+  currency  String     @default("INR")
+  source    CostSource
+  note      String?
+  createdAt DateTime   @default(now())
+  createdBy String?
+
+  // One cost per SKU per effective date — re-uploading the same CSV updates in
+  // place instead of stacking duplicate rows (§94 idempotency).
+  @@unique([organizationId, sku, effectiveFrom])
+  @@index([organizationId, sku, effectiveFrom])
+  @@index([variantId])
+  @@map("product_costs")
+}
+
+enum ShipmentStatus {
+  NEW
+  PICKED_UP
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  RTO_INITIATED
+  RTO_DELIVERED
+  CANCELLED
+  LOST
+  UNKNOWN
+}
+
+// Shipment is deliberately separate from Order (not fields bolted onto it),
+// same reasoning as Payment/Settlement being their own tables — a courier's
+// view of an order (AWB, status, freight cost) is its own lifecycle that can
+// change independently of the order itself, and one order can have more than
+// one shipment (split fulfillment, RTO + reshipment).
+model Shipment {
+  id                 String         @id @default(cuid())
+  organizationId     String
+  legalEntityId      String
+  connectionId       String
+  externalShipmentId String
+  orderId            String? // matched to our Order via orderNumber; null if unmatched
+  awbCode            String?
+  courierName        String?
+  status             ShipmentStatus @default(UNKNOWN)
+  freightAmount      BigInt? // paise — not populated yet, see modules/connectors/shiprocket
+  codAmount          BigInt? // paise, cash-on-delivery amount to be collected, if any
+  pickedUpAt         DateTime?
+  deliveredAt        DateTime?
+  raw                Json?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  order           Order?           @relation(fields: [orderId], references: [id])
+  settlementLines SettlementLine[]
+
+  @@unique([connectionId, externalShipmentId])
+  @@index([organizationId, legalEntityId])
+  @@index([awbCode])
+  @@map("shipments")
+}
+
+// ---------------------------------------------------------------------------
+// Inbound email ingestion
+// ---------------------------------------------------------------------------
+
+// A per-org ingest address, e.g. docs-<token>@in.<domain>. The token is the
+// ONLY authentication an inbound email carries — sender addresses are trivially
+// forged and no Indian courier signs its mail — so it is long, random, stored
+// hashed-equivalent (unguessable, not derived), and rotatable. Rotation is a
+// new row rather than an update: mail sent to the old address during the
+// changeover window still has to be attributable, and a merchant who rotates
+// because the address leaked needs the old one DEAD, which `disabledAt` makes
+// explicit rather than implied by overwrite.
+model EmailIngestAddress {
+  id             String    @id @default(cuid())
+  organizationId String
+  token          String    @unique
+  createdAt      DateTime  @default(now())
+  disabledAt     DateTime?
+
+  inboundEmails InboundEmail[]
+
+  @@index([organizationId])
+  @@map("email_ingest_addresses")
+}
+
+enum InboundEmailStatus {
+  PROCESSED // every attachment either imported or was a duplicate
+  PARTIAL   // some attachments imported, some failed or were unrecognised
+  FAILED    // attachments present, none imported
+  EMPTY     // no attachments worth trying (no PDF/CSV)
+}
+
+// One row per email received, whatever happened to it. This table is the
+// answer to "I forwarded the invoice yesterday, where is it?" — without it a
+// silently-dropped attachment is indistinguishable from mail that never
+// arrived, and the merchant's only recourse is re-forwarding into the void.
+model InboundEmail {
+  id             String             @id @default(cuid())
+  organizationId String
+  addressId      String
+  /** RFC Message-ID when the provider passes one — the dedupe key for retries. */
+  messageId      String?
+  fromAddress    String?
+  subject        String?
+  attachmentCount Int
+  status         InboundEmailStatus
+  /** Per-attachment outcomes: [{name, kind, ok, detail}] — what the log renders. */
+  outcomes       Json
+  createdAt      DateTime           @default(now())
+
+  address EmailIngestAddress @relation(fields: [addressId], references: [id], onDelete: Cascade)
+
+  // Providers retry webhook deliveries on timeout; the same email must not
+  // import its attachments twice. Message-ID is the natural key when present.
+  @@unique([organizationId, messageId])
+  @@index([organizationId, createdAt])
+  @@map("inbound_emails")
+}
+
+// ---------------------------------------------------------------------------
+// Courier freight invoices
+// ---------------------------------------------------------------------------
+
+// What a courier CHARGED us to carry parcels — distinct in every way from a COD
+// remittance, which is what a courier COLLECTED and paid us. Kept in its own
+// tables rather than folded into Settlement for exactly that reason: one is a
+// cost, the other is a receipt, and a shared table invites summing them.
+//
+// Persisted rather than being applied straight onto Shipment.freightAmount and
+// discarded, because the invoice answers questions the shipment cannot:
+//   - which invoice a charge came from, when a figure is disputed
+//   - whether an invoice has already been uploaded (re-upload is idempotent)
+//   - which AWBs were billed that we have NO shipment for — invisible otherwise
+model FreightInvoice {
+  id              String    @id @default(cuid())
+  organizationId  String
+  legalEntityId   String
+  connectionId    String
+  /** Courier's own invoice number, e.g. "2026709R00005458". */
+  invoiceNo       String
+  invoiceDate     DateTime?
+  /** The courier account billed, e.g. "NDA821166". */
+  customerAccount String?
+  /** e.g. "Etail Air COD" / "Etail Air Prepaid" — the COD/prepaid split. */
+  product         String?
+  carrier         String // normalised carrier slug, see connectors/courier.ts
+  /** paise — the freight subtotal the invoice itself states. */
+  statedTotal     BigInt?
+  /** paise — grand total incl. surcharges and GST. NOT the sum of the lines. */
+  grandTotal      BigInt?
+  /** paise — sum of the parsed lines. Equals statedTotal or the upload is refused. */
+  lineTotal       BigInt
+  lineCount       Int
+  fileName        String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  lines FreightInvoiceLine[]
+
+  // Re-uploading the same PDF must not double-count freight. The courier's own
+  // invoice number is the natural key.
+  @@unique([organizationId, invoiceNo])
+  @@index([organizationId, carrier])
+  @@map("freight_invoices")
+}
+
+model FreightInvoiceLine {
+  id              String    @id @default(cuid())
+  organizationId  String
+  invoiceId       String
+  awb             String
+  /** Resolved at apply time. Null means the courier billed for a parcel we have no record of. */
+  shipmentId      String?
+  shipDate        DateTime
+  destination     String?
+  serviceType     String?
+  chargedWeightKg Float?
+  /** paise, SIGNED — negative rows are credits the courier issued back. */
+  amount          BigInt
+  /** The courier's (R) prefix: a return leg, billed on top of the outbound one. */
+  isReturnLeg     Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+
+  invoice  FreightInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, awb])
+  @@index([invoiceId])
+  @@index([shipmentId])
+  @@map("freight_invoice_lines")
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation
+// ---------------------------------------------------------------------------
+
+enum MatchType {
+  ORDER_PAYMENT
+  PAYMENT_SETTLEMENT
+  SETTLEMENT_BANK
+  COD_REMITTANCE
+  // Shipment ↔ courier freight invoice line. The only leg that reconciles a
+  // COST rather than a receipt, and it runs in both directions: a shipment with
+  // no invoice line is freight we have not been billed for yet (or an invoice
+  // we have not uploaded), and an invoice line with no shipment is the courier
+  // billing for a parcel this system has no record of — which is money leaving
+  // for nothing, and the only place it would ever surface.
+  SHIPMENT_FREIGHT
+}
+
+enum MatchConfidence {
+  HIGH
+  MEDIUM
+  LOW
+  MANUAL
+}
+
+enum MatchStatus {
+  MATCHED
+  EXCEPTION
+  RESOLVED
+}
+
+// One row per PAIRING the engine established — never one row per unmatched
+// record. Unmatched is the absence of a row, computed with a LEFT JOIN at read
+// time (modules/calc/reconciliation.ts), because "unmatched" is not a fact
+// about an order, it is a fact about the current state of every OTHER table:
+// materialising 49,617 exception rows would mean re-deriving all of them every
+// time a single payment arrives.
+//
+// The one exception is a human WRITE-OFF — "this order will never be paid,
+// stop showing it" — which is a decision, not a derivation, so it must be
+// stored. That is the only case with a null target.
+model ReconciliationMatch {
+  id             String          @id @default(cuid())
+  organizationId String
+  matchType      MatchType
+  confidence     MatchConfidence
+  sourceType     String
+  sourceId       String
+  // Nullable ONLY for a written-off source (see above). Every engine-produced
+  // match has both sides.
+  targetType     String?
+  targetId       String?
+  amountDeltaAbs BigInt          @default(0) // paise, |source - target|
+  status         MatchStatus     @default(MATCHED)
+  // Free text on a write-off/resolution, so a decision carries its reason.
+  note           String?
+  resolvedBy     String?
+  resolvedAt     DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @default(now()) @updatedAt
+
+  // Re-running the engine must be idempotent — it is a pure function of the
+  // current tables, so the same pass must upsert the same rows rather than
+  // duplicating them. Postgres treats NULLs as distinct, so write-off rows
+  // (null target) are deliberately outside this constraint.
+  @@unique([matchType, sourceType, sourceId, targetType, targetId], name: "recon_pair")
+  @@index([organizationId, status])
+  @@index([organizationId, matchType])
+  @@index([sourceType, sourceId])
+  @@index([targetType, targetId])
+  @@map("reconciliation_matches")
+}
+
+// ---------------------------------------------------------------------------
+// Computed metrics (output of the deterministic calc engine — the AI CFO and
+// dashboard both read from here, never from raw tables directly, so every
+// number they show is versioned and reproducible)
+// ---------------------------------------------------------------------------
+
+enum MetricGranularity {
+  DAILY
+  MONTHLY
+}
+
+enum MetricConfidence {
+  ESTIMATED
+  PROVISIONAL
+  RECONCILED
+  FINAL
+}
+
+model MetricSnapshot {
+  id             String            @id @default(cuid())
+  organizationId String
+  legalEntityId  String?
+  metricKey      String // e.g. "revenue", "contribution_margin", "cash_forecast_7d"
+  granularity    MetricGranularity
+  periodStart    DateTime
+  periodEnd      DateTime
+  valueMinor     BigInt? // paise, for money metrics
+  valueNumeric   Float? // for ratios/percentages only — never for currency
+  formulaVersion String
+  confidence     MetricConfidence  @default(ESTIMATED)
+  computedAt     DateTime          @default(now())
+
+  @@unique([organizationId, legalEntityId, metricKey, granularity, periodStart, formulaVersion])
+  @@index([organizationId, metricKey, periodStart])
+  @@map("metric_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// Audit (insert-only — every financial calculation and every user/AI action
+// that touches money gets a row here; never update or delete rows in this table)
+// ---------------------------------------------------------------------------
+
+enum ActorType {
+  USER
+  SYSTEM
+  AI
+}
+
+model AuditLog {
+  id             String    @id @default(cuid())
+  organizationId String
+  actorType      ActorType
+  actorId        String
+  action         String
+  entityType     String
+  entityId       String?
+  metadata       Json?
+  createdAt      DateTime  @default(now())
+
+  @@index([organizationId, createdAt])
+  @@map("audit_log")
+}
