@@ -1041,3 +1041,77 @@ model AuditLog {
   @@index([organizationId, createdAt])
   @@map("audit_log")
 }
+
+// §17 anomaly detection. Rule-based (v1, per spec) — modules/calc/anomalies.ts
+// is the registry; every value here is computed there, never guessed by a
+// route or by the AI layer.
+enum AnomalyType {
+  REVENUE_DECLINE
+  REVENUE_SPIKE
+  AD_SPEND_SPIKE
+  RTO_INCREASE
+  REFUND_INCREASE
+  COURIER_COST_INCREASE
+  NEGATIVE_MARGIN_SKU
+  MISSING_SETTLEMENT
+  DUPLICATE_PAYMENT
+  CANCELLATION_INCREASE
+  PRODUCT_COST_INCREASE
+  CASH_BELOW_THRESHOLD
+}
+
+enum AnomalySeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AnomalyStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  DISMISSED
+}
+
+model Anomaly {
+  id             String          @id @default(cuid())
+  organizationId String
+  type           AnomalyType
+  severity       AnomalySeverity
+
+  // Numeric axis of the finding — not always paise (e.g. RTO_INCREASE's
+  // values are a rate in percentage points), so plain Float rather than the
+  // BigInt-paise convention every money value elsewhere uses. Rules that ARE
+  // money-shaped (revenue, ad spend, courier cost, cash) still put the paise
+  // figure here as a plain number — safe up to ~9e15, far past anything a
+  // D2C brand's numbers reach — and keep the exact BigInt string in evidence.
+  observedValue Float
+  expectedValue Float
+  difference    Float
+
+  periodStart DateTime
+  periodEnd   DateTime
+
+  // Rule-specific detail: which SKUs, which orders, the exact paise strings,
+  // the query that produced the finding. What recommendedInvestigation below
+  // tells a human to go look AT.
+  evidence               Json
+  recommendedInvestigation String
+
+  ownerId String? // Clerk user id — unassigned until a human claims it
+  status  AnomalyStatus @default(OPEN)
+
+  // One row per (type, org, period) — see modules/calc/anomalies.ts's
+  // dedupeKeyFor(). Re-running the same day's check is an upsert, not a
+  // second row; a new day is a new period and a new row, which is what lets
+  // "since when has this been true" be answered by querying history instead
+  // of only ever seeing today's snapshot.
+  dedupeKey String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId, status])
+  @@index([organizationId, type])
+  @@map("anomalies")
+}
