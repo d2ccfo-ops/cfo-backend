@@ -353,7 +353,8 @@ model Payment {
   currency          String    @default("INR")
   method            String?
   status            String
-  feeAmount         BigInt? // gateway fee, paise
+  feeAmount         BigInt? // gateway fee, paise (GST-inclusive, where the provider states it that way)
+  taxAmount         BigInt? // GST portion of feeAmount, paise — a subset of it, not additional to it
   capturedAt        DateTime?
   raw               Json?
   createdAt         DateTime  @default(now())
@@ -378,6 +379,7 @@ model Settlement {
   externalSettlementId String
   amount               BigInt // paise, net settled
   feeAmount            BigInt    @default(0)
+  taxAmount            BigInt    @default(0) // GST portion of feeAmount, paise — a subset of it, not additional to it
   utr                  String?
   status               String
   settledAt            DateTime?
@@ -455,6 +457,7 @@ model SettlementLine {
   // instead of silently reconciled.
   grossAmount BigInt // paise
   feeAmount   BigInt   @default(0)
+  taxAmount   BigInt   @default(0) // GST portion of feeAmount, paise — a subset of it, not additional to it
   netAmount   BigInt // paise
   raw         Json?
   createdAt   DateTime @default(now())
