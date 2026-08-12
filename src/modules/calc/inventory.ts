@@ -12,7 +12,27 @@ import { paiseToRupees, sumPaise } from "./money.js";
 // showing one — same reasoning as available-cash's missingOpeningBalance
 // handling in modules/calc/cash.ts.
 
-const FORMULA_VERSION = "v1";
+const FORMULA_VERSION = "v2";
+
+// UNITS ABOVE THIS ARE NOT A STOCK LEVEL.
+//
+// Found by the cash-conversion-cycle work (P6.2), which reported DIO of
+// 1,684,116 days for the pilot organisation. The arithmetic was right; the
+// input was not. This org's variants include one with 1,000,000 units at ₹1
+// and four above 100,000 — the placeholder quantities a merchant sets in
+// Shopify so the storefront never blocks a sale on an untracked item. Summed
+// at price, they produced an inventory valuation of ₹2,274 crore for a brand
+// doing about ₹1 crore of revenue.
+//
+// That figure has been on the Inventory page all along. It is the most
+// dangerous kind of wrong number in this product: not invented, but COMPUTED
+// — from real rows, by correct code, at a magnitude nobody sanity-checked.
+//
+// So variants above the threshold are excluded from the headline and REPORTED,
+// with their SKUs. Not silently capped: if 20,000 units really is this
+// business's stock level, the founder needs to see that we disagreed and say
+// so, rather than find a quietly adjusted number.
+const IMPLAUSIBLE_UNITS_PER_VARIANT = 10_000;
 
 export async function getInventoryValueSummary(organizationId: string) {
   const now = new Date();
@@ -20,11 +40,30 @@ export async function getInventoryValueSummary(organizationId: string) {
 
   const variants = await prisma.productVariant.findMany({
     where: { product: { organizationId } },
-    select: { price: true, inventoryQuantity: true },
+    select: { sku: true, price: true, inventoryQuantity: true },
   });
 
-  const valueMinor = sumPaise(variants.map((v) => v.price * BigInt(v.inventoryQuantity)));
-  const unitsOnHand = variants.reduce((sum, v) => sum + v.inventoryQuantity, 0);
+  const tracked = variants.filter((v) => v.inventoryQuantity < IMPLAUSIBLE_UNITS_PER_VARIANT);
+  const untracked = variants.filter((v) => v.inventoryQuantity >= IMPLAUSIBLE_UNITS_PER_VARIANT);
+
+  // The headline is the defensible figure. The all-variants total is still
+  // reported beside it, because hiding the difference would leave someone
+  // comparing this page against Shopify's own number with no explanation.
+  const valueMinor = sumPaise(tracked.map((v) => v.price * BigInt(v.inventoryQuantity)));
+  const unitsOnHand = tracked.reduce((sum, v) => sum + v.inventoryQuantity, 0);
+  const allVariantsValueMinor = sumPaise(variants.map((v) => v.price * BigInt(v.inventoryQuantity)));
+  const excludedUnits = untracked.reduce((sum, v) => sum + v.inventoryQuantity, 0);
+
+  const warnings: string[] = [];
+  if (untracked.length > 0) {
+    const worst = [...untracked]
+      .sort((a, b) => b.inventoryQuantity - a.inventoryQuantity)
+      .slice(0, 5)
+      .map((v) => `${v.sku ?? "(no SKU)"} at ${v.inventoryQuantity.toLocaleString("en-IN")} units`);
+    warnings.push(
+      `${untracked.length} variant(s) report ${excludedUnits.toLocaleString("en-IN")} units between them — at or above ${IMPLAUSIBLE_UNITS_PER_VARIANT.toLocaleString("en-IN")} each — and are EXCLUDED from this valuation. These are the placeholder quantities a store sets so an untracked item never blocks a sale, not counted stock. Largest: ${worst.join(", ")}. Including them would value this inventory at ${paiseToRupees(allVariantsValueMinor).toLocaleString("en-IN")} rupees.`
+    );
+  }
 
   const existingSnapshot = await prisma.metricSnapshot.findFirst({
     where: {
@@ -63,7 +102,14 @@ export async function getInventoryValueSummary(organizationId: string) {
     valueMinor: valueMinor.toString(),
     value: paiseToRupees(valueMinor),
     unitsOnHand,
-    variantCount: variants.length,
+    variantCount: tracked.length,
+    // Stated so the difference from Shopify's own figure is explicable rather
+    // than mysterious.
+    allVariantsValueMinor: allVariantsValueMinor.toString(),
+    excludedVariantCount: untracked.length,
+    excludedUnits,
+    implausibleUnitsThreshold: IMPLAUSIBLE_UNITS_PER_VARIANT,
+    warnings,
     asOf: now.toISOString(),
     // Deliberately ignores the dashboard's date filter, and says so rather
     // than silently returning today's figure under a historical heading.

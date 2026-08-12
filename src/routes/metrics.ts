@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { getStateProfitability } from "../modules/calc/geography.js";
+import { getCashConversionCycle } from "../modules/calc/cashCycle.js";
 import { unsupportedScopeMessage, withEntityScope } from "../lib/entityScope.js";
 import { z } from "zod";
 import { withDateRange } from "../lib/dateRange.js";
@@ -342,4 +344,19 @@ metricsRouter.get("/payables", ...requireAuth, withDateRange, withEntityScope, a
 metricsRouter.get("/freshness", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
   const summary = await getDataFreshness(req.auth!.organizationId);
   res.json(summary);
+});
+
+// §14 state profitability (P6.1). RTO is regional in India — a state at 25%
+// and a state at 6% are different businesses sharing a catalogue, and the
+// aggregate rate hides both. The state is derived at read time from the raw
+// payload and nothing else is: no street, no pincode, no name.
+metricsRouter.get("/state-profitability", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+  res.json(await getStateProfitability(req.auth!.organizationId, req.dateRange!, req.entityScope));
+});
+
+// §14 cash conversion cycle (P6.2). The number that explains why a profitable
+// month can still leave the bank account emptier. Reported as null when any of
+// its three terms cannot be measured — a partial cycle is not a shorter cycle.
+metricsRouter.get("/cash-conversion-cycle", ...requireAuth, withDateRange, async (req, res) => {
+  res.json(await getCashConversionCycle(req.auth!.organizationId, req.dateRange!));
 });
