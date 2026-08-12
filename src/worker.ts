@@ -2,6 +2,7 @@ import { logger } from "./lib/logger.js";
 import { prisma } from "./lib/prisma.js";
 import { redisConnection } from "./lib/redis.js";
 import { anomalySchedulerQueue, startAnomalyScheduler } from "./modules/queue/anomalyScheduler.js";
+import { notificationSchedulerQueue, startNotificationScheduler } from "./modules/queue/notificationScheduler.js";
 import { snapshotSchedulerQueue, startSnapshotScheduler } from "./modules/queue/snapshotScheduler.js";
 import { startSyncScheduler, syncSchedulerQueue } from "./modules/queue/syncScheduler.js";
 import { startSyncWorker } from "./modules/queue/syncWorker.js";
@@ -30,6 +31,10 @@ const anomalyScheduler = startAnomalyScheduler();
 // be made up later, because the position metrics it records read current-state
 // tables that hold no history to look back through.
 const snapshotScheduler = startSnapshotScheduler();
+// §23. Runs after the anomaly sweep on purpose — it emits a notification per
+// CRITICAL open anomaly, so going first would notify about yesterday's
+// findings and miss tonight's.
+const notificationScheduler = startNotificationScheduler();
 
 // Re-entrancy guard. Without it a second signal — or the same signal delivered
 // to both the `tsx watch` wrapper and this child, which is what happens on
@@ -52,6 +57,8 @@ async function shutdown(signal: string) {
     await anomalySchedulerQueue.close();
     await snapshotScheduler.close();
     await snapshotSchedulerQueue.close();
+    await notificationScheduler.close();
+    await notificationSchedulerQueue.close();
     await worker.close();
     await redisConnection.quit();
     await prisma.$disconnect();

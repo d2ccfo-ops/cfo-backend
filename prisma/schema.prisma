@@ -1178,3 +1178,62 @@ model Anomaly {
   @@index([organizationId, type])
   @@map("anomalies")
 }
+
+// ---------------------------------------------------------------------------
+// §23 Notifications (P3.1)
+// ---------------------------------------------------------------------------
+// "Anomalies nobody sees are worthless." The §17 engine has run nightly since
+// P2.1c and finds real problems — a below-cost SKU, a settlement that stopped
+// arriving — and every one of them waits for someone to open the Exceptions
+// page and notice. This table is what turns a finding into something that
+// reaches a person.
+
+enum NotificationType {
+  ANOMALY_CREATED
+  SYNC_FAILED
+  DATA_STALE
+  RECON_EXCEPTION_SPIKE
+  CASH_BELOW_THRESHOLD
+  VENDOR_PAYMENT_DUE
+}
+
+enum NotificationSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+model Notification {
+  id             String               @id @default(cuid())
+  organizationId String
+  type           NotificationType
+  severity       NotificationSeverity
+  title          String
+  body           String
+
+  // What this is ABOUT, so the UI can link somewhere useful. Deliberately a
+  // loose pair rather than six nullable foreign keys: the referenced entity
+  // differs per type (an Anomaly, a Connection, a VendorBill), and a column
+  // per type would need a migration for every new emitter.
+  resourceType String?
+  resourceId   String?
+
+  // The same rule the anomaly engine holds to. Emitters are polled — the
+  // nightly sweep re-evaluates every condition from scratch — so without this
+  // a founder whose cash has been below threshold for three weeks would find
+  // twenty-one identical rows waiting. One condition, one row, updated in
+  // place while it persists.
+  dedupeKey String @unique
+
+  // Null until read. Reading is the ONLY thing a user can do to a
+  // notification: there is no delete, because a notification is a record that
+  // someone was told, and quietly removing it would make the audit trail lie
+  // about what was communicated.
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([organizationId, readAt])
+  @@index([organizationId, createdAt])
+  @@map("notifications")
+}

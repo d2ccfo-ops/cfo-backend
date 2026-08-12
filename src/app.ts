@@ -35,6 +35,7 @@ import { metricsRouter } from "./routes/metrics.js";
 import { evidenceRouter } from "./routes/evidence.js";
 import { auditRouter } from "./routes/audit.js";
 import { anomaliesRouter } from "./routes/anomalies.js";
+import { notificationsRouter } from "./routes/notifications.js";
 import { reconciliationRouter } from "./routes/reconciliation.js";
 import { settlementsRouter } from "./routes/settlements.js";
 import { clerkWebhookRouter } from "./routes/webhooks/clerk.js";
@@ -108,6 +109,7 @@ export function createApp() {
   app.use("/evidence", evidenceRouter);
   app.use("/audit", auditRouter);
   app.use("/anomalies", anomaliesRouter);
+  app.use("/notifications", notificationsRouter);
   app.use("/inventory", inventoryRouter);
   app.use("/costs", costsRouter);
   app.use("/preferences", preferencesRouter);
