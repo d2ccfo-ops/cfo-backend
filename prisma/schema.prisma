@@ -96,11 +96,27 @@ model LegalEntity {
   @@map("legal_entities")
 }
 
+// §12.2's seven roles. MEMBER is the eighth value and is kept deliberately:
+// Postgres enum values can be added additively but not removed without a table
+// rewrite, and every membership row in this database currently carries it.
+// middleware/rbac.ts maps MEMBER to ANALYST wherever a decision is made, so
+// nothing has to know about the legacy value except that one function.
 enum MembershipRole {
   OWNER
   ADMIN
   MEMBER
   VIEWER
+  // Signs off on money movements and can act on findings, but cannot touch
+  // credentials — a connector token is the keys to the business.
+  FINANCE_MANAGER
+  // Enters and restamps costs. The one write this role has that
+  // FINANCE_MANAGER does not need to be granted separately.
+  ACCOUNTANT
+  // Reads everything and can run what-ifs. What MEMBER always meant.
+  ANALYST
+  // A read-only guest with no ability to spend anything — not even a model
+  // call. Brought in to look at the books, not to work in them.
+  EXTERNAL_CA
 }
 
 model Membership {

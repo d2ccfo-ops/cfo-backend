@@ -62,6 +62,21 @@ clerkWebhookRouter.post("/", async (req, res) => {
           update: { name: data.organization.name },
           select: { id: true },
         });
+        // The role has to be RECONCILED, not overwritten. Clerk knows two
+        // roles; §12.2 has seven. Writing mapClerkRole(data.role) on every
+        // update — which is what this did — would silently flatten an
+        // in-app FINANCE_MANAGER or EXTERNAL_CA back to the default the next
+        // time Clerk fired an unrelated membership event, and nothing would
+        // say so. See reconcileRole below.
+        const existing = await prisma.membership.findUnique({
+          where: {
+            organizationId_clerkUserId: {
+              organizationId: organization.id,
+              clerkUserId: data.public_user_data.user_id,
+            },
+          },
+          select: { role: true },
+        });
         await prisma.membership.upsert({
           where: {
             organizationId_clerkUserId: {
@@ -73,9 +88,12 @@ clerkWebhookRouter.post("/", async (req, res) => {
             organizationId: organization.id,
             clerkUserId: data.public_user_data.user_id,
             email: data.public_user_data.identifier,
-            role: mapClerkRole(data.role),
+            role: reconcileRole(data.role, null),
           },
-          update: { role: mapClerkRole(data.role) },
+          update: {
+            email: data.public_user_data.identifier,
+            role: reconcileRole(data.role, existing?.role ?? null),
+          },
         });
         break;
       }
@@ -109,8 +127,31 @@ clerkWebhookRouter.post("/", async (req, res) => {
   res.json({ received: true });
 });
 
-function mapClerkRole(clerkRole: string): MembershipRole {
-  if (clerkRole === "org:admin") return "ADMIN";
+/**
+ * Reconcile Clerk's two-role model with §12.2's seven.
+ *
+ * Clerk is the authority on ADMINISTRATIVE standing — who can manage the
+ * organisation itself. CFOOS is the authority on FUNCTIONAL role — who signs
+ * off on money, who enters costs, who is a read-only guest. Neither can
+ * express the other's distinctions, so the merge rules are:
+ *
+ *   org:owner  → OWNER, always. Ownership is Clerk's to assert.
+ *   org:admin  → ADMIN, unless the stored role is already OWNER (Clerk lists
+ *                the owner as an admin too, and demoting them here would let
+ *                an org lose its only owner to a webhook replay).
+ *   org:member → keep whatever functional role was assigned in-app. Only when
+ *                the stored role is an ADMINISTRATIVE one does this become a
+ *                real demotion, and then it lands on ANALYST — the read-and-
+ *                analyse default that MEMBER always meant.
+ *
+ * New members default to ANALYST rather than MEMBER. MEMBER remains a valid
+ * enum value for the rows that already carry it; nothing writes it any more.
+ */
+export function reconcileRole(clerkRole: string, existing: MembershipRole | null): MembershipRole {
   if (clerkRole === "org:owner") return "OWNER";
-  return "MEMBER";
+  if (clerkRole === "org:admin") return existing === "OWNER" ? "OWNER" : "ADMIN";
+  // Clerk says plain member.
+  if (existing === null) return "ANALYST";
+  if (existing === "OWNER" || existing === "ADMIN") return "ANALYST";
+  return existing;
 }

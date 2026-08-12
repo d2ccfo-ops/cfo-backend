@@ -1,12 +1,23 @@
 import { getAuth } from "@clerk/express";
+import type { MembershipRole } from "@prisma/client";
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { enforceRbac, normaliseRole } from "./rbac.js";
 
 export interface AuthContext {
   organizationId: string;
   legalEntityId: string | null;
   userId: string;
-  role: "org:admin" | "org:member" | string;
+  /**
+   * THIS ORGANISATION'S role for this user, from the Membership row.
+   *
+   * It used to be Clerk's org role string ("org:admin"), which nothing read
+   * and which cannot express the seven §12.2 roles — Clerk has two. The
+   * Membership row is the authority now, and middleware/rbac.ts decides on it.
+   */
+  role: MembershipRole;
+  /** Clerk's own role, kept for the webhook reconciliation path and for logs. */
+  clerkRole: string;
   // §3. Carried on the auth context because lib/dateRange.ts's withDateRange
   // must stay SYNCHRONOUS (see the note there on Express 4 async throws), so it
   // cannot look the organisation up itself — but it always runs after this.
@@ -30,7 +41,10 @@ declare global {
 // and always returns JSON, then resolves Clerk's orgId (the tenant the user
 // has selected in the org switcher) onto our internal Organization row — org
 // scope always comes from this verified claim, never from a client header.
-export const requireAuth = [resolveOrgContext];
+// Two middlewares, always in this order, and the second one is why RBAC
+// cannot be forgotten on a new route: anything that authenticates is also
+// authorised. See the note at the top of middleware/rbac.ts.
+export const requireAuth = [resolveOrgContext, enforceRbac];
 
 // Signed-in user, no organisation required. Exists for exactly one situation:
 // onboarding renders BEFORE the user has created an organisation, so an
@@ -72,11 +86,33 @@ async function resolveOrgContext(req: Request, res: Response, next: NextFunction
     return;
   }
 
+  // The Membership row is the authority on what this person may do. It is
+  // looked up per request rather than trusted from the token, because a role
+  // change has to take effect on the next request and a JWT does not expire
+  // when someone is demoted.
+  const membership = await prisma.membership.findUnique({
+    where: { organizationId_clerkUserId: { organizationId: organization.id, clerkUserId: userId } },
+    select: { role: true },
+  });
+
+  // No membership row is not a reason to lock someone out of an org Clerk says
+  // they belong to — the webhook can lag or have failed, and the resulting
+  // lockout would look like a total outage. It IS a reason not to grant
+  // anything above what Clerk itself asserts, so an admin falls back to ADMIN
+  // and everyone else to ANALYST. Never OWNER: that one is granted, not
+  // inferred.
+  const role: MembershipRole = membership
+    ? normaliseRole(membership.role)
+    : orgRole === "org:admin" || orgRole === "org:owner"
+      ? "ADMIN"
+      : "ANALYST";
+
   req.auth = {
     organizationId: organization.id,
     legalEntityId: null,
     userId,
-    role: orgRole ?? "org:member",
+    role,
+    clerkRole: orgRole ?? "org:member",
     timezone: organization.timezone,
   };
   next();

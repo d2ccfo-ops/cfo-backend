@@ -1,5 +1,8 @@
 import { Router } from "express";
+import { z } from "zod";
+import { writeAudit } from "../lib/audit.js";
 import { requireAuth } from "../middleware/auth.js";
+import { ROLE_ORDER, normaliseRole, requireRole } from "../middleware/rbac.js";
 import { prisma } from "../lib/prisma.js";
 
 export const organizationRouter = Router();
@@ -40,3 +43,121 @@ organizationRouter.get("/", ...requireAuth, async (req, res) => {
         : null,
   });
 });
+
+// ---------------------------------------------------------------------------
+// §12.2 team management (P5.1)
+// ---------------------------------------------------------------------------
+// The Team page was decorative: roles were stored by the Clerk webhook and
+// read by nothing, so every member of an organisation had every permission.
+// These two endpoints, plus middleware/rbac.ts, make the page mean something.
+
+organizationRouter.get("/members", ...requireAuth, async (req, res) => {
+  const members = await prisma.membership.findMany({
+    where: { organizationId: req.auth!.organizationId },
+    orderBy: [{ createdAt: "asc" }],
+    select: { id: true, clerkUserId: true, email: true, role: true, createdAt: true },
+  });
+  res.json({
+    members: members.map((m) => ({
+      ...m,
+      // The stored value AND what it resolves to. A row still carrying the
+      // legacy MEMBER should show as MEMBER and be explained, not silently
+      // relabelled — someone auditing permissions needs to see what is in the
+      // database.
+      role: m.role,
+      effectiveRole: normaliseRole(m.role),
+      isYou: m.clerkUserId === req.auth!.userId,
+      createdAt: m.createdAt.toISOString(),
+    })),
+    roles: ROLE_ORDER,
+    yourRole: req.auth!.role,
+    // Whether the caller may change anything here, so the UI can render
+    // read-only rather than offer a control that 403s.
+    canManage: req.auth!.role === "OWNER" || req.auth!.role === "ADMIN",
+  });
+});
+
+const roleSchema = z.object({ role: z.enum(ROLE_ORDER as [string, ...string[]]) }).strict();
+
+organizationRouter.patch(
+  "/members/:id/role",
+  ...requireAuth,
+  // enforceRbac already restricts /organization writes to OWNER and ADMIN.
+  // This states it again at the one endpoint that changes who can do what,
+  // because a permission change is the wrong place to rely on a path prefix
+  // continuing to mean what it means today.
+  requireRole("OWNER", "ADMIN"),
+  async (req, res, next) => {
+    let parsed: { role: string };
+    try {
+      parsed = roleSchema.parse(req.body ?? {});
+    } catch (err) {
+      next(err);
+      return;
+    }
+
+    const target = await prisma.membership.findFirst({
+      where: { id: req.params.id, organizationId: req.auth!.organizationId },
+      select: { id: true, clerkUserId: true, email: true, role: true },
+    });
+    // 404, not 403: a valid id from another organisation must not be confirmed
+    // to exist.
+    if (!target) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+
+    // Nobody demotes themselves out of the ability to undo it. Without this an
+    // organisation's only admin can lock everyone out of connections and
+    // member management with one click and no way back.
+    if (target.clerkUserId === req.auth!.userId && parsed.role !== req.auth!.role) {
+      res.status(409).json({
+        error: "cannot_change_own_role",
+        message: "You cannot change your own role. Ask another owner or admin to do it.",
+      });
+      return;
+    }
+
+    // An organisation must always have at least one OWNER.
+    if (target.role === "OWNER" && parsed.role !== "OWNER") {
+      const owners = await prisma.membership.count({
+        where: { organizationId: req.auth!.organizationId, role: "OWNER" },
+      });
+      if (owners <= 1) {
+        res.status(409).json({
+          error: "last_owner",
+          message: "This is the organisation's only owner. Promote someone else to owner first.",
+        });
+        return;
+      }
+    }
+
+    // Only an OWNER creates another OWNER. An ADMIN promoting themselves a
+    // deputy who can then remove them is not a hierarchy.
+    if (parsed.role === "OWNER" && req.auth!.role !== "OWNER") {
+      res.status(403).json({
+        error: "owner_only",
+        message: "Only an owner can make someone else an owner.",
+      });
+      return;
+    }
+
+    const updated = await prisma.membership.update({
+      where: { id: target.id },
+      data: { role: parsed.role as never },
+      select: { id: true, email: true, role: true },
+    });
+
+    await writeAudit({
+      organizationId: req.auth!.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "membership.role_changed",
+      entityType: "MEMBERSHIP",
+      entityId: target.id,
+      metadata: { email: target.email, from: target.role, to: parsed.role },
+    });
+
+    res.json({ ...updated, effectiveRole: normaliseRole(updated.role) });
+  }
+);
