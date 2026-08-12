@@ -107,6 +107,18 @@ export function createApp() {
   // getAuth(req)/requireAuth from middleware/auth.ts.
   app.use(clerkMiddleware());
 
+  // §27 rate limiting is NOT mounted here. It lives inside the requireAuth
+  // chain (middleware/auth.ts), because a limiter mounted before
+  // resolveOrgContext has no organisation to key on and silently degrades to
+  // per-IP — which on a multi-tenant API means one office's NAT looks like one
+  // customer, and a mobile network looks like thousands. Same reasoning as the
+  // RBAC guard: anything that authenticates is also limited, and a route
+  // written tomorrow is covered the moment it authenticates.
+  //
+  // Webhooks are deliberately outside it: they are mounted above
+  // clerkMiddleware, carry no org claim, and throttling a provider's delivery
+  // attempts converts our load problem into their retry storm.
+
   app.use("/organization", organizationRouter);
   app.use("/metrics", metricsRouter);
   app.use("/evidence", evidenceRouter);

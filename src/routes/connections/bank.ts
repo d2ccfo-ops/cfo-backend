@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { checkCsv } from "../../lib/uploadGuard.js";
 import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
@@ -64,6 +65,16 @@ bankConnectionRouter.post("/:connectionId/upload", ...requireAuth, async (req, r
   const { csv } = req.body ?? {};
   if (!csv || typeof csv !== "string") {
     res.status(400).json({ error: "missing_csv" });
+    return;
+  }
+
+  // §27 (P5.7). A portal export that silently returned a login page parses as
+  // a one-column CSV perfectly happily, and the downstream failure is "0 rows"
+  // — which everyone reads as "the account is empty". Checked here so the
+  // error names the actual problem.
+  const upload = checkCsv(csv);
+  if (!upload.ok) {
+    res.status(400).json({ error: "invalid_upload", message: upload.reason, detectedType: upload.detectedType ?? null });
     return;
   }
 

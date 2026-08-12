@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { checkBase64 } from "../../lib/uploadGuard.js";
 import { env } from "../../config/env.js";
 import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
@@ -216,6 +217,14 @@ async function ingestOnePdf(
   pdfBase64: string,
   fileName: string | undefined
 ) {
+  // §27 (P5.7). Checked at the ONE place both upload routes funnel through,
+  // so a single-file and a multi-file upload cannot diverge. A .pdf that is
+  // really a zip reaches pdf-parse and fails inside a worker thread with a
+  // message about the parser rather than about the file.
+  const check = checkBase64(pdfBase64, "pdf");
+  if (!check.ok) {
+    throw Object.assign(new Error(check.reason ?? "invalid upload"), { status: 400, code: "invalid_upload" });
+  }
   return ingestInvoicePdfDocument(connection, Buffer.from(pdfBase64, "base64"), fileName);
 }
 
