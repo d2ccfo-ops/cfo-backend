@@ -5,7 +5,11 @@ import { defineConfig } from "vitest/config";
 // deliberately separate so `npm test` can run in CI with no database at all.
 export default defineConfig({
   test: {
-    include: ["src/**/*.test.ts"],
+    // eval/ is included because the GRADER is pure and needs testing: a
+    // grader that marks a bad answer correct produces a green percentage
+    // that stops anyone looking, which is worse than having no eval. The
+    // eval RUNNER still needs a database and a key, and is not a test.
+    include: ["src/**/*.test.ts", "eval/**/*.test.ts"],
     environment: "node",
   },
 });

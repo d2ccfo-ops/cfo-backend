@@ -61,7 +61,19 @@ const KEEP = new Set([
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 // Indian mobile numbers, with or without +91 and separators. Deliberately
 // narrow: a broad \d{10} would eat order numbers, AWBs and amounts in paise.
-const PHONE_RE = /(?:\+?91[-\s]?)?[6-9]\d{4}[-\s]?\d{5}\b/g;
+//
+// The leading (?<!\d) is not cosmetic. Without it the pattern matched the TAIL
+// of a longer digit run whenever that run happened to end on a word boundary,
+// so a 13-digit Shopify order id like "1236123456789" was rewritten to
+// "123[phone]" and a UTR to "AXISN123[phone]". Whether that fired depended on
+// where a 6–9 landed inside the id, which is the worst kind of bug: it
+// corrupts an identifier for some records and not others, and the corrupted
+// ones stop matching anything downstream. Found by scripts/checkAiRestrictions.ts
+// running the mask over real order payloads.
+//
+// The trailing (?!\d) is the same guard on the other end — a 10-digit run
+// followed by more digits is not a phone number either.
+const PHONE_RE = /(?<![\d])(?:\+?91[-\s]?)?[6-9]\d{4}[-\s]?\d{5}(?!\d)/g;
 
 export function maskString(value: string): string {
   return value.replace(EMAIL_RE, "[email]").replace(PHONE_RE, "[phone]");

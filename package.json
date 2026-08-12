@@ -15,7 +15,9 @@
     "check:integration": "failed=\"\"; for f in scripts/check*.ts; do echo \"--- $f ---\"; npx tsx \"$f\" || failed=\"$failed $f\"; done; if [ -n \"$failed\" ]; then echo; echo \"FAILED SCRIPTS:$failed\"; exit 1; fi; echo; echo \"all integration checks passed\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "eval": "tsx eval/run.ts",
+    "eval:list": "tsx eval/run.ts --list"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0",
