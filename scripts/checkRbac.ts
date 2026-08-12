@@ -63,7 +63,13 @@ async function main() {
   console.log("\n[1] The guard is actually mounted");
   // ---------------------------------------------------------------------------
   const authSrc = await readFile(new URL("src/middleware/auth.ts", BACKEND), "utf8");
-  ok("requireAuth includes enforceRbac", /requireAuth\s*=\s*\[resolveOrgContext,\s*enforceRbac\]/.test(authSrc));
+  // Order matters and is asserted, not just membership: authorise before
+  // rate-limiting, so a request that will be refused for role does not consume
+  // the organisation's budget. P5.7 appended enforceRateLimit to this chain.
+  ok(
+    "requireAuth resolves the org, then authorises, then rate-limits",
+    /requireAuth\s*=\s*\[resolveOrgContext,\s*enforceRbac,\s*enforceRateLimit\]/.test(authSrc)
+  );
   ok("the auth context carries the Membership role, not Clerk's", authSrc.includes("prisma.membership.findUnique"));
   ok(
     "a missing membership row never falls back to OWNER",

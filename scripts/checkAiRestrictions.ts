@@ -1,4 +1,5 @@
 import { prisma } from "../src/lib/prisma.js";
+import { readFile } from "node:fs/promises";
 import { DEFAULT_TIMEZONE } from "../src/lib/dateRange.js";
 import { TOOLS, TOOLS_BY_NAME, executeTool, type ToolContext } from "../src/modules/ai/tools.js";
 import { maskPii, maskString } from "../src/modules/ai/pii.js";
@@ -118,19 +119,50 @@ async function main() {
     const offending = props.filter((p) => SQL_SHAPED.test(p));
     ok(`${t.name} exposes no query-shaped argument`, offending.length === 0, offending.join(", "));
   }
-  // Every argument a tool does accept is either a date, an enum, a bounded
-  // number or a boolean. A free string is the seam an injection would use.
-  const FREE_STRING_ALLOWED = new Set(["from", "to", "metric", "horizon"]);
+  // Every string argument is either an enum, a date, or explicitly listed here
+  // as CONTENT with the reason it has to be free.
+  //
+  // The rule this enforces is not "no free strings exist" — a drafted vendor
+  // message is free text by definition, and a rule that forbade it would
+  // simply be worked around. The rule is that no free string reaches a QUERY.
+  // Everything on this list is stored or returned verbatim; nothing on it
+  // becomes a filter, and the two tools that take an id use it in a
+  // parameterised findFirst scoped to the caller's organisation.
+  //
+  // A NEW free string is still a failure. Adding one means adding a line here
+  // and stating why, which is the point.
+  const FREE_STRING_ALLOWED = new Map<string, string>([
+    ["from", "date, parsed by resolveDateRange"],
+    ["to", "date, parsed by resolveDateRange"],
+    ["metric", "constrained by the zod enum even though the JSON schema shows a string"],
+    ["horizon", "validated by isForecastHorizon"],
+    ["vendorName", "content — appears in a draft the model wrote, never in a filter"],
+    ["subject", "content — draft only"],
+    ["body", "content — draft only"],
+    ["title", "content — stored on the approval request and shown to a reviewer"],
+    ["reason", "content — stored on the approval request and shown to a reviewer"],
+    ["amountPaise", "digits-only, enforced by the zod regex"],
+    ["entityId", "an id, used only in a parameterised findFirst scoped to the caller's org"],
+  ]);
   for (const t of TOOLS) {
     const props = (t.inputSchema as { properties?: Record<string, { type?: string; enum?: unknown[] }> }).properties ?? {};
     for (const [name, def] of Object.entries(props)) {
       if (def.type !== "string") continue;
       ok(
-        `${t.name}.${name} is a constrained string`,
+        `${t.name}.${name} is constrained or declared content`,
         FREE_STRING_ALLOWED.has(name) || Array.isArray(def.enum),
-        Array.isArray(def.enum) ? "" : "unconstrained free text"
+        Array.isArray(def.enum) ? "enum" : (FREE_STRING_ALLOWED.get(name) ?? "unconstrained free text with no declared reason")
       );
     }
+  }
+  // The other half of that rule: a content string must not reach a where
+  // clause. Asserted over the source rather than trusted.
+  const toolsSource = await readFile(new URL("../src/modules/ai/tools.ts", import.meta.url), "utf8");
+  for (const field of ["body", "subject", "vendorName", "title", "reason"]) {
+    ok(
+      `${field} never appears inside a where clause`,
+      !new RegExp(`where:\\s*\\{[^}]*\\b${field}\\b`).test(toolsSource)
+    );
   }
   ok(
     "no tool implementation calls $queryRaw or $executeRaw",
