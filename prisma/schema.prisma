@@ -1312,6 +1312,14 @@ model AgentRun {
   inputTokens    Int            @default(0)
   outputTokens   Int            @default(0)
   error          String?
+  // P4.7's verdict on this run's own answer, computed at answer time rather
+  // than only in the eval suite. Holds {figures, sources, pii} — which figures
+  // could not be found in any tool result, which sources named a tool that
+  // does not exist, and whether raw PII survived masking. Stored because "the
+  // model made a number up" is the one failure this product cannot detect
+  // later from the answer alone: the tool results that would disprove it are
+  // on AgentToolCall, but matching them back up after the fact is guesswork.
+  verification   Json?
   startedAt      DateTime       @default(now())
   finishedAt     DateTime?
 

@@ -93,11 +93,15 @@ aiRouter.get("/conversations/:id", ...requireAuth, async (req, res) => {
       runs: {
         orderBy: { startedAt: "asc" },
         select: {
-          id: true, status: true, turns: true, error: true, startedAt: true, finishedAt: true,
+          id: true, status: true, turns: true, error: true, verification: true, startedAt: true, finishedAt: true,
           // The tool trail, because §19's promise is that every figure came
           // from one of these. An answer nobody can trace back is not
           // auditable, and this is what makes it traceable from the UI.
-          toolCalls: { orderBy: { createdAt: "asc" }, select: { toolName: true, ok: true, error: true, durationMs: true } },
+          // `result` is selected only to lift evidenceRef back out — see the
+          // map built below. The payload itself never leaves this handler; it
+          // is the masked tool output and belongs in the audit table, not in
+          // a thread render.
+          toolCalls: { orderBy: { createdAt: "asc" }, select: { toolName: true, ok: true, error: true, durationMs: true, result: true } },
         },
       },
     },
@@ -124,9 +128,26 @@ aiRouter.get("/conversations/:id", ...requireAuth, async (req, res) => {
       status: r.status,
       turns: r.turns,
       error: r.error,
+      // Carried into the thread read, not just the live ask: a re-opened
+      // conversation must show the same "this figure is unverified" caveat it
+      // showed when it was answered.
+      verification: r.verification,
+      // Rebuilt from what the tools in this run actually returned, so a
+      // re-opened thread resolves a figure's source to the same destination
+      // the live answer did.
+      toolEvidence: Object.fromEntries(
+        r.toolCalls
+          .map((c) => [c.toolName, (c.result as { evidenceRef?: string } | null)?.evidenceRef])
+          .filter((e): e is [string, string] => typeof e[1] === "string")
+      ),
       startedAt: r.startedAt.toISOString(),
       finishedAt: r.finishedAt?.toISOString() ?? null,
-      toolCalls: r.toolCalls,
+      toolCalls: r.toolCalls.map((c) => ({
+        toolName: c.toolName,
+        ok: c.ok,
+        error: c.error,
+        durationMs: c.durationMs,
+      })),
     })),
   });
 });

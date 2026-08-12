@@ -16,6 +16,8 @@ import { getCodExposure, readReconciliationLegs } from "../calc/reconciliation.j
 import { getNetRevenueSummary } from "../calc/revenue.js";
 import { getSalesSummary } from "../calc/sales.js";
 import { getRtoRateSummary } from "../calc/shipments.js";
+import { getBankMovement, getPendingSettlements, getRefundAnalysis, getSettlementSummary } from "../calc/moneyMovement.js";
+import { buildEvidence } from "../../routes/evidence.js";
 import { maskPii } from "./pii.js";
 
 // §18 tool registry (P4.1).
@@ -46,6 +48,51 @@ export interface ToolContext {
   organizationId: string;
   timeZone: string;
   userId: string;
+}
+
+// WHERE A HUMAN GOES TO CHECK A FIGURE.
+//
+// The first version of this file invented an evidenceRef per tool by naming
+// the metric — "/evidence/net_revenue", "/evidence/rto_rate". Eleven of the
+// seventeen pointed at nothing: the §21 evidence route serves exactly five
+// material metrics (routes/evidence.ts's METRIC_TEXT) and 404s on anything
+// else. An answer citing a dead link is worse than one citing none, because
+// the citation is what a founder trusts instead of re-checking.
+//
+// So the set is closed and asserted. Two namespaces live here deliberately:
+// ENVELOPE refs resolve to the §21 API envelope with formula, sources and
+// sample rows; PAGE refs resolve to the screen that shows the working. A tool
+// with neither returns no evidenceRef at all rather than a plausible one.
+export const EVIDENCE_ENVELOPE_METRICS = [
+  "revenue",
+  "contribution_margin",
+  "product_profitability",
+  "cash_received",
+  "cash_forecast",
+] as const;
+
+export const EVIDENCE_PAGES = [
+  "/reconciliation",
+  "/exceptions",
+  "/connections",
+  "/settlements",
+  "/cash-flow",
+  "/revenue",
+  "/profitability",
+  "/inventory",
+  "/expenses",
+] as const;
+
+const ENVELOPE_REFS = new Set(EVIDENCE_ENVELOPE_METRICS.map((m) => `/evidence/${m}`));
+const PAGE_REFS = new Set<string>(EVIDENCE_PAGES);
+
+/** True when the ref resolves to the §21 evidence API rather than a screen. */
+export function isEvidenceEnvelopeRef(ref: string): boolean {
+  return ENVELOPE_REFS.has(ref);
+}
+
+export function isKnownEvidenceRef(ref: string): boolean {
+  return ENVELOPE_REFS.has(ref) || PAGE_REFS.has(ref);
 }
 
 export interface ToolResult {
@@ -110,7 +157,7 @@ export const TOOLS: ToolDefinition[] = [
         getNetRevenueSummary(ctx.organizationId, range),
         getDataStatusMap(ctx.organizationId),
       ]);
-      return envelope(data, { dataStatus: statuses.revenue, evidenceRef: "/evidence/net_revenue" });
+      return envelope(data, { dataStatus: statuses.revenue, evidenceRef: "/evidence/revenue" });
     }
   ),
 
@@ -119,7 +166,7 @@ export const TOOLS: ToolDefinition[] = [
     "Gross sales, order count, AOV, discount rate and refund rate (§5, §12, §64, §66) for a period.",
     RANGE_JSON,
     rangeArgs,
-    async (ctx, args) => envelope(await getSalesSummary(ctx.organizationId, rangeOf(ctx, args as never)), { evidenceRef: "/evidence/gross_sales" })
+    async (ctx, args) => envelope(await getSalesSummary(ctx.organizationId, rangeOf(ctx, args as never)), { evidenceRef: "/revenue" })
   ),
 
   tool(
@@ -141,7 +188,7 @@ export const TOOLS: ToolDefinition[] = [
       // available cash depends on a founder-entered opening balance that
       // cash_received's status says nothing about. The summary carries its own
       // missingOpeningBalance list, which is the honest signal here.
-      return envelope(await getAvailableCashSummary(ctx.organizationId), { evidenceRef: "/evidence/available_cash" });
+      return envelope(await getAvailableCashSummary(ctx.organizationId), { evidenceRef: "/cash-flow" });
     }
   ),
 
@@ -257,7 +304,7 @@ export const TOOLS: ToolDefinition[] = [
     "Monthly net burn and months of runway (§85). Runway is null when the business is not burning — that is a real answer, not a missing one.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
-    async (ctx) => envelope(await getBurnAndRunway(ctx.organizationId), { evidenceRef: "/evidence/available_cash" })
+    async (ctx) => envelope(await getBurnAndRunway(ctx.organizationId), { evidenceRef: "/cash-flow" })
   ),
 
   tool(
@@ -265,7 +312,7 @@ export const TOOLS: ToolDefinition[] = [
     "Outstanding vendor bills with ageing buckets and what falls due in the next 7 days.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
-    async (ctx) => envelope(await getPayablesSummary(ctx.organizationId), { evidenceRef: "/evidence/payables" })
+    async (ctx) => envelope(await getPayablesSummary(ctx.organizationId), { evidenceRef: "/expenses" })
   ),
 
   tool(
@@ -279,7 +326,7 @@ export const TOOLS: ToolDefinition[] = [
         getAdSpendSummary(ctx.organizationId, range),
         getAdEfficiencySummary(ctx.organizationId, range),
       ]);
-      return envelope({ spend, efficiency }, { evidenceRef: "/evidence/ad_spend" });
+      return envelope({ spend, efficiency }, { evidenceRef: "/expenses" });
     }
   ),
 
@@ -288,7 +335,7 @@ export const TOOLS: ToolDefinition[] = [
     "RTO rate over a period (§18) — how much COD is coming back undelivered.",
     RANGE_JSON,
     rangeArgs,
-    async (ctx, args) => envelope(await getRtoRateSummary(ctx.organizationId, rangeOf(ctx, args as never)), { evidenceRef: "/evidence/rto_rate" })
+    async (ctx, args) => envelope(await getRtoRateSummary(ctx.organizationId, rangeOf(ctx, args as never)), { evidenceRef: "/reconciliation" })
   ),
 
   tool(
@@ -309,7 +356,7 @@ export const TOOLS: ToolDefinition[] = [
           deliveredValue: e.deliveredValue.toString(),
           rtoValue: e.rtoValue.toString(),
         },
-        { evidenceRef: "/evidence/cod_exposure" }
+        { evidenceRef: "/settlements" }
       );
     }
   ),
@@ -353,6 +400,80 @@ export const TOOLS: ToolDefinition[] = [
   ),
 
   tool(
+    "get_settlement_summary",
+    "Provider payouts that landed in a period (§15): net settled, fees, GST on fees, split by provider and payout kind. Use for 'what did Razorpay actually pay me'.",
+    RANGE_JSON,
+    rangeArgs,
+    async (ctx, args) =>
+      envelope(await getSettlementSummary(ctx.organizationId, rangeOf(ctx, args as never)), { evidenceRef: "/settlements" })
+  ),
+
+  tool(
+    "get_pending_settlements",
+    "Captured payments the gateway has not yet paid out — the float it is holding, and how old the oldest is. Point-in-time.",
+    { type: "object", properties: {}, additionalProperties: false },
+    z.object({}).strict(),
+    async (ctx) => {
+      const data = await getPendingSettlements(ctx.organizationId);
+      return envelope(data, {
+        evidenceRef: "/settlements",
+        ...(data.unavailableReason ? { unavailable: data.unavailableReason } : {}),
+      });
+    }
+  ),
+
+  tool(
+    "get_bank_movement",
+    "Money in and out of the connected bank accounts over a period (§12.9): credits, debits and the net. This is the statement, not derived cash.",
+    RANGE_JSON,
+    rangeArgs,
+    async (ctx, args) => {
+      const data = await getBankMovement(ctx.organizationId, rangeOf(ctx, args as never));
+      return envelope(data, {
+        evidenceRef: "/cash-flow",
+        ...(data.unavailableReason ? { unavailable: data.unavailableReason } : {}),
+      });
+    }
+  ),
+
+  tool(
+    "get_refund_analysis",
+    "Dated refund transactions in a period (§66), split by gateway, plus how many orders claim a refunded amount with no transaction behind it.",
+    RANGE_JSON,
+    rangeArgs,
+    async (ctx, args) =>
+      envelope(await getRefundAnalysis(ctx.organizationId, rangeOf(ctx, args as never)), { evidenceRef: "/reconciliation" })
+  ),
+
+  tool(
+    "get_evidence",
+    "The §21 evidence envelope for one material metric: its definition, the exact formula and version, the sources, the reconciliation status and up to 20 underlying rows. Use when asked to show the workings.",
+    {
+      type: "object",
+      properties: {
+        metric: {
+          type: "string",
+          enum: [...EVIDENCE_ENVELOPE_METRICS],
+          description: "Which material metric to open the workings for.",
+        },
+        from: { type: "string", description: "Start date, YYYY-MM-DD. Omit for month-to-date." },
+        to: { type: "string", description: "End date, YYYY-MM-DD. Omit for month-to-date." },
+      },
+      required: ["metric"],
+      additionalProperties: false,
+    },
+    z.object({ metric: z.enum(EVIDENCE_ENVELOPE_METRICS), from: z.string().optional(), to: z.string().optional() }).strict(),
+    async (ctx, args) => {
+      const a = args as { metric: (typeof EVIDENCE_ENVELOPE_METRICS)[number]; from?: string; to?: string };
+      const { envelope: built } = await buildEvidence(ctx.organizationId, ctx.timeZone, a.metric, rangeOf(ctx, a), false);
+      // sampleTransactions carry customer-shaped columns on some metrics, so
+      // this is exactly the payload §27's masking exists for. envelope() runs
+      // it; nothing here bypasses that.
+      return envelope(built, { evidenceRef: `/evidence/${a.metric}` });
+    }
+  ),
+
+  tool(
     "get_data_freshness",
     "When each connected source last synced, and which are stale or erroring. Use this before trusting any other figure.",
     { type: "object", properties: {}, additionalProperties: false },
@@ -365,7 +486,7 @@ export const TOOLS: ToolDefinition[] = [
     "The §28 honesty label (estimated / provisional / reconciled) for every material metric, with the reason.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
-    async (ctx) => envelope(await getDataStatusMap(ctx.organizationId), { evidenceRef: "/evidence" })
+    async (ctx) => envelope(await getDataStatusMap(ctx.organizationId))
   ),
 ];
 

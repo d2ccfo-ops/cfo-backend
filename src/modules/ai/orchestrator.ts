@@ -4,6 +4,7 @@ import { writeAudit } from "../../lib/audit.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { TOOLS, executeTool, type ToolContext } from "./tools.js";
+import { verifyFigures, verifyNoPii, verifySources } from "./verify.js";
 
 // §18/§19 orchestrator (P4.3).
 //
@@ -87,12 +88,40 @@ no markdown fence:
   "recommendedAction": "one concrete next step, or null"
 }`;
 
+/**
+ * P4.7, applied to every live answer rather than only in the eval suite.
+ *
+ * The check that matters is `figures`: every number in the answer had to
+ * appear in a tool result. Running it here, at answer time, is the difference
+ * between a rule the tests assert and a rule the product enforces — a
+ * fabricated figure that only the eval suite would catch still reached a
+ * founder's screen in production.
+ */
+export interface AnswerVerification {
+  ok: boolean;
+  figuresChecked: number;
+  /** Figures found in no tool result. Non-empty means the model did arithmetic. */
+  unsupportedFigures: string[];
+  /** keyFigures citing a tool that does not exist. */
+  unknownSources: string[];
+  /** Raw PII that survived masking. Should always be empty. */
+  piiHits: string[];
+}
+
 export interface AskResult {
   conversationId: string;
   runId: string;
   status: "COMPLETED" | "FAILED" | "EXHAUSTED";
   answer: StructuredAnswer | null;
   toolCalls: Array<{ name: string; ok: boolean; durationMs: number }>;
+  /**
+   * Which evidence destination each tool used in THIS run actually returned,
+   * so a figure's "source" (a tool name) maps to somewhere a human can go.
+   * Built from real tool results rather than a second copy of the registry —
+   * a hardcoded map would drift from what the tools returned.
+   */
+  toolEvidence: Record<string, string>;
+  verification: AnswerVerification | null;
   turns: number;
   error?: string;
 }
@@ -198,6 +227,11 @@ export async function ask(
   const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: question }];
   const toolCalls: AskResult["toolCalls"] = [];
+  // Kept verbatim so verifyFigures can search the exact bytes the model was
+  // shown. Reconstructing them later from AgentToolCall would introduce a
+  // second serialisation and a second chance to disagree.
+  const toolOutputs: string[] = [];
+  const toolEvidence: Record<string, string> = {};
   let turns = 0;
   let inputTokens = 0;
   let outputTokens = 0;
@@ -230,6 +264,46 @@ export async function ask(
           .join("\n");
         const answer = parseStructuredAnswer(text);
 
+        // P4.7 applied before the answer is stored or returned.
+        //
+        // An unsupported figure does NOT fail the run: the rest of the answer
+        // is still the tool results, and discarding it would leave a founder
+        // with nothing when the flaw is one sentence. It becomes a warning ON
+        // the answer, in the answer's own warnings array, so it travels with
+        // the text — including into the stored message a screenshot is taken
+        // from three weeks later.
+        let verification: AnswerVerification | null = null;
+        if (answer) {
+          const figures = verifyFigures(answer, toolOutputs);
+          const sources = verifySources(answer);
+          const pii = verifyNoPii(answer);
+          verification = {
+            ok: figures.ok && sources.ok && pii.ok,
+            figuresChecked: figures.checked,
+            unsupportedFigures: figures.unsupported,
+            unknownSources: sources.unknown,
+            piiHits: pii.hits,
+          };
+          if (!figures.ok) {
+            answer.warnings = [
+              `${figures.unsupported.length} figure${figures.unsupported.length === 1 ? "" : "s"} in this answer (${figures.unsupported.join(", ")}) could not be found in any tool result. Treat ${figures.unsupported.length === 1 ? "it" : "them"} as unverified and check the dashboard.`,
+              ...answer.warnings,
+            ];
+          }
+          if (!sources.ok) {
+            answer.warnings = [
+              `This answer cites ${sources.unknown.join(", ")} as a source, which is not a tool that exists.`,
+              ...answer.warnings,
+            ];
+          }
+          if (!pii.ok) {
+            // Never shown to the founder as a warning — the leak is the
+            // problem, and repeating it in the UI would spread it. Logged and
+            // recorded instead.
+            logger.error({ runId: run.id, hits: pii.hits }, "ai_answer_contains_pii");
+          }
+        }
+
         await prisma.agentMessage.create({
           data: {
             conversationId: convo.id,
@@ -248,6 +322,7 @@ export async function ask(
             outputTokens,
             finishedAt: new Date(),
             error: answer ? null : "The model did not return a valid structured answer.",
+            verification: (verification ?? undefined) as never,
           },
         });
         await prisma.agentConversation.update({ where: { id: convo.id }, data: { updatedAt: new Date() } });
@@ -263,7 +338,16 @@ export async function ask(
           action: "ai.answered",
           entityType: "AGENT_RUN",
           entityId: run.id,
-          metadata: { question, turns, tools: toolCalls.map((t) => t.name), status: answer ? "COMPLETED" : "FAILED" },
+          metadata: {
+            question,
+            turns,
+            tools: toolCalls.map((t) => t.name),
+            status: answer ? "COMPLETED" : "FAILED",
+            // Recorded in the audit log too, because "the AI stated a figure
+            // nobody computed" is a finance event, not a debugging detail.
+            verified: verification?.ok ?? null,
+            unsupportedFigures: verification?.unsupportedFigures ?? [],
+          },
         });
 
         return {
@@ -272,6 +356,8 @@ export async function ask(
           status: answer ? "COMPLETED" : "FAILED",
           answer,
           toolCalls,
+          toolEvidence,
+          verification,
           turns,
           ...(answer ? {} : { error: "The model did not return a valid structured answer." }),
         };
@@ -292,6 +378,12 @@ export async function ask(
 
         const exec = await executeTool(ctx, use.name, use.input);
         toolCalls.push({ name: use.name, ok: exec.ok, durationMs: exec.durationMs });
+        const serialised = JSON.stringify(exec.result);
+        if (exec.ok) {
+          toolOutputs.push(serialised);
+          const ref = (exec.result as { evidenceRef?: string }).evidenceRef;
+          if (ref) toolEvidence[use.name] = ref;
+        }
 
         await prisma.agentToolCall.create({
           data: {
@@ -312,7 +404,7 @@ export async function ask(
           type: "tool_result",
           tool_use_id: use.id,
           is_error: !exec.ok,
-          content: JSON.stringify(exec.result),
+          content: serialised,
         });
       }
       messages.push({ role: "user", content: results });
@@ -330,6 +422,8 @@ export async function ask(
       status: "EXHAUSTED",
       answer: null,
       toolCalls,
+      toolEvidence,
+      verification: null,
       turns,
       error: `The question needed more than ${MAX_TURNS} rounds of lookups. Try asking about one metric or one period at a time.`,
     };
@@ -340,6 +434,6 @@ export async function ask(
       where: { id: run.id },
       data: { status: "FAILED", turns, inputTokens, outputTokens, finishedAt: new Date(), error: message },
     });
-    return { conversationId: convo.id, runId: run.id, status: "FAILED", answer: null, toolCalls, turns, error: message };
+    return { conversationId: convo.id, runId: run.id, status: "FAILED", answer: null, toolCalls, toolEvidence, verification: null, turns, error: message };
   }
 }
