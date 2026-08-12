@@ -50,6 +50,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../src/lib/prisma.js";
 import { applyInvoice, type InvoiceLine, type ParsedInvoice } from "../src/modules/connectors/bluedart/invoice.js";
+import { BLUEDART_COD_STATEMENT } from "../src/modules/connectors/bluedart/index.js";
 import { GOKWIK_SETTLEMENT_STATEMENT } from "../src/modules/connectors/gokwik/index.js";
 import { ingestStatement } from "../src/modules/connectors/remittance/statement.js";
 
@@ -188,6 +189,14 @@ async function purge(target: Target) {
   // belong to this script even though the connection does not.
   const campaigns = await prisma.adCampaignSpend.deleteMany({ where: { organizationId: target.organizationId } });
   if (campaigns.count > 0) console.log(`  · ${campaigns.count} campaign-day rows`);
+  const codBatches = await prisma.settlement.deleteMany({
+    where: { organizationId: target.organizationId, externalSettlementId: { startsWith: "DEMOCODR" } },
+  });
+  if (codBatches.count > 0) console.log(`  · ${codBatches.count} COD remittance batches`);
+  const refunds = await prisma.refund.deleteMany({
+    where: { organizationId: target.organizationId, externalRefundId: { startsWith: "rfnd_DEMO" } },
+  });
+  if (refunds.count > 0) console.log(`  · ${refunds.count} refunds`);
 
   console.log(
     `purged: ${invoices.count} freight invoices, ${settlements.count} settlements, ` +
@@ -702,6 +711,166 @@ async function seedCampaignSpend(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
+// 6. COD REMITTANCE STATEMENTS (data register D2)
+// ---------------------------------------------------------------------------
+// The single largest category of silently lost money in Indian D2C: a parcel
+// is delivered, the courier collects the cash, and weeks later nobody can say
+// which deliveries the bank credit covered.
+//
+// Generated as a Bluedart COD MIS and fed through the real parser, so the
+// balance invariant (lines must sum to the stated remittance total) is
+// enforced by the code that will meet the real file.
+//
+// DELIBERATELY NOT COMPLETE. About 8% of delivered COD parcels are left out,
+// because that is the real condition and it is what the missing-COD-remittance
+// exception exists to surface. A demo where every parcel remits perfectly
+// demonstrates nothing — the whole point of the detector is the tail.
+async function seedCodRemittance(target: Target, connectionId: string) {
+  const existing = await prisma.settlementLine.count({
+    where: { organizationId: target.organizationId, type: "SHIPMENT_COD", externalReference: { startsWith: "DEMOCOD" } },
+  });
+  if (existing > 0) {
+    console.log(`  ${existing} seeded COD lines already present — skipping`);
+    return;
+  }
+
+  const delivered = await prisma.shipment.findMany({
+    where: {
+      organizationId: target.organizationId,
+      status: "DELIVERED",
+      awbCode: { not: null },
+      deliveredAt: { not: null },
+      order: { paymentMode: "COD", cancelledAt: null },
+    },
+    select: { awbCode: true, deliveredAt: true, order: { select: { grossAmount: true } } },
+    orderBy: { deliveredAt: "asc" },
+  });
+  if (delivered.length === 0) {
+    console.log("  no delivered COD shipments — skipping");
+    return;
+  }
+
+  // Weekly remittance batches, which is how couriers actually pay out.
+  const byWeek = new Map<string, typeof delivered>();
+  let skipped = 0;
+  for (const s of delivered) {
+    // The tail that stays unremitted. Left out on purpose — see above.
+    if (rnd() < 0.08) {
+      skipped += 1;
+      continue;
+    }
+    const d = s.deliveredAt!;
+    // Remitted the Monday after delivery.
+    const remitDate = new Date(d.getTime() + (8 - d.getUTCDay()) * 86_400_000);
+    if (remitDate > new Date()) {
+      skipped += 1;
+      continue;
+    }
+    const key = remitDate.toISOString().slice(0, 10);
+    const bucket = byWeek.get(key) ?? [];
+    bucket.push(s);
+    byWeek.set(key, bucket);
+  }
+
+  const header = [
+    "Remittance No", "Remittance Date", "UTR", "Waybill No",
+    "COD Amount", "COD Charges", "Net Amount", "Total Remittance",
+  ].join(",");
+  const body: string[] = [];
+  let lineCount = 0;
+
+  for (const [dayKey, batch] of byWeek) {
+    const remittanceNo = `DEMOCODR${dayKey.replaceAll("-", "")}`;
+    const utr = `CODUTR${dayKey.replaceAll("-", "")}`;
+    const lines = batch.map((s) => {
+      const gross = Number(s.order.grossAmount) / 100;
+      // Bluedart's COD handling charge: ~1.5% with a floor, which is the shape
+      // of every courier's COD card.
+      const fee = Math.max(25, Math.round(gross * 0.015 * 100) / 100);
+      return { awb: s.awbCode!, gross, fee, net: Math.round((gross - fee) * 100) / 100 };
+    });
+    const total = Math.round(lines.reduce((sum, l) => sum + l.net, 0) * 100) / 100;
+    for (const l of lines) {
+      // The REAL waybill, so the parser resolves each line to its shipment the
+      // way it will on a real MIS. The DEMO marker rides on the remittance
+      // number instead — marking the AWB would make every line resolve to
+      // nothing and quietly turn this into a test of the unresolved path.
+      body.push(
+        [remittanceNo, dayKey, utr, l.awb, l.gross.toFixed(2), l.fee.toFixed(2), l.net.toFixed(2), total.toFixed(2)].join(",")
+      );
+      lineCount += 1;
+    }
+  }
+
+  if (lineCount === 0) {
+    console.log("  nothing to remit in range — skipping");
+    return;
+  }
+
+  const result = await ingestStatement(
+    { connectionId, organizationId: target.organizationId, legalEntityId: target.legalEntityId },
+    [header, ...body].join("\n"),
+    BLUEDART_COD_STATEMENT
+  );
+
+  console.log(
+    `  → ${result.batchesImported} remittances, ${result.linesImported} lines, ` +
+      `${result.linesUnresolved} unresolved, ${skipped} deliveries deliberately left unremitted, ${result.rejected.length} rejected`
+  );
+  if (result.rejected.length > 0) {
+    for (const r of result.rejected.slice(0, 2)) console.log(`     rejected ${r.batchId}: ${r.detail}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 7. REFUNDS
+// ---------------------------------------------------------------------------
+// Without these the refund-mismatch exception is undetectable and the §15
+// refund leg has nothing to run against — both report "no refund records
+// exist", which is honest and useless for development.
+//
+// A slice is left with NO matching payout line, which is what a refund
+// mismatch IS: money the store believes it returned that no payout carries.
+async function seedRefunds(target: Target) {
+  const existing = await prisma.refund.count({ where: { organizationId: target.organizationId } });
+  if (existing > 0) {
+    console.log(`  ${existing} refunds already present — skipping`);
+    return;
+  }
+
+  const connectionId = await demoConnection(target, "RAZORPAY", "demo-razorpay-refunds");
+  const refunded = await prisma.order.findMany({
+    where: { organizationId: target.organizationId, refundedAmount: { gt: 0 } },
+    select: { id: true, externalOrderId: true, refundedAmount: true, placedAt: true },
+    take: 400,
+  });
+  if (refunded.length === 0) {
+    console.log("  no orders carry a refunded amount — skipping");
+    return;
+  }
+
+  const rows: Prisma.RefundCreateManyInput[] = refunded.map((o, i) => ({
+    organizationId: target.organizationId,
+    legalEntityId: target.legalEntityId,
+    connectionId,
+    orderId: o.id,
+    externalRefundId: `rfnd_DEMO${o.externalOrderId}_${i}`,
+    amount: o.refundedAmount,
+    currency: "INR",
+    // Refunds settle days after the order, not on it.
+    processedAt: new Date(o.placedAt.getTime() + intBetween(3, 21) * 86_400_000),
+    gateway: "razorpay",
+    gatewayRef: `rfnd_${intBetween(100_000, 999_999)}`,
+    raw: { entity: "refund", order_id: o.externalOrderId, speed: "normal" },
+  }));
+
+  for (let i = 0; i < rows.length; i += 500) {
+    await prisma.refund.createMany({ data: rows.slice(i, i + 500), skipDuplicates: true });
+  }
+  console.log(`  → ${rows.length} refunds (no payout lines carry them, so the refund-mismatch detector has something to find)`);
+}
+
+// ---------------------------------------------------------------------------
 async function main() {
   if (!ORG_QUERY) {
     console.error('Usage: npx tsx scripts/seedDemoGaps.ts --org "DEMO — technox pvt ltd" [--purge]');
@@ -734,6 +903,12 @@ async function main() {
 
   console.log("\n[5] campaign-grain ad spend (D4)");
   await seedCampaignSpend(target);
+
+  console.log("\n[6] COD remittance statements (D2)");
+  await seedCodRemittance(target, bluedartConn);
+
+  console.log("\n[7] refunds");
+  await seedRefunds(target);
 
   console.log("\ndone.\n");
   await prisma.$disconnect();

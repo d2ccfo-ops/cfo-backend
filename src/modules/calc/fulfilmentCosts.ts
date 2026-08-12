@@ -38,6 +38,18 @@ import type { OrgSettings } from "../orgs/settings.js";
 // subtracted again. A number that is honest about which question it answers is
 // worth more than one that keeps the formula looking symmetrical.
 
+/**
+ * How long after dispatch a courier invoice is expected.
+ *
+ * Couriers bill monthly in arrears, so a parcel shipped last week has no
+ * invoice yet and that is the billing cycle, not a missing upload. Without
+ * this distinction the forward-shipping layer can NEVER be covered for any
+ * org that is still trading — the current month's shipments always lack an
+ * invoice — and CM1 stays permanently unreliable for a reason nobody can act
+ * on. 45 days covers a monthly cycle plus the fortnight it takes to arrive.
+ */
+const INVOICE_EXPECTED_AFTER_DAYS = 45;
+
 export interface FreightSplit {
   /** Outbound freight: total billed minus return legs. */
   forwardMinor: bigint;
@@ -45,7 +57,29 @@ export interface FreightSplit {
   reverseMinor: bigint;
   /** Shipments in the period that carry any freight at all. */
   billedShipments: number;
+  /**
+   * Billable shipments that carry freight.
+   *
+   * Kept separate from billedShipments because a courier can invoice sooner
+   * than the cutoff assumes, which made the numerator exceed the denominator
+   * and print "6089 of 5300 billable shipments" — a coverage line that reads
+   * as a bug whatever the arithmetic behind it is doing.
+   */
+  billedBillableShipments: number;
   totalShipments: number;
+  /**
+   * Shipments a courier could actually bill for: dispatched (they have a
+   * waybill) and old enough that an invoice should have arrived.
+   *
+   * A shipment with no AWB was never handed over, so no courier can have
+   * charged for it. Counting it as missing freight reports a gap that cannot
+   * be closed.
+   */
+  billableShipments: number;
+  /** Dispatched, but too recent for an invoice. Reported, not counted a gap. */
+  awaitingInvoice: number;
+  /** Never dispatched — no waybill, so nothing to bill. */
+  neverDispatched: number;
   /** Shipments with a return leg billed against them. */
   returnedShipments: number;
   /** True when a return-leg source exists at all (an invoice has been uploaded). */
@@ -55,8 +89,15 @@ export interface FreightSplit {
 export async function getFreightSplit(organizationId: string, range: ResolvedRange): Promise<FreightSplit> {
   const shipments = await prisma.shipment.findMany({
     where: { organizationId, createdAt: { gte: range.from, lte: range.to } },
-    select: { id: true, freightAmount: true },
+    select: { id: true, freightAmount: true, awbCode: true, pickedUpAt: true, createdAt: true },
   });
+
+  const invoiceCutoff = new Date(Date.now() - INVOICE_EXPECTED_AFTER_DAYS * 86_400_000);
+  // Dispatched = it has a waybill. Nothing else is a claim about whether a
+  // courier COULD have billed us.
+  const dispatched = shipments.filter((s) => s.awbCode !== null);
+  const billable = dispatched.filter((s) => (s.pickedUpAt ?? s.createdAt) < invoiceCutoff);
+  const awaitingInvoice = dispatched.length - billable.length;
 
   const billed = shipments.filter((s) => s.freightAmount !== null);
   const totalBilled = billed.reduce((sum, s) => sum + (s.freightAmount as bigint), 0n);
@@ -87,7 +128,11 @@ export async function getFreightSplit(organizationId: string, range: ResolvedRan
     forwardMinor: totalBilled - reverseMinor,
     reverseMinor,
     billedShipments: billed.length,
+    billedBillableShipments: billable.filter((s) => s.freightAmount !== null).length,
     totalShipments: shipments.length,
+    billableShipments: billable.length,
+    awaitingInvoice,
+    neverDispatched: shipments.length - dispatched.length,
     returnedShipments: reverseRows.length,
     hasReverseSource: anyReturnLeg > 0,
   };

@@ -117,7 +117,12 @@ export async function getContributionMargin(
   // from its API and produces no invoice lines at all — see fulfilmentCosts.ts.
   const forwardShipping = freight.forwardMinor;
   const reverseShipping = freight.reverseMinor;
-  const shippingCovered = freight.totalShipments > 0 && freight.billedShipments === freight.totalShipments;
+  // Measured against BILLABLE shipments, not all of them. A parcel with no
+  // waybill was never handed to a courier, and one dispatched last week has no
+  // invoice yet because couriers bill monthly in arrears. Counting either as
+  // missing freight made this layer permanently uncovered for any org still
+  // trading, which left CM1 unreliable for a reason nobody could act on.
+  const shippingCovered = freight.billableShipments > 0 && freight.billedBillableShipments >= freight.billableShipments;
 
   // --- Packaging (§23). The one layer whose source is a typed rate rather than
   // an ingested record: nothing a brand connects reports what a mailer costs.
@@ -175,8 +180,10 @@ export async function getContributionMargin(
       hasSource: freight.billedShipments > 0,
       note: freight.totalShipments === 0
         ? "No shipments in this period"
-        : `${freight.billedShipments} of ${freight.totalShipments} shipments carry a freight amount` +
-          (freight.reverseMinor > 0n ? ", excluding return legs (counted below)" : ""),
+        : `${freight.billedBillableShipments} of ${freight.billableShipments} billable shipments carry freight` +
+          (freight.awaitingInvoice > 0 ? `; ${freight.awaitingInvoice} dispatched too recently to be invoiced yet` : "") +
+          (freight.neverDispatched > 0 ? `; ${freight.neverDispatched} never dispatched, so nothing to bill` : "") +
+          (freight.reverseMinor > 0n ? ". Excludes return legs, counted below." : ""),
     },
     {
       key: "reverseShipping",
