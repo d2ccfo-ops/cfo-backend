@@ -33,6 +33,7 @@ import { legalEntitiesRouter } from "./routes/legalEntities.js";
 import { organizationRouter } from "./routes/organization.js";
 import { metricsRouter } from "./routes/metrics.js";
 import { evidenceRouter } from "./routes/evidence.js";
+import { auditRouter } from "./routes/audit.js";
 import { reconciliationRouter } from "./routes/reconciliation.js";
 import { settlementsRouter } from "./routes/settlements.js";
 import { clerkWebhookRouter } from "./routes/webhooks/clerk.js";
@@ -104,6 +105,7 @@ export function createApp() {
   app.use("/organization", organizationRouter);
   app.use("/metrics", metricsRouter);
   app.use("/evidence", evidenceRouter);
+  app.use("/audit", auditRouter);
   app.use("/inventory", inventoryRouter);
   app.use("/costs", costsRouter);
   app.use("/preferences", preferencesRouter);

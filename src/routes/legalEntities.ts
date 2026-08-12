@@ -1,6 +1,7 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
+import { writeAudit } from "../lib/audit.js";
 import { requireAuth, requireUser } from "../middleware/auth.js";
 
 export const legalEntitiesRouter = Router();
@@ -225,6 +226,15 @@ legalEntitiesRouter.post("/", ...requireAuth, parseCreate, async (req, res) => {
     data: { organizationId: req.auth!.organizationId, ...body },
     select: SELECT,
   });
+  await writeAudit({
+    organizationId: req.auth!.organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "legal_entity.create",
+    entityType: "LEGAL_ENTITY",
+    entityId: entity.id,
+    metadata: { name: entity.name },
+  });
   res.status(201).json({ legalEntity: entity });
 });
 
@@ -251,6 +261,16 @@ legalEntitiesRouter.put("/primary", ...requireAuth, parseCreate, async (req, res
     ? await prisma.legalEntity.update({ where: { id: existing.id }, data: body, select: SELECT })
     : await prisma.legalEntity.create({ data: { organizationId, ...body }, select: SELECT });
 
+  await writeAudit({
+    organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: existing ? "legal_entity.update" : "legal_entity.create",
+    entityType: "LEGAL_ENTITY",
+    entityId: entity.id,
+    metadata: { name: entity.name, primary: true },
+  });
+
   res.status(existing ? 200 : 201).json({ legalEntity: entity, created: !existing });
 });
 
@@ -270,5 +290,14 @@ legalEntitiesRouter.patch("/:id", ...requireAuth, parsePatch, async (req, res) =
   }
 
   const entity = await prisma.legalEntity.findUnique({ where: { id: req.params.id }, select: SELECT });
+  await writeAudit({
+    organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "legal_entity.update",
+    entityType: "LEGAL_ENTITY",
+    entityId: req.params.id,
+    metadata: { fields: Object.keys(parsedOn(req).patch!) },
+  });
   res.json({ legalEntity: entity });
 });

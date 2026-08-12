@@ -3,6 +3,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { encodeCredentials, ingestSettlementReport } from "../../modules/connectors/gokwik/index.js";
 import { serializeIngestResult } from "../../modules/connectors/remittance/statement.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
@@ -105,6 +106,15 @@ gokwikConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
         });
 
     logger.info({ connectionId: connection.id, credentialsVerified }, "gokwik_connected");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "GOKWIK", credentialsVerified },
+    });
     res.json({ connected: true, connectionId: connection.id, credentialsVerified, note: probeNote });
   } catch (err) {
     logger.error({ err }, "gokwik_connect_failed");
@@ -142,6 +152,20 @@ gokwikConnectionRouter.post("/:connectionId/settlement", ...requireAuth, async (
       },
       "gokwik_settlement_ingested"
     );
+    await writeAudit({
+      organizationId: connection.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "import.settlement_report",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: {
+        provider: "GOKWIK",
+        batchesImported: result.batchesImported,
+        linesImported: result.linesImported,
+        rejected: result.rejected.length,
+      },
+    });
     res.json(serializeIngestResult(result));
   } catch (err) {
     logger.error({ err }, "gokwik_settlement_ingest_failed");

@@ -3,6 +3,7 @@ import { logger } from "../../lib/logger.js";
 import { encryptSecret } from "../../lib/crypto.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { encodeCredentials, login, shiprocketConnector } from "../../modules/connectors/shiprocket/index.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
@@ -52,6 +53,15 @@ shiprocketConnectionRouter.post("/connect", ...requireAuth, async (req, res) => 
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
 
     logger.info({ connectionId: connection.id, recordsFetched: result.recordsFetched }, "shiprocket_backfill_complete");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "SHIPROCKET" },
+    });
     res.json({ connected: true, recordsFetched: result.recordsFetched });
   } catch (err) {
     logger.error({ err }, "shiprocket_connect_failed");

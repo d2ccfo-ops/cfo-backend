@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { landedCostOf, getCostCoverage, stampCogs } from "../modules/calc/cogs.js";
 import { prisma } from "../lib/prisma.js";
+import { writeAudit } from "../lib/audit.js";
 import { requireAuth } from "../middleware/auth.js";
 
 export const costsRouter = Router();
@@ -113,6 +114,15 @@ costsRouter.post("/bulk", ...requireAuth, async (req, res, next) => {
   }
 
   const stamp = parsed.restamp === false ? null : await stampCogs(organizationId);
+
+  await writeAudit({
+    organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "cost.bulk_import",
+    entityType: "PRODUCT_COST",
+    metadata: { saved: rows.length, source, restamp: stamp },
+  });
 
   res.json({
     saved: rows.length,
@@ -277,5 +287,13 @@ costsRouter.get("/", ...requireAuth, async (req, res) => {
 // orders that arrived before their SKU had a cost.
 costsRouter.post("/restamp", ...requireAuth, async (req, res) => {
   const result = await stampCogs(req.auth!.organizationId);
+  await writeAudit({
+    organizationId: req.auth!.organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "cost.restamp",
+    entityType: "PRODUCT_COST",
+    metadata: { result },
+  });
   res.json({ stamped: result, coverage: await getCostCoverage(req.auth!.organizationId) });
 });

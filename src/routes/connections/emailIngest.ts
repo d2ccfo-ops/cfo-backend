@@ -3,6 +3,7 @@ import { env } from "../../config/env.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { generateIngestToken } from "../../modules/ingest/inboundEmail.js";
 
 export const emailIngestRouter = Router();
@@ -85,6 +86,16 @@ emailIngestRouter.post("/rotate", ...requireAuth, async (req, res) => {
       prisma.emailIngestAddress.create({ data: { organizationId, token: generateIngestToken() } }),
     ]);
     logger.info({ organizationId }, "email_ingest_rotated");
+    // The token itself is the credential (it forms the ingest address) — never
+    // logged, here or anywhere. The event is what matters for the trail.
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "email_ingest.address_rotated",
+      entityType: "EMAIL_INGEST_ADDRESS",
+      entityId: created.id,
+    });
     res.json({
       token: created.token,
       address: addressFor(created.token),

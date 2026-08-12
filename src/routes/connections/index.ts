@@ -2,6 +2,7 @@ import { Router } from "express";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { claimAndEnqueueSync } from "../../modules/queue/syncQueue.js";
 
 export const connectionsRouter = Router();
@@ -76,6 +77,16 @@ connectionsRouter.patch("/:connectionId/opening-balance", ...requireAuth, async 
     data: { openingBalanceMinor: BigInt(Math.round(balanceRupees * 100)), openingBalanceDate: parsedDate },
   });
 
+  await writeAudit({
+    organizationId: connection.organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "connection.opening_balance_set",
+    entityType: "CONNECTION",
+    entityId: connection.id,
+    metadata: { balanceRupees, asOfDate },
+  });
+
   res.json({ updated: true });
 });
 
@@ -121,6 +132,15 @@ connectionsRouter.post("/:connectionId/sync", ...requireAuth, async (req, res) =
       res.status(202).json({ queued: false, syncStatus: connection.syncStatus, alreadyInFlight: true });
       return;
     }
+    await writeAudit({
+      organizationId: connection.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.sync_triggered",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: connection.provider },
+    });
     res.status(202).json({ queued: true, syncStatus: "QUEUED" });
   } catch (err) {
     logger.error({ err, connectionId: connection.id, provider: connection.provider }, "connection_sync_enqueue_failed");

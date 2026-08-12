@@ -5,6 +5,7 @@ import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { signOAuthState, verifyOAuthState } from "../../lib/oauthState.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import {
   encodeCredentials,
   exchangeCodeForRefreshToken,
@@ -84,6 +85,17 @@ googleAdsConnectionRouter.get("/callback", async (req, res) => {
       { organizationId: stateResult.organizationId, accounts: customerIds.length, totalRecords },
       "google_ads_backfill_complete"
     );
+    // No Clerk session on an OAuth redirect callback — state only carries
+    // organizationId. One entry for the whole grant, not one per customer ID,
+    // since it's a single authorization event.
+    await writeAudit({
+      organizationId: stateResult.organizationId,
+      actorType: "SYSTEM",
+      actorId: "oauth_callback",
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      metadata: { provider: "GOOGLE_ADS", customerIds },
+    });
     res.redirect(`${env.FRONTEND_URL}/connections?googleAds=connected&accounts=${customerIds.length}&records=${totalRecords}`);
   } catch (err) {
     logger.error({ err }, "google_ads_oauth_callback_failed");

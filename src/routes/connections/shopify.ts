@@ -5,6 +5,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { signOAuthState, verifyOAuthState } from "../../lib/oauthState.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { shopifyConnector } from "../../modules/connectors/shopify/index.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
@@ -131,6 +132,15 @@ shopifyConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
 
     logger.info({ connectionId: connection.id, recordsFetched: result.recordsFetched }, "shopify_token_connect_complete");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "SHOPIFY", shop },
+    });
     res.json({ connected: true, recordsFetched: result.recordsFetched });
   } catch (err) {
     logger.error({ err, shop }, "shopify_token_connect_failed");
@@ -181,6 +191,17 @@ shopifyConnectionRouter.get("/callback", async (req, res) => {
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
 
     logger.info({ connectionId: connection.id, recordsFetched: result.recordsFetched }, "shopify_backfill_complete");
+    // No Clerk session on an OAuth redirect callback — state only carries
+    // organizationId (see lib/oauthState.ts).
+    await writeAudit({
+      organizationId: stateResult.organizationId,
+      actorType: "SYSTEM",
+      actorId: "oauth_callback",
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "SHOPIFY", shop },
+    });
     res.redirect(`${env.FRONTEND_URL}/connections?shopify=connected&orders=${result.recordsFetched}`);
   } catch (err) {
     logger.error({ err }, "shopify_oauth_callback_failed");

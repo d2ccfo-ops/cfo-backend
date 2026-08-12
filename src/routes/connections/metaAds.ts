@@ -5,6 +5,7 @@ import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { signOAuthState, verifyOAuthState } from "../../lib/oauthState.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import {
   encodeCredentials,
   exchangeCodeForLongLivedToken,
@@ -79,6 +80,14 @@ metaAdsConnectionRouter.get("/callback", async (req, res) => {
     }
 
     logger.info({ organizationId: stateResult.organizationId, accounts: adAccounts.length, totalRecords }, "meta_ads_backfill_complete");
+    await writeAudit({
+      organizationId: stateResult.organizationId,
+      actorType: "SYSTEM",
+      actorId: "oauth_callback",
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      metadata: { provider: "META_ADS", adAccountIds: adAccounts.map((a) => a.id) },
+    });
     res.redirect(`${env.FRONTEND_URL}/connections?metaAds=connected&accounts=${adAccounts.length}&records=${totalRecords}`);
   } catch (err) {
     logger.error({ err }, "meta_ads_oauth_callback_failed");

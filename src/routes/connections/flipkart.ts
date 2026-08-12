@@ -3,6 +3,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { encodeCredentials, flipkartConnector, verifyCredentials } from "../../modules/connectors/flipkart/index.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
@@ -53,6 +54,15 @@ flipkartConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
 
     logger.info({ connectionId: connection.id, recordsFetched: result.recordsFetched }, "flipkart_connect_complete");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "FLIPKART" },
+    });
     res.json({ connected: true, recordsFetched: result.recordsFetched });
   } catch (err) {
     logger.error({ err }, "flipkart_connect_failed");

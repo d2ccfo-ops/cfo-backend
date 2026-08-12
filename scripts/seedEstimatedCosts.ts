@@ -1,5 +1,6 @@
 import { prisma } from "../src/lib/prisma.js";
 import { stampCogs } from "../src/modules/calc/cogs.js";
+import { writeAudit } from "../src/lib/audit.js";
 
 // PLACEHOLDER product costs, so contribution margin can be SEEN before real
 // costs are entered. Every row is marked source=ESTIMATED — the lowest
@@ -28,6 +29,14 @@ async function wipe() {
   // Re-stamp so order lines drop the estimated COGS they were carrying.
   const stamp = await stampCogs(ORG);
   console.log(`re-stamped: ${JSON.stringify(stamp)}`);
+  await writeAudit({
+    organizationId: ORG,
+    actorType: "SYSTEM",
+    actorId: "seedEstimatedCosts_script",
+    action: "cost.estimate_wipe",
+    entityType: "PRODUCT_COST",
+    metadata: { removed: del.count, restamp: stamp },
+  });
   await prisma.$disconnect();
 }
 
@@ -93,6 +102,14 @@ async function seed() {
 
   const stamp = await stampCogs(ORG);
   console.log(`re-stamped order lines: ${JSON.stringify(stamp)}`);
+  await writeAudit({
+    organizationId: ORG,
+    actorType: "SYSTEM",
+    actorId: "seedEstimatedCosts_script",
+    action: "cost.estimate_seed",
+    entityType: "PRODUCT_COST",
+    metadata: { seeded, skippedReal, restamp: stamp },
+  });
   await prisma.$disconnect();
 }
 

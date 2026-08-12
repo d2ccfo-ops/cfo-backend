@@ -5,6 +5,7 @@ import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { signOAuthState, verifyOAuthState } from "../../lib/oauthState.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import {
   accountsServerFor,
   encodeCredentials,
@@ -101,6 +102,16 @@ zohoBooksConnectionRouter.get("/callback", async (req, res) => {
               credentialsRef,
             },
           });
+
+      await writeAudit({
+        organizationId: stateResult.organizationId,
+        actorType: "SYSTEM",
+        actorId: "oauth_callback",
+        action: "connection.credential_set",
+        entityType: "CONNECTION",
+        entityId: connection.id,
+        metadata: { provider: "ZOHO_BOOKS", zohoOrganizationId: zohoOrg.organization_id },
+      });
 
       try {
         const result = await zohoBooksConnector.backfill(toConnectorContext(connection));

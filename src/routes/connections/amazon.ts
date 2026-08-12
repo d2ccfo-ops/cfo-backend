@@ -5,6 +5,7 @@ import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { signOAuthState, verifyOAuthState } from "../../lib/oauthState.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { amazonConnector, encodeCredentials, exchangeCodeForRefreshToken, getAuthorizeUrl } from "../../modules/connectors/amazon/index.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
@@ -70,6 +71,18 @@ amazonConnectionRouter.get("/callback", async (req, res) => {
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
 
     logger.info({ organizationId: stateResult.organizationId, recordsFetched: result.recordsFetched }, "amazon_backfill_complete");
+    // No Clerk session on an OAuth redirect callback (see verifyOAuthState) —
+    // the state only carries organizationId, so the actor is the OAuth flow
+    // itself, not an identified user.
+    await writeAudit({
+      organizationId: stateResult.organizationId,
+      actorType: "SYSTEM",
+      actorId: "oauth_callback",
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "AMAZON" },
+    });
     res.redirect(`${env.FRONTEND_URL}/connections?amazon=connected&records=${result.recordsFetched}`);
   } catch (err) {
     logger.error({ err }, "amazon_oauth_callback_failed");

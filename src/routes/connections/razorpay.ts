@@ -2,6 +2,7 @@ import { Router } from "express";
 import { logger } from "../../lib/logger.js";
 import { encryptSecret } from "../../lib/crypto.js";
 import { prisma } from "../../lib/prisma.js";
+import { writeAudit } from "../../lib/audit.js";
 import { requireAuth } from "../../middleware/auth.js";
 import { encodeCredentials, razorpayConnector } from "../../modules/connectors/razorpay/index.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
@@ -48,6 +49,16 @@ razorpayConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
             credentialsRef,
           },
         });
+
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "RAZORPAY" },
+    });
 
     // Inline for now, same trade-off as Shopify's backfill — see cfo-docs/PROGRESS.md.
     const result = await razorpayConnector.backfill(toConnectorContext(connection));

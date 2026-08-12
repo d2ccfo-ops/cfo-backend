@@ -4,6 +4,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import {
   encodeCredentials,
   fetchToken,
@@ -167,6 +168,15 @@ bluedartConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
         });
 
     logger.info({ connectionId: connection.id, credentialsVerified }, "bluedart_connected");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "BLUEDART", credentialsVerified },
+    });
     res.json({
       connected: true,
       connectionId: connection.id,
@@ -234,6 +244,15 @@ bluedartConnectionRouter.post("/:connectionId/invoice", ...requireAuth, async (r
       { connectionId: connection.id, invoiceNo: outcome.invoiceNo, linesParsed: outcome.linesParsed },
       "bluedart_invoice_ingested"
     );
+    await writeAudit({
+      organizationId: connection.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "import.freight_invoice",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "BLUEDART", invoiceNo: outcome.invoiceNo, linesParsed: outcome.linesParsed },
+    });
     res.json(outcome);
   } catch (err) {
     logger.error({ err }, "bluedart_invoice_ingest_failed");
@@ -320,6 +339,15 @@ bluedartConnectionRouter.post("/:connectionId/invoices", ...requireAuth, async (
     { connectionId: connection.id, files: files.length, imported: imported.length, distinct: distinct.length },
     "bluedart_invoices_batch_ingested"
   );
+  await writeAudit({
+    organizationId: connection.organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "import.freight_invoice_batch",
+    entityType: "CONNECTION",
+    entityId: connection.id,
+    metadata: { provider: "BLUEDART", filesReceived: files.length, imported: imported.length, distinct: distinct.length },
+  });
 
   res.json({
     filesReceived: files.length,
@@ -368,6 +396,20 @@ bluedartConnectionRouter.post("/:connectionId/remittance", ...requireAuth, async
       },
       "bluedart_remittance_ingested"
     );
+    await writeAudit({
+      organizationId: connection.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "import.cod_remittance",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: {
+        provider: "BLUEDART",
+        batchesImported: result.batchesImported,
+        linesImported: result.linesImported,
+        rejected: result.rejected.length,
+      },
+    });
     res.json(serializeIngestResult(result));
   } catch (err) {
     logger.error({ err }, "bluedart_remittance_ingest_failed");

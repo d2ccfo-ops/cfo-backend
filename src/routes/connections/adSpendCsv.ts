@@ -4,6 +4,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { importAdSpendCsv } from "../../modules/connectors/adspend/csv.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
 
@@ -66,6 +67,15 @@ adSpendCsvRouter.post("/:slug/connect", ...requireAuth, async (req, res) => {
       }));
 
     logger.info({ connectionId: connection.id, provider }, "ad_spend_csv_connected");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.create",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider, mode: "csv", externalAccountId },
+    });
     res.json({ connected: true, connectionId: connection.id, externalAccountId });
   } catch (err) {
     logger.error({ err }, "ad_spend_csv_connect_failed");
@@ -113,6 +123,15 @@ adSpendCsvRouter.post("/:slug/:connectionId/upload", ...requireAuth, async (req,
       { connectionId: connection.id, provider, days: result.daysImported, errors: result.errors.length },
       "ad_spend_csv_imported"
     );
+    await writeAudit({
+      organizationId: connection.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "import.ad_spend_csv",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider, daysImported: result.daysImported, errors: result.errors.length },
+    });
     res.json({ ...result, totalSpendPaise: result.totalSpendPaise.toString() });
   } catch (err) {
     logger.error({ err }, "ad_spend_csv_import_failed");

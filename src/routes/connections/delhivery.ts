@@ -4,6 +4,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { encodeCredentials, generateWebhookToken } from "../../modules/connectors/delhivery/index.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
 
@@ -58,6 +59,15 @@ delhiveryConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
         });
 
     logger.info({ connectionId: connection.id }, "delhivery_connected");
+    await writeAudit({
+      organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "connection.credential_set",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { provider: "DELHIVERY" },
+    });
     // No backfill call — see modules/connectors/delhivery's comment on why
     // there's nothing to pull yet. The webhook URL is what the merchant
     // actually needs next.

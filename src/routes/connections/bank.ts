@@ -3,6 +3,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import { ingestStatement } from "../../modules/connectors/bank/index.js";
 import { toConnectorContext } from "../../modules/connectors/types.js";
 import { getOrCreateDefaultLegalEntity } from "../../modules/orgs/legalEntity.js";
@@ -41,6 +42,16 @@ bankConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
         },
       });
 
+  await writeAudit({
+    organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "connection.credential_set",
+    entityType: "CONNECTION",
+    entityId: connection.id,
+    metadata: { provider: "BANK", externalAccountId },
+  });
+
   res.json({ connected: true, connectionId: connection.id });
 });
 
@@ -71,6 +82,15 @@ bankConnectionRouter.post("/:connectionId/upload", ...requireAuth, async (req, r
       { connectionId: connection.id, recordsFetched: result.recordsFetched, skipped: result.skipped },
       "bank_statement_ingested"
     );
+    await writeAudit({
+      organizationId: req.auth!.organizationId,
+      actorType: "USER",
+      actorId: req.auth!.userId,
+      action: "import.bank_statement",
+      entityType: "CONNECTION",
+      entityId: connection.id,
+      metadata: { recordsFetched: result.recordsFetched, skipped: result.skipped },
+    });
     res.json(result);
   } catch (err) {
     logger.error({ err }, "bank_statement_ingest_failed");

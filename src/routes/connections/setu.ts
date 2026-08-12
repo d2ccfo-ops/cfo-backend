@@ -4,6 +4,7 @@ import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { writeAudit } from "../../lib/audit.js";
 import {
   activateConsentConnection,
   createConsent,
@@ -64,6 +65,16 @@ setuConnectionRouter.post("/connect", ...requireAuth, async (req, res) => {
     },
   });
 
+  await writeAudit({
+    organizationId,
+    actorType: "USER",
+    actorId: req.auth!.userId,
+    action: "connection.consent_requested",
+    entityType: "CONNECTION",
+    entityId: connection.id,
+    metadata: { provider: "BANK_AA" },
+  });
+
   res.json({ connectionId: connection.id, redirectUrl: consent.url });
 });
 
@@ -103,6 +114,15 @@ setuConnectionRouter.get("/:connectionId/status", ...requireAuth, async (req, re
     const consentStatus = await getConsentStatus(connection.externalAccountId ?? "");
     if (consentStatus.status === "ACTIVE") {
       await activateConsentConnection(connection);
+      await writeAudit({
+        organizationId: connection.organizationId,
+        actorType: "USER",
+        actorId: req.auth!.userId,
+        action: "connection.credential_set",
+        entityType: "CONNECTION",
+        entityId: connection.id,
+        metadata: { provider: "BANK_AA" },
+      });
       // activateConsentConnection only *requests* a data session — the data
       // itself normally arrives via Setu's FI notification, which cannot
       // reach a local/sandbox backend. Driving it from the poll too is what
