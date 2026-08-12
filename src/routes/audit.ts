@@ -19,6 +19,15 @@ auditRouter.get("/", ...requireAuth, async (req, res) => {
   const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), MAX_LIMIT) : DEFAULT_LIMIT;
 
   const action = typeof req.query.action === "string" ? req.query.action : undefined;
+  // Prefix, for the families of actions that share one — "auth.", "approval.",
+  // "reconciliation.". An exact match cannot ask "show me every auth event",
+  // and a caller that resorts to fetching everything and filtering in the
+  // browser gets a page of the wrong rows the moment there are more than 50.
+  const actionPrefix = typeof req.query.actionPrefix === "string" ? req.query.actionPrefix : undefined;
+  // Whose actions. `mine` rather than a free actorId: letting a caller name
+  // any actor is a way to enumerate other people's activity, and the only
+  // legitimate narrowing a UI needs is "my own".
+  const mineOnly = req.query.mine === "true" || req.query.mine === "1";
   const entityType = typeof req.query.entityType === "string" ? req.query.entityType : undefined;
   const actorType = typeof req.query.actorType === "string" ? (req.query.actorType as ActorType) : undefined;
   // Cursor is the id of the last row from the previous page — createdAt alone
@@ -29,6 +38,8 @@ auditRouter.get("/", ...requireAuth, async (req, res) => {
     where: {
       organizationId,
       ...(action ? { action } : {}),
+      ...(actionPrefix ? { action: { startsWith: actionPrefix } } : {}),
+      ...(mineOnly ? { actorId: req.auth!.userId } : {}),
       ...(entityType ? { entityType } : {}),
       ...(actorType ? { actorType } : {}),
     },

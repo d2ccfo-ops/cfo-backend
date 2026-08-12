@@ -115,6 +115,49 @@ clerkWebhookRouter.post("/", async (req, res) => {
         break;
       }
 
+      // ---------------------------------------------------------------------
+      // §12.1 auth events (P5.4)
+      // ---------------------------------------------------------------------
+      // Sign-ins, sign-outs, revoked sessions and 2FA changes, recorded in the
+      // SAME audit log as every money decision. That is the point: "who saw
+      // this figure" and "who changed it" are the same question when the
+      // answer is a person, and splitting authentication into a separate log
+      // means nobody correlates a strange write with the session that made it.
+      //
+      // These events name a USER, not an organisation, so they are written
+      // against every organisation that user belongs to. An admin auditing
+      // their own org must be able to see a session event for one of their
+      // members without being handed every other tenant's.
+      case "session.created":
+      case "session.ended":
+      case "session.removed":
+      case "session.revoked": {
+        const data = event.data as {
+          id: string;
+          user_id: string;
+          client_id?: string;
+          last_active_at?: number;
+        };
+        await auditAuthEvent(data.user_id, event.type, {
+          sessionId: data.id,
+          clientId: data.client_id ?? null,
+        });
+        break;
+      }
+
+      case "user.updated": {
+        // Clerk does not fire a dedicated event when someone turns 2FA on or
+        // off; it arrives as a user.updated with the flag flipped. Recorded
+        // explicitly because "MFA was disabled at 03:12" is exactly the line
+        // an incident review needs, and it is invisible otherwise.
+        const data = event.data as { id: string; two_factor_enabled?: boolean; banned?: boolean };
+        await auditAuthEvent(data.id, "user.updated", {
+          twoFactorEnabled: data.two_factor_enabled ?? null,
+          banned: data.banned ?? null,
+        });
+        break;
+      }
+
       default:
         break;
     }
@@ -154,4 +197,39 @@ export function reconcileRole(clerkRole: string, existing: MembershipRole | null
   if (existing === null) return "ANALYST";
   if (existing === "OWNER" || existing === "ADMIN") return "ANALYST";
   return existing;
+}
+
+/**
+ * Write an auth event to the audit log of every organisation the user belongs
+ * to.
+ *
+ * Fanned out rather than stored once against a null organisation, because
+ * every read path in this system is org-scoped by construction (§12.2) and an
+ * unscoped row would be either invisible or visible to everyone. Duplicating
+ * a handful of session rows across the two or three orgs a person belongs to
+ * is the cheap side of that trade.
+ */
+async function auditAuthEvent(clerkUserId: string, action: string, metadata: Record<string, unknown>) {
+  const memberships = await prisma.membership.findMany({
+    where: { clerkUserId },
+    select: { organizationId: true, email: true },
+  });
+  if (memberships.length === 0) {
+    // A session for someone who belongs to no organisation yet — signing up.
+    // Nothing to scope it to, and inventing a home for it would put it
+    // somewhere it does not belong.
+    logger.info({ clerkUserId, action }, "clerk_auth_event_unscoped");
+    return;
+  }
+  await prisma.auditLog.createMany({
+    data: memberships.map((m) => ({
+      organizationId: m.organizationId,
+      actorType: "USER" as const,
+      actorId: clerkUserId,
+      action: `auth.${action.replace(".", "_")}`,
+      entityType: "SESSION",
+      entityId: (metadata.sessionId as string) ?? clerkUserId,
+      metadata: { ...metadata, email: m.email } as never,
+    })),
+  });
 }
