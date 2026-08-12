@@ -985,7 +985,10 @@ async function aggregateLeg(
         AND rm."sourceType" = ${sourceType}
         AND rm."sourceId" = s.id
         AND rm.status <> 'EXCEPTION'
-      ORDER BY rm."createdAt" DESC
+      -- P6.3. Same rule as the items query: a manual pairing outranks whatever
+      -- the engine derived afterwards, so the leg counts and the row a reader
+      -- sees cannot disagree about which match is in force.
+      ORDER BY (rm.confidence = 'MANUAL') DESC, rm."createdAt" DESC
       LIMIT 1
     ) m ON true`);
   return rows[0]!;

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { Prisma, MatchType } from "@prisma/client";
+import { z } from "zod";
 import { buildCodDataStatus, buildSettlementDataStatus } from "../modules/calc/dataStatus.js";
 import { prisma } from "../lib/prisma.js";
 import { describeRange, withDateRange, type ResolvedRange } from "../lib/dateRange.js";
@@ -13,11 +14,20 @@ import {
   runReconciliation,
   RECONCILIATION_VERSION,
 } from "../modules/calc/reconciliation.js";
+import { getPairCandidates, pairOrderToPayment, unpairOrder } from "../modules/reconciliation/manualMatch.js";
 
 export const reconciliationRouter = Router();
 
 const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 200;
+
+// P6.3. The note is bounded and optional — a pairing that carries a reason is
+// worth more six months later than one that does not, but requiring it would
+// train people to type "ok".
+const pairSchema = z.object({
+  paymentId: z.string().min(1).max(64),
+  note: z.string().trim().max(500).optional().nullable().transform((v) => v || null),
+});
 
 // Every row status the list can return. Filtering happens in SQL against the
 // same CASE expression that produces the value, so a filter can never disagree
@@ -162,7 +172,13 @@ const BASE_FROM = Prisma.sql`
     WHERE rm."sourceType" = 'ORDER'
       AND rm."sourceId" = o.id
       AND rm."matchType" = 'ORDER_PAYMENT'
-    ORDER BY rm."createdAt" DESC
+    -- P6.3. A HUMAN DECISION OUTRANKS A DERIVATION, always. Ordering by
+    -- createdAt alone was fine while every row came from the engine, but a
+    -- manual pairing is a claim someone is accountable for, and the next
+    -- nightly run creating a row for a different payment would silently
+    -- overrule it. Whoever paired this would see their decision quietly
+    -- undone, with nothing to indicate it had happened.
+    ORDER BY (rm.confidence = 'MANUAL') DESC, rm."createdAt" DESC
     LIMIT 1
   ) m ON true
   LEFT JOIN payments p ON p.id = m."targetId"`;
@@ -799,4 +815,119 @@ reconciliationRouter.post("/items/:orderId/restore", ...requireAuth, async (req,
     note: row.note,
     invoice: invoiceContext(row.status, row),
   });
+});
+
+// ---------------------------------------------------------------------------
+// P6.3 — MANUAL MATCH PAIRING (§15)
+// ---------------------------------------------------------------------------
+// Thin over modules/reconciliation/manualMatch.ts — the reasoning, the refusal
+// and the audit trail all live there so they can be exercised without HTTP.
+// These handlers only map results onto status codes.
+
+/** Payments that could plausibly belong to this order, for the pairing UI. */
+reconciliationRouter.get("/items/:orderId/pair-candidates", ...requireAuth, async (req, res, next) => {
+  try {
+    const orderId = req.params.orderId;
+    if (!orderId) {
+      res.status(400).json({ error: "order_id_required" });
+      return;
+    }
+    const result = await getPairCandidates(req.auth!.organizationId, orderId);
+    if (!result) {
+      res.status(404).json({ error: "order_not_found" });
+      return;
+    }
+    res.json({
+      order: {
+        id: result.order.id,
+        externalOrderId: result.order.externalOrderId,
+        grossAmountPaise: result.order.grossAmount.toString(),
+        placedAt: result.order.placedAt.toISOString(),
+      },
+      windowDays: result.windowDays,
+      candidates: result.candidates.map((c) => ({
+        id: c.id,
+        externalPaymentId: c.externalPaymentId,
+        amountPaise: c.amountPaise.toString(),
+        differencePaise: c.differencePaise.toString(),
+        capturedAt: c.capturedAt?.toISOString() ?? null,
+        method: c.method,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Pair an order to a payment by hand. */
+reconciliationRouter.post("/items/:orderId/pair", ...requireAuth, async (req, res, next) => {
+  try {
+    const orderId = req.params.orderId;
+    const parsed = pairSchema.safeParse(req.body);
+    if (!orderId || !parsed.success) {
+      res.status(400).json({
+        error: "invalid_request",
+        detail: parsed.success ? "order_id_required" : parsed.error.issues,
+      });
+      return;
+    }
+
+    const result = await pairOrderToPayment(
+      req.auth!.organizationId,
+      orderId,
+      parsed.data.paymentId,
+      parsed.data.note,
+      req.auth!.userId
+    );
+
+    if (!result.ok) {
+      if (result.reason === "payment_already_matched") {
+        res.status(409).json({
+          error: result.reason,
+          // Names the other order. "Already matched" alone leaves someone
+          // hunting through the table for which one.
+          message: `That payment is already matched to order ${result.conflictingOrderRef ?? result.conflictingOrderId}. Unpair it there first — one payment cannot settle two orders.`,
+          conflictingOrderId: result.conflictingOrderId,
+        });
+        return;
+      }
+      res.status(404).json({ error: result.reason });
+      return;
+    }
+
+    res.json({
+      id: result.matchId,
+      status: "matched",
+      confidence: "MANUAL",
+      differencePaise: result.differencePaise.toString(),
+      matchMethod: "Matched manually",
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Undo a manual pairing. */
+reconciliationRouter.post("/items/:orderId/unpair", ...requireAuth, async (req, res, next) => {
+  try {
+    const organizationId = req.auth!.organizationId;
+    const orderId = req.params.orderId;
+    if (!orderId) {
+      res.status(400).json({ error: "order_id_required" });
+      return;
+    }
+
+    const { unpaired } = await unpairOrder(organizationId, orderId, req.auth!.userId);
+    if (!unpaired) {
+      res.status(404).json({ error: "not_manually_paired" });
+      return;
+    }
+
+    // Re-run so the row's state in THIS response is what the evidence
+    // supports, rather than an empty state that resolves at some later run.
+    await runReconciliation(organizationId);
+    res.json({ status: "unpaired" });
+  } catch (err) {
+    next(err);
+  }
 });
