@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import { prisma } from "../src/lib/prisma.js";
 import { getCashForecast } from "../src/modules/calc/cashForecast.js";
 import { applyScenario, runCashScenario, type ScenarioParams } from "../src/modules/calc/cashScenario.js";
@@ -133,6 +135,42 @@ async function main() {
   ok("marked not-applied", lever?.applied === false);
   ok("the line really is unchanged, matching the claim", cod.totals.closingMinor === base.totals.closingMinor);
   ok("and it reaches the reliability note", /not modelled/i.test(cod.reliabilityNote));
+
+  console.log("\n[10] the scenario response carries every field the UI reads");
+  // cfo-frontend's ScenarioPanel is Clerk-gated, so no script can render it.
+  // What CAN be checked is the seam that actually breaks: a field the panel
+  // reads by name which the response does not carry renders a blank cell, and
+  // nothing on either side fails loudly. The names are read out of the panel
+  // source rather than restated here, so this cannot drift from the component.
+  const panelSrc = await readFile(new URL("../../cfo-frontend/components/cards/ScenarioPanel.js", pathToFileURL(import.meta.dirname + "/")), "utf8");
+  const shaped = applyScenario(base, { growthDeltaPct: 10, adSpendDeltaPct: 5 });
+
+  const comparisonFields = [...panelSrc.matchAll(/comparison\.([A-Za-z]+)/g)].map((m) => m[1]!);
+  const uniqueComparison = [...new Set(comparisonFields)];
+  ok("the panel reads at least one comparison field", uniqueComparison.length > 0, uniqueComparison.join(", "));
+  for (const field of uniqueComparison) {
+    ok(`comparison.${field} exists on the response`, field in (shaped.comparison as Record<string, unknown>));
+  }
+
+  // The lever list the panel offers must be a SUBSET of what the engine
+  // accepts — a slider posting a key the schema rejects would 400 the whole
+  // scenario, and a founder would see "couldn't run that scenario" with no
+  // way to tell which control caused it.
+  const panelLeverKeys = [...panelSrc.matchAll(/key:\s*"([A-Za-z]+)"/g)].map((m) => m[1]!);
+  const engineKeys = new Set([
+    "adSpendDeltaPct",
+    "codShareDeltaPct",
+    "rtoDeltaPct",
+    "collectionAccelDays",
+    "inventoryPurchase",
+    "vendorPaymentDelayDays",
+    "growthDeltaPct",
+  ]);
+  ok("the panel offers at least one lever", panelLeverKeys.length > 0, panelLeverKeys.join(", "));
+  for (const k of panelLeverKeys) ok(`panel lever "${k}" is a real engine parameter`, engineKeys.has(k));
+  // The converse of the "no control that lies" rule: the panel must NOT offer
+  // a slider for the lever the engine reports as unmodelled.
+  ok("the panel does not offer a slider for the unmodelled codShareDeltaPct", !panelLeverKeys.includes("codShareDeltaPct"));
 
   console.log("\n" + "─".repeat(60));
   console.log(`${pass} passed, ${fail} failed`);
