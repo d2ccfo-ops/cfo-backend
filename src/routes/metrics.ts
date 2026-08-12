@@ -6,6 +6,13 @@ import { getAdEfficiencySummary, getAdSpendSummary } from "../modules/calc/ads.j
 import { getAvailableCashSummary, getCashReceivedSummary } from "../modules/calc/cash.js";
 import { DEFAULT_HORIZON, getCashForecast, isForecastHorizon } from "../modules/calc/cashForecast.js";
 import { runCashScenario, type ScenarioParams } from "../modules/calc/cashScenario.js";
+import {
+  DAILY_SNAPSHOT_METRICS,
+  DAILY_SNAPSHOT_VERSION,
+  captureDailySnapshot,
+  getDailySnapshotDiff,
+  getSnapshotHistory,
+} from "../modules/calc/dailySnapshot.js";
 import { getDataFreshness } from "../modules/calc/freshness.js";
 import { getDataStatusMap, FORMULA_VERSION as DATA_STATUS_FORMULA_VERSION } from "../modules/calc/dataStatus.js";
 import { getInventoryCoverSummary, getInventoryValueSummary } from "../modules/calc/inventory.js";
@@ -147,6 +154,67 @@ metricsRouter.post("/cash-forecast/scenario", ...requireAuth, async (req, res, n
     horizon
   );
   res.json({ base, scenario });
+});
+
+// P2.2d snapshot history. Everything else on this router answers "what is this
+// number now"; this answers "what has it been", which is a question no other
+// endpoint can serve — the six calc modules that persist a MetricSnapshot as a
+// side effect all overwrite the current period's row in place, so their history
+// is one row deep by construction.
+//
+// Returns the series AND the overnight diff from one call. A client fetching
+// them separately would compute the two at different instants, the same trap
+// the scenario endpoint avoids by returning both lines together.
+const DEFAULT_HISTORY_DAYS = 30;
+
+metricsRouter.get("/snapshot-history", ...requireAuth, withDateRange, async (req, res) => {
+  const requested = Number.parseInt(String(req.query.days ?? ""), 10);
+  const days = Number.isFinite(requested) ? requested : DEFAULT_HISTORY_DAYS;
+  const [history, diff] = await Promise.all([
+    getSnapshotHistory(req.auth!.organizationId, days),
+    getDailySnapshotDiff(req.auth!.organizationId),
+  ]);
+  res.json({
+    formulaVersion: DAILY_SNAPSHOT_VERSION,
+    // History is a fixed trailing window of captured days, not the dashboard's
+    // picked range — the rows only exist for days the nightly job actually ran,
+    // and pretending a filter applied would imply days that were never
+    // captured are simply outside the selection.
+    periodFiltered: false,
+    // The full catalogue, not just the metrics with rows. A client rendering
+    // "no history yet for X" needs to know X exists; series only carries the
+    // ones that have points.
+    catalogue: DAILY_SNAPSHOT_METRICS,
+    ...history,
+    diff,
+  });
+});
+
+// Manual capture, for the same reason POST /anomalies/run exists: waiting until
+// 02:05 tomorrow to find out whether the nightly job produces sane rows is not
+// a workable feedback loop. It still cannot write to an arbitrary day —
+// captureDailySnapshot derives its target from the clock and takes no date, so
+// this can only ever (re)write yesterday.
+metricsRouter.post("/snapshot-history/run", ...requireAuth, async (req, res) => {
+  const capture = await captureDailySnapshot(req.auth!.organizationId);
+  res.json({
+    formulaVersion: DAILY_SNAPSHOT_VERSION,
+    organizationId: capture.organizationId,
+    timeZone: capture.timeZone,
+    day: capture.day,
+    written: capture.written,
+    // Which metrics had no honest value for this org, by name. The interesting
+    // half of the answer on a partly-connected account, and the only way to
+    // tell "recorded as zero" from "not recorded" without querying the table.
+    omitted: capture.omitted,
+    rows: capture.rows.map((r) => ({
+      metricKey: r.metricKey,
+      // paise, as a string. Money never crosses the wire as a JSON number.
+      valueMinor: r.valueMinor === null ? null : r.valueMinor.toString(),
+      valueNumeric: r.valueNumeric,
+      confidence: r.confidence,
+    })),
+  });
 });
 
 // Ignores the resolved range on purpose: only current stock levels exist

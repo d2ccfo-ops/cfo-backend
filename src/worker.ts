@@ -2,6 +2,7 @@ import { logger } from "./lib/logger.js";
 import { prisma } from "./lib/prisma.js";
 import { redisConnection } from "./lib/redis.js";
 import { anomalySchedulerQueue, startAnomalyScheduler } from "./modules/queue/anomalyScheduler.js";
+import { snapshotSchedulerQueue, startSnapshotScheduler } from "./modules/queue/snapshotScheduler.js";
 import { startSyncScheduler, syncSchedulerQueue } from "./modules/queue/syncScheduler.js";
 import { startSyncWorker } from "./modules/queue/syncWorker.js";
 
@@ -24,6 +25,11 @@ const scheduler = startSyncScheduler();
 // Postgres and Redis, and the clock should not stop because the API tier is
 // being restarted or scaled to zero.
 const anomalyScheduler = startAnomalyScheduler();
+// P2.2d's nightly snapshot capture, same reasoning again. It has to keep its
+// own clock for a reason the other two do not share: a night it misses cannot
+// be made up later, because the position metrics it records read current-state
+// tables that hold no history to look back through.
+const snapshotScheduler = startSnapshotScheduler();
 
 // Re-entrancy guard. Without it a second signal — or the same signal delivered
 // to both the `tsx watch` wrapper and this child, which is what happens on
@@ -44,6 +50,8 @@ async function shutdown(signal: string) {
     await syncSchedulerQueue.close();
     await anomalyScheduler.close();
     await anomalySchedulerQueue.close();
+    await snapshotScheduler.close();
+    await snapshotSchedulerQueue.close();
     await worker.close();
     await redisConnection.quit();
     await prisma.$disconnect();
