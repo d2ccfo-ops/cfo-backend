@@ -1,7 +1,5 @@
-import { createRequire } from "node:module";
 import { prisma } from "../../../lib/prisma.js";
-
-const require = createRequire(import.meta.url);
+import { runInWorkerWithTimeout } from "../../../lib/workerTimeout.js";
 
 // Bluedart's freight TAX INVOICE — what they charge you to carry a parcel.
 //
@@ -185,11 +183,38 @@ export function parseBluedartInvoiceText(text: string): ParsedInvoice {
   };
 }
 
+// P1.2 hardening: the actual pdf-parse call runs in pdfWorker.ts, on its own
+// thread, with a hard wall-clock deadline — a crafted PDF that makes pdfjs
+// loop or allocate stalls that thread, not the request thread serving every
+// other inbound email. Timeout/parse-failure/worker-crash all surface as the
+// same thrown error, which ingestInvoicePdfDocument's existing try/catch
+// already converts to `unreadable_pdf` — no caller needed to change.
+const PDF_PARSE_TIMEOUT_MS = 20_000;
+
+// tsx does not propagate its TS loader into a freshly spawned worker thread
+// on its own; passing this execArgv re-registers it inside that thread. Only
+// needed when THIS file is itself running from source (dev, via tsx) — under
+// a compiled production build the worker is already plain .js and needs no
+// loader at all. import.meta.url's own extension is the one signal that's
+// always true for "how was I loaded", so it drives the check directly rather
+// than an env var that could drift from reality.
+const RUNNING_FROM_TS_SOURCE = import.meta.url.endsWith(".ts");
+const PDF_WORKER_URL = new URL(RUNNING_FROM_TS_SOURCE ? "../../ingest/pdfWorker.ts" : "../../ingest/pdfWorker.js", import.meta.url);
+
 export async function parseBluedartInvoicePdf(data: Buffer | Uint8Array): Promise<ParsedInvoice> {
-  const { PDFParse } = require("pdf-parse");
-  const parser = new PDFParse({ data: new Uint8Array(data) });
-  const result = await parser.getText();
-  return parseBluedartInvoiceText(result.text);
+  const result = await runInWorkerWithTimeout<{ bytes: Uint8Array }, { ok: true; text: string } | { ok: false; message: string }>(
+    PDF_WORKER_URL,
+    { bytes: new Uint8Array(data) },
+    PDF_PARSE_TIMEOUT_MS,
+    RUNNING_FROM_TS_SOURCE ? ["--import", "tsx"] : []
+  );
+  if (!result.ok) {
+    throw new Error(result.reason === "timeout" ? `PDF parsing timed out after ${PDF_PARSE_TIMEOUT_MS}ms` : result.detail);
+  }
+  if (!result.value.ok) {
+    throw new Error(result.value.message);
+  }
+  return parseBluedartInvoiceText(result.value.text);
 }
 
 export interface InvoiceApplyResult {

@@ -44,13 +44,11 @@ import { getOrCreateDefaultLegalEntity } from "../orgs/legalEntity.js";
 //     or delete a reconciled payout (see getOrCreateIngestConnection);
 //   - the webhook rate-limits per token and caps each attachment's size.
 //
-// KNOWN HARDENING TODO before enabling in production with a live inbound
-// provider: pdf-parse runs on the request thread, so a crafted PDF that makes
-// pdfjs loop or allocate can still stall the event loop despite the size cap.
-// Move the PDF parse into a worker thread with a wall-clock timeout (treat a
-// timeout as unreadable_pdf) before pointing a real inbound domain at this.
-// Until EMAIL_INGEST_DOMAIN is set no provider posts here, so this is a
-// pre-launch task, not a live exposure.
+// P1.2, done: pdf-parse used to run on the request thread, where a crafted
+// PDF that makes pdfjs loop or allocate could stall the event loop despite
+// the size cap. It now runs in modules/ingest/pdfWorker.ts on its own thread
+// with a 20s wall-clock deadline (lib/workerTimeout.ts) — a breach kills the
+// thread and surfaces as unreadable_pdf, same as any other unparseable file.
 
 // ---------------------------------------------------------------------------
 // Payload normalisation
