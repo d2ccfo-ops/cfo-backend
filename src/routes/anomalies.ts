@@ -20,7 +20,11 @@ const MAX_LIMIT = 200;
 // never has to know which route a row came from. `evidence` passes through
 // as-is: it is rule-specific by design, and flattening it into named columns
 // would mean a schema change per new rule.
-function serialize(a: {
+//
+// Exported so scripts/checkAnomaliesContract.ts can feed the REAL wire shape
+// to the frontend's mapper instead of a hand-written lookalike that would
+// drift from this the moment a field changes.
+export function serializeAnomaly(a: {
   id: string;
   type: AnomalyType;
   severity: AnomalySeverity;
@@ -112,7 +116,7 @@ anomaliesRouter.get("/", ...requireAuth, async (req, res) => {
   });
 
   res.json({
-    anomalies: page.map(serialize),
+    anomalies: page.map(serializeAnomaly),
     nextCursor: hasMore ? page[page.length - 1]!.id : null,
     counts: {
       byStatus: Object.fromEntries(byStatus.map((r) => [r.status, r._count._all])),
@@ -205,5 +209,5 @@ anomaliesRouter.patch("/:id", ...requireAuth, async (req, res, next) => {
     },
   });
 
-  res.json(serialize(updated));
+  res.json(serializeAnomaly(updated));
 });
