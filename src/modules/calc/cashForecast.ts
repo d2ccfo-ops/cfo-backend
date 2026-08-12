@@ -4,13 +4,26 @@ import { prisma } from "../../lib/prisma.js";
 import { paiseToRupees } from "./money.js";
 import { getAvailableCashSummary } from "./cash.js";
 
-// 30-day cash forecast.
+// Cash forecast over a 7, 30 or 90-day horizon (§16).
 //
 // A forecast is the one number on this dashboard that cannot be verified
 // against a source, so it is also the easiest one to fake convincingly. The
 // rule this file holds to is that every component declares its OWN basis —
 // measured, assumed, or unavailable — and the projection refuses to describe
 // itself as a balance when a whole side of the equation has no data behind it.
+//
+// ONE engine, one horizon parameter — not three code paths. The horizon
+// changes how far the same walk runs, nothing else, so a 90-day line and a
+// 7-day line can never be computed differently and disagree on their
+// overlapping days.
+//
+// The horizon is NOT free of consequences for honesty, though, and the
+// engine says so rather than leaving the reader to work it out: only about
+// the first `codRemittanceLagDays` of inflow come from orders that actually
+// exist. Past that point every rupee of inflow is projected from trailing
+// velocity, so a 90-day line is ~90% invention by value where a 7-day line is
+// mostly pipeline. `projectedInflowSharePct` reports exactly that, and the
+// reliability note degrades with it.
 //
 //   closing(d) = closing(d-1) + inflow(d) − outflow(d)
 //
@@ -24,9 +37,23 @@ import { getAvailableCashSummary } from "./cash.js";
 // that quietly treats unknown as zero draws a line that rises forever. That
 // distinction is the whole reason `reliability` exists below.
 
-export const CASH_FORECAST_VERSION = "v1";
+// v2: the horizon became a parameter and the response gained
+// lowestBalance/cashShortageDate/projectedInflowSharePct. v1 snapshots stay
+// as they are (§92) — the 30-day numbers themselves are unchanged, so this
+// is an additive version bump, not a restatement.
+export const CASH_FORECAST_VERSION = "v2";
 
-const HORIZON_DAYS = 30;
+// The three §16 horizons. A closed set rather than a free integer: each one
+// is a different QUESTION (this week's squeeze, this month's plan, this
+// quarter's runway) with a different honesty profile, and an arbitrary
+// 43-day horizon is not a question anyone on this product asks.
+export const FORECAST_HORIZONS = [7, 30, 90] as const;
+export type ForecastHorizon = (typeof FORECAST_HORIZONS)[number];
+export const DEFAULT_HORIZON: ForecastHorizon = 30;
+
+export function isForecastHorizon(n: unknown): n is ForecastHorizon {
+  return typeof n === "number" && (FORECAST_HORIZONS as readonly number[]).includes(n);
+}
 
 // How far back to measure order velocity. Four weeks is long enough to average
 // out a single bad week and short enough to still track a real trend; it is
@@ -96,6 +123,29 @@ export interface CashForecast {
     netMinor: string;
     closingMinor: string;
   };
+  /**
+   * §16. The trough, not the endpoint — a line that dips below zero in week
+   * three and recovers by week twelve ends healthy and is still a crisis, so
+   * the closing balance alone cannot answer "will I run out".
+   */
+  lowestBalance: {
+    valueMinor: string;
+    value: number;
+    date: string;
+  };
+  /**
+   * The first day the projected balance goes negative, or null if it never
+   * does inside the horizon. Null means "not within these N days" — NOT
+   * "never", which is a claim no horizon can support.
+   */
+  cashShortageDate: string | null;
+  /**
+   * What share of projected INFLOW comes from orders that don't exist yet.
+   * Rises with the horizon by construction (see the header): a reader
+   * deciding how much to trust the line needs this, and it is not derivable
+   * from anything else in the response.
+   */
+  projectedInflowSharePct: number;
   components: ComponentCoverage[];
   /**
    * usable        — both sides measured; the closing balance means something
@@ -178,11 +228,12 @@ function mean(values: bigint[]): bigint {
 export async function getCashForecast(
   organizationId: string,
   timeZone: string = DEFAULT_TIMEZONE,
-  now: Date = new Date()
+  now: Date = new Date(),
+  horizonDays: ForecastHorizon = DEFAULT_HORIZON
 ): Promise<CashForecast> {
   const today = zonedDayKey(now, timeZone);
-  const horizon = Array.from({ length: HORIZON_DAYS }, (_, i) => addZonedDays(today, i + 1));
-  const horizonEnd = startOfZonedDay(addZonedDays(today, HORIZON_DAYS + 1), timeZone);
+  const horizon = Array.from({ length: horizonDays }, (_, i) => addZonedDays(today, i + 1));
+  const horizonEnd = startOfZonedDay(addZonedDays(today, horizonDays + 1), timeZone);
 
   // --- Opening balance --------------------------------------------------
   const cash = await getAvailableCashSummary(organizationId);
@@ -274,6 +325,12 @@ export async function getCashForecast(
   let totalProjected = 0n;
   let totalBills = 0n;
   let totalRunRate = 0n;
+  // Seeded from the opening balance, not from the first projected day: if
+  // today's balance is already the lowest point the horizon ever sees, that
+  // IS the trough, and starting the search a day later would miss it.
+  let lowestBalance = openingBalance;
+  let lowestBalanceDate = today;
+  let cashShortageDate: string | null = null;
 
   // Weekday multiplier applied to a paise amount, staying in integers — the
   // multiplier is scaled by 1000 rather than converted to a float, so no money
@@ -316,6 +373,14 @@ export async function getCashForecast(
     totalProjected += projected;
     totalBills += billOutflow;
     totalRunRate += runRateOutflow;
+
+    if (running < lowestBalance) {
+      lowestBalance = running;
+      lowestBalanceDate = day;
+    }
+    // FIRST crossing only — a line that dips negative, recovers, and dips
+    // again has one date that matters, and it is the earliest one.
+    if (cashShortageDate === null && running < 0n) cashShortageDate = day;
 
     days.push({
       date: day,
@@ -394,18 +459,38 @@ export async function getCashForecast(
       ? ("usable" as const)
       : ("directional" as const);
 
-  const reliabilityNote =
+  // Share of inflow that comes from orders which do not exist yet. Integer
+  // maths on paise, then one division at the end — the same discipline every
+  // money value in this file keeps.
+  const projectedInflowSharePct =
+    totalInflow === 0n ? 0 : Math.round(Number((totalProjected * 1000n) / totalInflow)) / 10;
+
+  const baseNote =
     reliability === "inflows_only"
       ? "No outflow source is connected — no accounting system, no ad account. This line shows money coming IN and nothing going out, so it is not a cash balance and will rise indefinitely. Connect accounting or ads before treating it as a runway."
       : reliability === "directional"
         ? "Part of the outflow side is missing, so the shape of this line is more trustworthy than its level."
         : "Both sides of the projection have a real data source.";
 
+  // The horizon's own caveat, stated separately because it is true regardless
+  // of how many sources are connected: a longer horizon is not the same
+  // forecast drawn further, it is a progressively larger share of pure
+  // projection. Without this a 90-day line looks exactly as solid as a 7-day
+  // one, and they are not remotely the same claim.
+  const horizonNote =
+    projectedInflowSharePct >= 66
+      ? ` Over ${horizonDays} days, ${projectedInflowSharePct}% of projected inflow comes from orders not yet placed — this is a trend extrapolation, not a view of money already earned.`
+      : projectedInflowSharePct >= 33
+        ? ` Over ${horizonDays} days, ${projectedInflowSharePct}% of projected inflow comes from orders not yet placed.`
+        : ` Most inflow over these ${horizonDays} days comes from orders already placed.`;
+
+  const reliabilityNote = baseNote + horizonNote;
+
   return {
     version: CASH_FORECAST_VERSION,
     generatedAt: now.toISOString(),
     timezone: timeZone,
-    horizonDays: HORIZON_DAYS,
+    horizonDays,
     openingBalance: {
       valueMinor: openingBalance.toString(),
       value: paiseToRupees(openingBalance),
@@ -419,6 +504,13 @@ export async function getCashForecast(
       netMinor: (totalInflow - totalOutflow).toString(),
       closingMinor: running.toString(),
     },
+    lowestBalance: {
+      valueMinor: lowestBalance.toString(),
+      value: paiseToRupees(lowestBalance),
+      date: lowestBalanceDate,
+    },
+    cashShortageDate,
+    projectedInflowSharePct,
     components,
     reliability,
     reliabilityNote,

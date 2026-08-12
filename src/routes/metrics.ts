@@ -3,7 +3,7 @@ import { withDateRange } from "../lib/dateRange.js";
 import { withTrendWindow } from "../lib/trendWindow.js";
 import { getAdEfficiencySummary, getAdSpendSummary } from "../modules/calc/ads.js";
 import { getAvailableCashSummary, getCashReceivedSummary } from "../modules/calc/cash.js";
-import { getCashForecast } from "../modules/calc/cashForecast.js";
+import { DEFAULT_HORIZON, getCashForecast, isForecastHorizon } from "../modules/calc/cashForecast.js";
 import { getDataFreshness } from "../modules/calc/freshness.js";
 import { getDataStatusMap, FORMULA_VERSION as DATA_STATUS_FORMULA_VERSION } from "../modules/calc/dataStatus.js";
 import { getInventoryCoverSummary, getInventoryValueSummary } from "../modules/calc/inventory.js";
@@ -86,9 +86,16 @@ metricsRouter.get("/available-cash", ...requireAuth, withDateRange, async (req, 
 // past window would be asking what we once expected to happen, which no card
 // on this page means. Still runs through withDateRange so a malformed date is
 // a clean 400 rather than silently disregarded.
+// ?horizon=7|30|90 (§16). An unrecognised or absent value falls back to 30
+// rather than 400ing: the horizon is a view preference, and a stale bookmark
+// carrying ?horizon=45 should show the default forecast, not an error page
+// where a cash line ought to be. The response always states the horizon it
+// actually used, so the caller can tell it was not honoured.
 metricsRouter.get("/cash-forecast", ...requireAuth, withDateRange, async (req, res) => {
+  const requested = Number.parseInt(String(req.query.horizon ?? ""), 10);
+  const horizon = isForecastHorizon(requested) ? requested : DEFAULT_HORIZON;
   const [forecast, statuses] = await Promise.all([
-    getCashForecast(req.auth!.organizationId, req.auth!.timezone),
+    getCashForecast(req.auth!.organizationId, req.auth!.timezone, new Date(), horizon),
     getDataStatusMap(req.auth!.organizationId),
   ]);
   res.json({ ...forecast, dataStatus: statuses.cash_forecast });
