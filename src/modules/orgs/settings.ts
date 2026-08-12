@@ -78,6 +78,13 @@ export const orgSettingsSchema = z
       .strict()
       .nullable(),
 
+    // P5.2 (§22). Above this, an action stops being housekeeping and becomes
+    // a decision that needs a second pair of eyes. Configurable because
+    // "material" is a fact about the business — a ₹25,000 default is right
+    // for a brand doing ₹2 Cr a year and absurd at either end of that range.
+    // null means "use the default"; it is not zero.
+    approvalThresholdPaise: z.string().regex(/^\d+$/, "must be a non-negative integer string").nullable(),
+
     // P2.2e. The fixed costs that leave on a DATE rather than as a rate —
     // payroll, rent, EMI, subscriptions, advance tax. Stored here rather than
     // as a table because it is configuration a founder types once, not

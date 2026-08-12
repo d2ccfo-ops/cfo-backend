@@ -3,6 +3,7 @@ import { logger } from "../../lib/logger.js";
 import { redisConnection } from "../../lib/redis.js";
 import { runDigestSweep } from "../notifications/digest.js";
 import { runNotificationSweep } from "../notifications/notifications.js";
+import { runApprovalExpirySweep } from "../approvals/approvals.js";
 
 // §23's nightly pass (P3.1). Runs at 02:45 IST — AFTER the anomaly sweep at
 // 02:30, and that ordering is the point: the first thing this emits is a
@@ -53,6 +54,13 @@ export function startNotificationScheduler() {
         if (result.failed.length > 0) logger.error({ failed: result.failed, kind }, "digest_sweep_failures");
         return result;
       }
+      // §22 expiry, folded into this sweep rather than given a scheduler of
+      // its own. Marking a request EXPIRED is bookkeeping — decideApproval
+      // checks the deadline itself, so a request that lapsed six hours ago
+      // cannot be approved regardless of whether this has run.
+      const expiry = await runApprovalExpirySweep();
+      if (expiry.expired > 0) logger.info(expiry, "approval_expiry_sweep_completed");
+
       const result = await runNotificationSweep();
       logger.info(result, "notification_sweep_completed");
       return result;

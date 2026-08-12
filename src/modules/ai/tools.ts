@@ -18,6 +18,7 @@ import { getSalesSummary } from "../calc/sales.js";
 import { getRtoRateSummary } from "../calc/shipments.js";
 import { getBankMovement, getPendingSettlements, getRefundAnalysis, getSettlementSummary } from "../calc/moneyMovement.js";
 import { buildEvidence } from "../../routes/evidence.js";
+import { createApprovalRequest } from "../approvals/approvals.js";
 import { maskPii } from "./pii.js";
 
 // §18 tool registry (P4.1).
@@ -470,6 +471,114 @@ export const TOOLS: ToolDefinition[] = [
       // this is exactly the payload §27's masking exists for. envelope() runs
       // it; nothing here bypasses that.
       return envelope(built, { evidenceRef: `/evidence/${a.metric}` });
+    }
+  ),
+
+  tool(
+    "draft_vendor_message",
+    "Draft a message to a supplier or partner about an outstanding amount or a discrepancy. Returns TEXT ONLY — nothing is sent, and the draft must be approved by a person before it can be used.",
+    {
+      type: "object",
+      properties: {
+        vendorName: { type: "string", description: "Who the message is addressed to." },
+        subject: { type: "string", description: "One-line subject." },
+        body: { type: "string", description: "The message body you have drafted, in full." },
+        amountPaise: { type: "string", description: "The amount in dispute, in paise, if the message concerns one. Must come from a tool result." },
+      },
+      required: ["vendorName", "subject", "body"],
+      additionalProperties: false,
+    },
+    z
+      .object({
+        vendorName: z.string().min(1).max(200),
+        subject: z.string().min(1).max(200),
+        body: z.string().min(1).max(4000),
+        amountPaise: z.string().regex(/^\d+$/).optional(),
+      })
+      .strict(),
+    async (ctx, args) => {
+      const a = args as { vendorName: string; subject: string; body: string; amountPaise?: string };
+      // Draft-only, and the tool cannot be made to send by any argument: there
+      // is no outbound channel in this system at all. §18 requires the draft
+      // to route through the approval engine, which is what request_approval
+      // does — this returns the text and says so.
+      return envelope(
+        {
+          draft: { to: a.vendorName, subject: a.subject, body: a.body, amountPaise: a.amountPaise ?? null },
+          sent: false,
+          note:
+            "This is a draft. Nothing has been sent. Use request_approval to route it to a person, who will send it themselves — CFOOS has no outbound channel to a counterparty.",
+        },
+        { evidenceRef: "/reconciliation" }
+      );
+    }
+  ),
+
+  tool(
+    "request_approval",
+    "Route an action to a person for sign-off (§22). Use for anything that moves money above the organisation's materiality threshold, or for any message that would leave the company. Creates a PENDING request; it does not perform the action.",
+    {
+      type: "object",
+      properties: {
+        actionType: {
+          type: "string",
+          enum: ["RECONCILIATION_WRITE_OFF", "COST_RESTAMP", "EXTERNAL_MESSAGE", "OTHER"],
+          description: "What kind of action is being requested.",
+        },
+        title: { type: "string", description: "One line a reviewer reads first." },
+        reason: { type: "string", description: "Why this should be done, in the founder's terms. Cite the figures you were given." },
+        amountPaise: { type: "string", description: "The money at stake in paise. Must appear in a tool result you received." },
+        entityType: { type: "string", enum: ["ORDER", "PRODUCT", "CONVERSATION"], description: "What the action is about." },
+        entityId: { type: "string", description: "The id of that thing." },
+      },
+      required: ["actionType", "title", "reason"],
+      additionalProperties: false,
+    },
+    z
+      .object({
+        actionType: z.enum(["RECONCILIATION_WRITE_OFF", "COST_RESTAMP", "EXTERNAL_MESSAGE", "OTHER"]),
+        title: z.string().min(3).max(200),
+        reason: z.string().min(3).max(1000),
+        amountPaise: z.string().regex(/^\d+$/).optional(),
+        entityType: z.enum(["ORDER", "PRODUCT", "CONVERSATION"]).optional(),
+        entityId: z.string().max(64).optional(),
+      })
+      .strict(),
+    async (ctx, args) => {
+      const a = args as {
+        actionType: "RECONCILIATION_WRITE_OFF" | "COST_RESTAMP" | "EXTERNAL_MESSAGE" | "OTHER";
+        title: string;
+        reason: string;
+        amountPaise?: string;
+        entityType?: string;
+        entityId?: string;
+      };
+      const request = await createApprovalRequest({
+        organizationId: ctx.organizationId,
+        actionType: a.actionType,
+        title: a.title,
+        reason: a.reason,
+        amountPaise: a.amountPaise === undefined ? null : BigInt(a.amountPaise),
+        entityType: a.entityType,
+        entityId: a.entityId,
+        // preparedByType AI is the whole point of the field: a reviewer is
+        // entitled to know a model assembled this before they sign it.
+        preparedBy: "ai",
+        preparedByType: "AI",
+        requestedBy: ctx.userId,
+        evidence: { draftedByModel: true, question: a.title },
+      });
+      return envelope(
+        {
+          approvalRequestId: request.id,
+          status: request.status,
+          riskLevel: request.riskLevel,
+          requiredRole: request.requiredRole,
+          expiresAt: request.expiresAt.toISOString(),
+          note: "Nothing has happened yet. A person with the required role must approve this before the action is taken.",
+        },
+        { evidenceRef: "/exceptions" }
+      );
     }
   ),
 

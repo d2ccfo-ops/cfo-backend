@@ -4,6 +4,7 @@ import { buildCodDataStatus, buildSettlementDataStatus } from "../modules/calc/d
 import { prisma } from "../lib/prisma.js";
 import { describeRange, withDateRange, type ResolvedRange } from "../lib/dateRange.js";
 import { requireAuth } from "../middleware/auth.js";
+import { createApprovalRequest, getMaterialityThreshold, needsApproval } from "../modules/approvals/approvals.js";
 import {
   AMOUNT_TOLERANCE_PAISE,
   getCodExposure,
@@ -610,10 +611,66 @@ reconciliationRouter.post("/items/:orderId/write-off", ...requireAuth, async (re
 
   const order = await prisma.order.findFirst({
     where: { id: orderId, organizationId },
-    select: { id: true, grossAmount: true },
+    select: { id: true, grossAmount: true, externalOrderId: true, placedAt: true, channel: true },
   });
   if (!order) {
     res.status(404).json({ error: "order_not_found" });
+    return;
+  }
+
+  // §22 (P5.2). Above the org's materiality threshold this stops being
+  // housekeeping and becomes a decision, so it goes to a second person
+  // instead of happening. Below it, nothing changes — requiring sign-off on
+  // every ₹200 write-off is how approvals become a reflex click, and an
+  // approval nobody reads launders a mistake into a decision two people made.
+  const threshold = await getMaterialityThreshold(organizationId);
+  const verdict = needsApproval("RECONCILIATION_WRITE_OFF", order.grossAmount, threshold);
+  if (verdict.required) {
+    const existingRequest = await prisma.approvalRequest.findFirst({
+      where: { organizationId, entityType: "ORDER", entityId: orderId, status: "PENDING" },
+      select: { id: true },
+    });
+    if (existingRequest) {
+      res.status(409).json({
+        error: "approval_pending",
+        message: "A write-off for this order is already waiting for approval.",
+        approvalRequestId: existingRequest.id,
+      });
+      return;
+    }
+
+    const request = await createApprovalRequest({
+      organizationId,
+      actionType: "RECONCILIATION_WRITE_OFF",
+      title: `Write off order ${order.externalOrderId ?? orderId}`,
+      reason: note ?? "No justification was given.",
+      amountPaise: order.grossAmount,
+      entityType: "ORDER",
+      entityId: orderId,
+      // Captured NOW, so the reviewer signs off on the figures that were
+      // shown rather than on whatever the data says when they get to it.
+      evidence: {
+        orderId,
+        externalOrderId: order.externalOrderId,
+        channel: order.channel,
+        placedAt: order.placedAt?.toISOString() ?? null,
+        grossAmountPaise: order.grossAmount.toString(),
+        thresholdPaise: threshold.toString(),
+        rule: verdict.reason,
+      },
+      payload: { note },
+      preparedBy: req.auth!.userId,
+      requestedBy: req.auth!.userId,
+    });
+
+    // 202, not 200: the request was accepted and nothing has been written off.
+    res.status(202).json({
+      status: "approval_required",
+      approvalRequestId: request.id,
+      requiredRole: request.requiredRole,
+      riskLevel: request.riskLevel,
+      message: verdict.reason,
+    });
     return;
   }
 

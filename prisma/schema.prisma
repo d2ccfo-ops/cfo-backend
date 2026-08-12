@@ -1358,6 +1358,100 @@ model AgentRun {
 // "no snapshot history yet", "the narrative was discarded because it contained
 // a figure the snapshot did not produce". Those are answers, and recording
 // them stops the sweep retrying a question that already resolved.
+// §22 approval engine (P5.2).
+//
+// The model exists because of a distinction the rest of this system already
+// makes everywhere else: a DERIVATION can be recomputed and a DECISION cannot.
+// Writing off ₹4 lakh, restamping a cost on a period already reported, or
+// sending a message to a vendor are decisions. They are irreversible in the
+// way that matters — the ledger, the reported number and the counterparty's
+// inbox have all moved on — and the system's only defence against a mistake
+// is that a second person looked first.
+//
+// Everything needed to make that judgement is stored ON the request. A
+// reviewer who has to go and reconstruct what they are approving will approve
+// it, because the alternative is spending twenty minutes on a checkbox.
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  // Nobody acted before the deadline. Distinct from REJECTED: a request that
+  // times out was not judged, and treating silence as a "no" hides the fact
+  // that the process failed rather than the request.
+  EXPIRED
+  // Withdrawn by whoever raised it, before anyone acted.
+  CANCELLED
+}
+
+enum ApprovalRiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum ApprovalActionType {
+  // Writing off an unmatched order above the materiality threshold.
+  RECONCILIATION_WRITE_OFF
+  // Restamping product costs over a period that has already been reported.
+  COST_RESTAMP
+  // An AI-drafted message to someone outside the company. Draft-only by
+  // construction — §18's tool returns text and nothing sends it.
+  EXTERNAL_MESSAGE
+  // Anything a later consumer adds. Present so a new action type is a code
+  // change rather than a migration.
+  OTHER
+}
+
+model ApprovalRequest {
+  id             String             @id @default(cuid())
+  organizationId String
+  actionType     ApprovalActionType
+  status         ApprovalStatus     @default(PENDING)
+  riskLevel      ApprovalRiskLevel
+
+  // What is being asked for, in one line a reviewer reads first.
+  title       String
+  // Why. Written by whoever raised it, not generated.
+  reason      String
+  // The money at stake, paise. Null when the action moves no money (a message).
+  amount      BigInt?
+  // What the reviewer needs to see, captured AT REQUEST TIME rather than
+  // looked up at review time. A figure that changed between the request and
+  // the review would be approved on the strength of a number nobody saw.
+  evidence    Json?
+  // The thing being acted on: an order id, a product id, a conversation id.
+  entityType  String?
+  entityId    String?
+  // The payload the action needs if approved — the draft message text, the
+  // write-off note. Stored so approval EXECUTES the request rather than
+  // authorising a second, unverified attempt at it.
+  payload     Json?
+
+  // Who assembled it. Distinct from requestedBy because §22 allows the AI to
+  // prepare a request a person then submits — "the model wrote this" is a fact
+  // a reviewer is entitled to.
+  preparedBy       String
+  preparedByType   ActorType      @default(USER)
+  requestedBy      String
+  // The minimum role that may act on this. Stored rather than derived, so a
+  // later change to the policy cannot silently lower the bar on requests that
+  // are already open.
+  requiredRole     MembershipRole
+  // Nobody approves their own request. Enforced in code; recorded here so the
+  // trail shows who could have.
+  decidedBy        String?
+  decidedAt        DateTime?
+  decisionNote     String?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId, status, createdAt])
+  @@index([organizationId, entityType, entityId])
+  @@map("approval_requests")
+}
+
 model AiDailyBrief {
   id             String   @id @default(cuid())
   organizationId String
