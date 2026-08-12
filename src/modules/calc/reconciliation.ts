@@ -489,6 +489,189 @@ async function runPaymentSettlementLeg(
   );
 }
 
+// §15 leg 6 — Refund ↔ the settlement line that carries the money back out.
+//
+// This leg could not exist before P2.3a-pre. Refunds were a cumulative
+// per-order total with no date and no id, and matching needs discrete records
+// on both sides; the Refund table is that record.
+//
+// Two passes, in confidence order, and the order matters. An id match is
+// something the gateway TOLD us, so it is HIGH and taken first. An
+// amount-and-date match is something this engine INFERRED, so it is MEDIUM,
+// and it only ever runs against what the first pass left over — otherwise a
+// coincidental ₹1,240 could claim a line whose id names a different refund
+// entirely.
+//
+// Both directions are findings, which is the whole point of the leg:
+//   - our refund with no settlement line  → the store believes it returned
+//     money the gateway has no record of returning
+//   - a settlement refund line with no refund of ours → money left against an
+//     order this system never saw refunded: a chargeback, or a refund issued
+//     straight from the gateway dashboard. Invisible everywhere else in the
+//     product.
+const REFUND_MATCH_WINDOW_DAYS = 10;
+
+async function runRefundPaymentLeg(organizationId: string, pending: PendingMatch[]): Promise<LegOutcome> {
+  const [refunds, lines] = await Promise.all([
+    prisma.refund.findMany({
+      where: { organizationId },
+      select: { id: true, amount: true, processedAt: true, gatewayRef: true },
+      orderBy: { processedAt: "asc" },
+    }),
+    // Refunds arrive as ADJUSTMENT lines: a settlement's PAYMENT lines are
+    // captures, and money going back out is not one. Negative-net lines are
+    // the refunds and fee deductions inside a payout — see the Razorpay recon
+    // mapping in connectors/razorpay, where netAmount = credit − debit.
+    prisma.settlementLine.findMany({
+      where: { organizationId, type: "ADJUSTMENT" },
+      select: { id: true, settlementId: true, externalReference: true, grossAmount: true, netAmount: true },
+    }),
+  ]);
+
+  const totalRefundValue = refunds.reduce((a, r) => a + r.amount, 0n);
+  const base: LegOutcome = {
+    matchType: MatchType.REFUND_PAYMENT,
+    state: "ran",
+    eligible: refunds.length,
+    matched: 0,
+    needsReview: 0,
+    unmatched: refunds.length,
+    matchedValue: 0n,
+    unmatchedValue: totalRefundValue,
+  };
+
+  if (refunds.length === 0) {
+    return {
+      ...base,
+      state: "unavailable",
+      blockedReason:
+        "No refunds recorded yet. Refunds arrive with Shopify orders — if the store has issued some, run scripts/backfillRefunds.ts to read them out of stored payloads.",
+    };
+  }
+  if (lines.length === 0) {
+    const settlements = await prisma.settlement.count({ where: { organizationId, kind: "GATEWAY" } });
+    return {
+      ...base,
+      state: "unavailable",
+      blockedReason:
+        settlements === 0
+          ? "Refunds exist, but no gateway settlement records do — the settlement statement that would show the money leaving is the missing source."
+          : "Settlements exist but carry no adjustment lines, so the refunds inside each payout are not itemised. Import the gateway's settlement recon report.",
+    };
+  }
+
+  // Only outgoing lines. A positive adjustment is money coming IN (a reversal,
+  // a recovery) and can never be the counterpart of a refund; including them
+  // would let an inbound ₹1,240 satisfy an outbound ₹1,240.
+  const outgoing = lines.filter((l) => l.netAmount < 0n || l.grossAmount < 0n);
+  const absOf = (l: (typeof outgoing)[number]) => {
+    const v = l.netAmount !== 0n ? l.netAmount : l.grossAmount;
+    return v < 0n ? -v : v;
+  };
+
+  const claimed = new Set<string>();
+
+  // --- Pass 1: the gateway named it.
+  const byReference = new Map<string, typeof outgoing>();
+  for (const l of outgoing) {
+    const list = byReference.get(l.externalReference) ?? [];
+    list.push(l);
+    byReference.set(l.externalReference, list);
+  }
+  const matchedRefundIds = new Set<string>();
+  for (const refund of refunds) {
+    if (!refund.gatewayRef) continue;
+    const candidates = (byReference.get(refund.gatewayRef) ?? []).filter((l) => !claimed.has(l.id));
+    const line = candidates[0];
+    if (!line) continue;
+    claimed.add(line.id);
+    matchedRefundIds.add(refund.id);
+    const stated = absOf(line);
+    pending.push({
+      matchType: MatchType.REFUND_PAYMENT,
+      confidence: MatchConfidence.HIGH,
+      sourceType: "REFUND",
+      sourceId: refund.id,
+      targetType: "SETTLEMENT_LINE",
+      targetId: line.id,
+      amountDeltaAbs: refund.amount > stated ? refund.amount - stated : stated - refund.amount,
+    });
+  }
+
+  // --- Pass 2: exact amount inside a date window, over what pass 1 left.
+  //
+  // Exact amount only. A refund is a specific figure the gateway passes
+  // through unchanged — unlike a payout, nothing is netted off it — so a
+  // tolerance here would not absorb rounding, it would let two different
+  // refunds of similar size claim each other's lines.
+  const windowMs = REFUND_MATCH_WINDOW_DAYS * 86_400_000;
+  const remaining = outgoing.filter((l) => !claimed.has(l.id));
+  const byAmount = new Map<string, typeof remaining>();
+  for (const l of remaining) {
+    const key = absOf(l).toString();
+    const list = byAmount.get(key) ?? [];
+    list.push(l);
+    byAmount.set(key, list);
+  }
+  // Settled-at is needed for the window; fetched once for the lines that could
+  // still match rather than joined into the query above, which would pull a
+  // settlement row per line for the majority that pass 1 already resolved.
+  const settlementIds = [...new Set(remaining.map((l) => l.settlementId))];
+  const settledAt = new Map(
+    (
+      await prisma.settlement.findMany({
+        where: { id: { in: settlementIds } },
+        select: { id: true, settledAt: true, createdAt: true },
+      })
+    ).map((s) => [s.id, s.settledAt ?? s.createdAt])
+  );
+
+  for (const refund of refunds) {
+    if (matchedRefundIds.has(refund.id)) continue;
+    const candidates = (byAmount.get(refund.amount.toString()) ?? []).filter((l) => !claimed.has(l.id));
+    // Nearest in time wins when several are eligible. Two identical refunds a
+    // month apart should each take the payout beside them, not whichever the
+    // query happened to return first.
+    let best: (typeof remaining)[number] | undefined;
+    let bestGap = Number.POSITIVE_INFINITY;
+    for (const l of candidates) {
+      const when = settledAt.get(l.settlementId);
+      if (!when) continue;
+      const gap = Math.abs(when.getTime() - refund.processedAt.getTime());
+      if (gap <= windowMs && gap < bestGap) {
+        best = l;
+        bestGap = gap;
+      }
+    }
+    if (!best) continue;
+    claimed.add(best.id);
+    matchedRefundIds.add(refund.id);
+    pending.push({
+      matchType: MatchType.REFUND_PAYMENT,
+      confidence: MatchConfidence.MEDIUM,
+      sourceType: "REFUND",
+      sourceId: refund.id,
+      targetType: "SETTLEMENT_LINE",
+      targetId: best.id,
+      // Zero by construction — the pass matches on exact equality. Stated
+      // explicitly rather than left implicit so a future tolerance change
+      // cannot silently start reporting these as clean.
+      amountDeltaAbs: 0n,
+    });
+  }
+
+  const existing = await prisma.reconciliationMatch.findMany({
+    where: { organizationId, matchType: MatchType.REFUND_PAYMENT },
+    select: { sourceId: true, amountDeltaAbs: true, status: true },
+  });
+  return summariseLeg(
+    base,
+    refunds.map((r) => ({ id: r.id, grossAmount: r.amount })),
+    pending,
+    existing
+  );
+}
+
 // COD → BANK is a batch relationship, not a pairing: a courier remits many
 // delivered shipments in one transfer. Resolving it needs the courier's COD
 // remittance statement (Shiprocket and Delhivery both expose one; neither
@@ -736,6 +919,11 @@ export async function runReconciliation(organizationId: string): Promise<Reconci
   const paymentSettlement = await runPaymentSettlementLeg(organizationId, pending);
   const codRemittance = await runCodRemittanceLeg(organizationId, pending);
   const shipmentFreight = await runShipmentFreightLeg(organizationId, pending);
+  // Runs after the settlement legs: it reads SettlementLine rows, and running
+  // it before them would work but would read a table nothing in this pass had
+  // touched yet — the ordering states the dependency rather than leaving it to
+  // be rediscovered.
+  const refundPayment = await runRefundPaymentLeg(organizationId, pending);
 
   let created = 0;
   if (pending.length > 0) {
@@ -753,7 +941,7 @@ export async function runReconciliation(organizationId: string): Promise<Reconci
     version: RECONCILIATION_VERSION,
     ranAt: new Date(),
     durationMs: Date.now() - startedAt,
-    legs: [orderPayment, paymentSettlement, settlementBank, codRemittance, shipmentFreight],
+    legs: [orderPayment, paymentSettlement, settlementBank, codRemittance, refundPayment, shipmentFreight],
     created,
   };
 }
@@ -833,7 +1021,7 @@ export async function readReconciliationLegs(organizationId: string): Promise<Le
   });
   const carrierSlugs = invoiceCarriers.map((c) => c.carrier);
 
-  const [orderPayment, paymentSettlement, settlementBank, codRemittance, shipmentFreight] = await Promise.all([
+  const [orderPayment, paymentSettlement, settlementBank, codRemittance, refundPayment, shipmentFreight] = await Promise.all([
     aggregateLeg(
       organizationId,
       MatchType.ORDER_PAYMENT,
@@ -864,6 +1052,13 @@ export async function readReconciliationLegs(organizationId: string): Promise<Le
                  WHERE "organizationId" = ${organizationId}
                    AND status = 'DELIVERED' AND "codAmount" > 0`
     ),
+    aggregateLeg(
+      organizationId,
+      MatchType.REFUND_PAYMENT,
+      "REFUND",
+      Prisma.sql`SELECT id, amount AS value FROM refunds
+                 WHERE "organizationId" = ${organizationId}`
+    ),
     // Scoped to carriers we hold an invoice for — see runShipmentFreightLeg.
     // With no invoices at all the query is skipped entirely rather than run
     // against an empty IN list, which Postgres rejects.
@@ -885,6 +1080,7 @@ export async function readReconciliationLegs(organizationId: string): Promise<Le
     toLeg(MatchType.PAYMENT_SETTLEMENT, paymentSettlement),
     toLeg(MatchType.SETTLEMENT_BANK, settlementBank),
     toLeg(MatchType.COD_REMITTANCE, codRemittance),
+    toLeg(MatchType.REFUND_PAYMENT, refundPayment),
     toLeg(MatchType.SHIPMENT_FREIGHT, shipmentFreight),
   ];
   // The freight leg's unmatched value is not "eligible minus matched": an
