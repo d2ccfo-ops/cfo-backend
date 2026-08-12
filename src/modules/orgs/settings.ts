@@ -108,6 +108,31 @@ export const orgSettingsSchema = z
       // rejection, not a silent de-duplication.
       .refine((v) => new Set(v.map((e) => e.id)).size === v.length, "recurringOutflows ids must be unique")
       .nullable(),
+
+    // P6.5 (§23). The packaging layer of contribution margin.
+    //
+    // WHY THIS IS CONFIGURATION AND NOT INGESTED DATA. Nothing a D2C brand
+    // connects reports packaging cost per order. It is a mailer, a filler and a
+    // label whose cost the founder knows and no system does — Shopify does not
+    // carry it, no courier states it, and it does not appear on any settlement.
+    // A rate typed once is the only honest source available, which is why the
+    // layer stayed at zero until there was somewhere to type it.
+    //
+    // Two components because both exist: a mailer is charged per PARCEL, tissue
+    // and inserts per ITEM. A single blended per-order number would misprice
+    // every multi-item order, and multi-item orders are where the margin is.
+    //
+    // Null means not configured — which keeps the layer `covered: false` and
+    // CM1 unreliable. That is the correct state, and it is different from a
+    // configured zero, which is a founder stating packaging genuinely costs
+    // nothing. The two must not collapse into each other.
+    packagingCost: z
+      .object({
+        perOrderPaise: z.string().regex(/^\d+$/, "must be a non-negative integer string"),
+        perItemPaise: z.string().regex(/^\d+$/, "must be a non-negative integer string"),
+      })
+      .strict()
+      .nullable(),
   })
   .partial()
   .strict();

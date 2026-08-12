@@ -565,6 +565,33 @@ async function seedMarketplaceFees(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
+// 4. PACKAGING RATE (§23)
+// ---------------------------------------------------------------------------
+// The only cost layer with no ingested source at all — no connected system
+// reports what a mailer costs. A founder types it once. Set here so the demo
+// exercises a configured layer rather than permanently showing the
+// not-configured state, which is already visible on the real org.
+//
+// ₹14 per parcel (poly mailer, label, tape) and ₹4 per item (tissue, insert)
+// are ordinary Indian D2C numbers.
+async function seedPackagingRate(target: Target) {
+  const org = await prisma.organization.findUnique({
+    where: { id: target.organizationId },
+    select: { settings: true },
+  });
+  const settings = (org?.settings as Record<string, unknown> | null) ?? {};
+  if (settings.packagingCost) {
+    console.log("  packaging rate already configured — leaving it alone");
+    return;
+  }
+  await prisma.organization.update({
+    where: { id: target.organizationId },
+    data: { settings: { ...settings, packagingCost: { perOrderPaise: "1400", perItemPaise: "400" } } },
+  });
+  console.log("  → ₹14.00/order + ₹4.00/item");
+}
+
+// ---------------------------------------------------------------------------
 async function main() {
   if (!ORG_QUERY) {
     console.error('Usage: npx tsx scripts/seedDemoGaps.ts --org "DEMO — technox pvt ltd" [--purge]');
@@ -591,6 +618,9 @@ async function main() {
 
   console.log("\n[3] marketplace fees");
   await seedMarketplaceFees(target);
+
+  console.log("\n[4] packaging rate");
+  await seedPackagingRate(target);
 
   console.log("\ndone.\n");
   await prisma.$disconnect();

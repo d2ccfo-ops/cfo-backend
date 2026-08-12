@@ -1,6 +1,8 @@
 import { resolveDateRange, type ResolvedRange, describeRange } from "../../lib/dateRange.js";
 import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import { prisma } from "../../lib/prisma.js";
+import { getOrgSettings } from "../orgs/settings.js";
+import { computePackaging, getFreightSplit, getRtoCost, getTransactionFees } from "./fulfilmentCosts.js";
 import { paiseToRupees, sumPaise } from "./money.js";
 import { getRevenueLadder } from "./revenueLadder.js";
 
@@ -44,6 +46,14 @@ interface Layer {
   // fix a data-entry problem that was actually a missing feature.
   hasSource: boolean;
   note: string;
+  // P6.5. A measured cost that is REPORTED but not subtracted, because the
+  // rupees in it are already inside another layer. RTO cost is the only one:
+  // the freight on a returned parcel sits in forward and reverse shipping
+  // already, so deducting it again as "RTO cost" would charge it twice while
+  // keeping §36's formula looking symmetrical. Memo layers are excluded from
+  // the CM arithmetic AND from the reliability chain — an unmeasurable memo
+  // must not mark CM1 unreliable when every real deduction above it is covered.
+  memo?: boolean;
 }
 
 export async function getContributionMargin(
@@ -53,7 +63,7 @@ export async function getContributionMargin(
   // caller passed before this existed and remains the default.
   scope: EntityScope | null = null
 ) {
-  const [ladder, lineItems, shipments, adSpend, payments] = await Promise.all([
+  const [ladder, lineItems, shipments, adSpend, payments, settings, freight, fees, orderCount] = await Promise.all([
     getRevenueLadder(organizationId, range, scope),
     prisma.orderLineItem.findMany({
       where: {
@@ -79,6 +89,12 @@ export async function getContributionMargin(
       where: { organizationId, capturedAt: { gte: range.from, lte: range.to } },
       select: { feeAmount: true },
     }),
+    getOrgSettings(organizationId),
+    getFreightSplit(organizationId, range),
+    getTransactionFees(organizationId, range),
+    prisma.order.count({
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.from, lte: range.to }, cancelledAt: null },
+    }),
   ]);
 
   const netRevenue = BigInt(ladder.ladder.netRevenue.valueMinor);
@@ -95,24 +111,34 @@ export async function getContributionMargin(
   const cogsValueCoveragePct =
     totalLineValue === 0n ? 0 : Math.round((Number(costedValue) / Number(totalLineValue)) * 1000) / 10;
 
-  // --- Forward shipping (§24). Shipment.freightAmount, where a connector
-  // supplied one. Reverse shipping (§25) and RTO cost (§17) have no source at
-  // all — deliberately NOT approximated from forward freight, which would
-  // invent a number.
-  const freightRows = shipments.filter((s) => s.freightAmount !== null);
-  const forwardShipping = sumPaise(freightRows.map((s) => s.freightAmount as bigint));
-  const shippingCovered = shipments.length > 0 && freightRows.length === shipments.length;
+  // --- Shipping (§24, §25). Forward is total billed freight MINUS return legs;
+  // reverse is the return legs themselves. Derived by subtraction rather than
+  // by re-summing forward invoice rows, because Shiprocket writes freightAmount
+  // from its API and produces no invoice lines at all — see fulfilmentCosts.ts.
+  const forwardShipping = freight.forwardMinor;
+  const reverseShipping = freight.reverseMinor;
+  const shippingCovered = freight.totalShipments > 0 && freight.billedShipments === freight.totalShipments;
 
-  // --- Gateway fees (§27). Payment.feeAmount where present.
-  const feeRows = payments.filter((p) => p.feeAmount !== null);
-  const gatewayFees = sumPaise(feeRows.map((p) => p.feeAmount as bigint));
-  const gatewayCovered = payments.length > 0 && feeRows.length === payments.length;
+  // --- Packaging (§23). The one layer whose source is a typed rate rather than
+  // an ingested record: nothing a brand connects reports what a mailer costs.
+  const packaging = computePackaging(settings, orderCount, lineItems.length);
+
+  // --- Transaction fees (§27–§30). Gateway and marketplace are the same column
+  // on the same table, split by the provider that produced the payment; COD
+  // collection charges come from the remittance statement's fee column.
+  const gatewayFees = fees.gatewayMinor;
+  const gatewayCovered = fees.gatewayPayments > 0 && fees.gatewayWithFee === fees.gatewayPayments;
+  const marketplaceCovered = fees.marketplacePayments > 0 && fees.marketplaceWithFee === fees.marketplacePayments;
 
   // --- Advertising (§31). INR only: mixing a USD-billed ad account into a
   // rupee margin would be off by ~85x, the same trap modules/calc/ads.ts guards.
   const inrAds = adSpend.filter((a) => a.currency === "INR");
   const advertising = sumPaise(inrAds.map((a) => a.spendAmount));
   const adsCovered = adSpend.length > 0 && inrAds.length === adSpend.length;
+
+  // --- What returns cost (§17). Reported, never deducted — the freight in it
+  // is already inside forward and reverse shipping above.
+  const rto = await getRtoCost(organizationId, range, packaging);
 
   const layers: Layer[] = [
     {
@@ -131,11 +157,13 @@ export async function getContributionMargin(
       key: "packaging",
       label: "Packaging",
       spec: "§23",
-      amountMinor: "0",
-      amount: 0,
-      covered: false,
-      hasSource: false,
-      note: "No source — needs a per-order/per-item packaging rule, which has no configuration table yet",
+      amountMinor: packaging.amountMinor.toString(),
+      amount: paiseToRupees(packaging.amountMinor),
+      covered: packaging.configured,
+      hasSource: packaging.configured,
+      note: packaging.configured
+        ? `₹${paiseToRupees(packaging.perOrderPaise)}/order + ₹${paiseToRupees(packaging.perItemPaise)}/item over ${packaging.orders} orders and ${packaging.items} items`
+        : "Not configured — set a per-order and per-item packaging rate in Settings. No connected system reports it.",
     },
     {
       key: "forwardShipping",
@@ -144,30 +172,43 @@ export async function getContributionMargin(
       amountMinor: forwardShipping.toString(),
       amount: paiseToRupees(forwardShipping),
       covered: shippingCovered,
-      hasSource: freightRows.length > 0,
-      note: shipments.length === 0
+      hasSource: freight.billedShipments > 0,
+      note: freight.totalShipments === 0
         ? "No shipments in this period"
-        : `${freightRows.length} of ${shipments.length} shipments carry a freight amount`,
+        : `${freight.billedShipments} of ${freight.totalShipments} shipments carry a freight amount` +
+          (freight.reverseMinor > 0n ? ", excluding return legs (counted below)" : ""),
     },
     {
       key: "reverseShipping",
       label: "Reverse shipping",
       spec: "§25",
-      amountMinor: "0",
-      amount: 0,
-      covered: false,
-      hasSource: false,
-      note: "No source — reverse freight is not reported by any connected courier",
+      amountMinor: reverseShipping.toString(),
+      amount: paiseToRupees(reverseShipping),
+      // Covered once a return-leg source exists. A period with no returns then
+      // reports a measured zero rather than an unmeasurable one — which is the
+      // distinction a founder needs to tell "no returns" from "we can't see
+      // returns".
+      covered: freight.hasReverseSource,
+      hasSource: freight.hasReverseSource,
+      note: freight.hasReverseSource
+        ? `${freight.returnedShipments} shipments billed a return leg`
+        : "No source — needs a courier freight invoice, which is the only document that states reverse freight",
     },
     {
       key: "rtoCost",
-      label: "RTO cost",
+      label: "RTO cost (memo)",
       spec: "§17",
-      amountMinor: "0",
-      amount: 0,
-      covered: false,
-      hasSource: false,
-      note: "No source — needs forward+reverse freight, packaging and write-off per RTO shipment",
+      amountMinor: rto.totalMinor.toString(),
+      amount: paiseToRupees(rto.totalMinor),
+      covered: rto.measurable,
+      hasSource: rto.measurable,
+      // The memo flag is what keeps this out of the arithmetic. See Layer.memo.
+      memo: true,
+      note: rto.measurable
+        ? `${rto.rtoShipments} of ${rto.totalShipments} shipments returned (${rto.ratePct}%). Already counted in shipping and packaging above — shown here to answer "what do returns cost", not deducted again.`
+        : rto.rtoShipments === 0
+          ? "No RTO shipments in this period"
+          : `${rto.rtoShipments} RTO shipments, none carrying freight — the count is real, the cost is not measurable`,
     },
     {
       key: "gatewayFees",
@@ -176,28 +217,39 @@ export async function getContributionMargin(
       amountMinor: gatewayFees.toString(),
       amount: paiseToRupees(gatewayFees),
       covered: gatewayCovered,
-      hasSource: feeRows.length > 0,
-      note: payments.length === 0 ? "No payment records in this period" : `${feeRows.length} of ${payments.length} payments carry a fee`,
+      hasSource: fees.gatewayWithFee > 0,
+      note: fees.gatewayPayments === 0
+        ? "No gateway payments in this period"
+        : `${fees.gatewayWithFee} of ${fees.gatewayPayments} gateway payments carry a fee`,
     },
     {
       key: "codFees",
       label: "COD fees",
       spec: "§29",
-      amountMinor: "0",
-      amount: 0,
-      covered: false,
-      hasSource: false,
-      note: "No source — COD collection charges are not reported by any connected courier",
+      amountMinor: fees.codMinor.toString(),
+      amount: paiseToRupees(fees.codMinor),
+      // Covered only when THIS PERIOD's COD charges are known — either a
+      // remittance statement covers it, or there was no COD to charge for.
+      // A period with COD sales and no statement is a gap, not a zero.
+      covered: fees.codCovered,
+      hasSource: fees.hasCodSource,
+      note: fees.codLines > 0
+        ? `${fees.codLines} COD remittance lines in this period`
+        : fees.codOrders === 0
+          ? "No COD orders in this period"
+          : `${fees.codOrders} COD orders in this period and no remittance statement covering them — the collection charge on that cash is unknown, not zero`,
     },
     {
       key: "marketplaceFees",
       label: "Marketplace fees",
       spec: "§30",
-      amountMinor: "0",
-      amount: 0,
-      covered: false,
-      hasSource: false,
-      note: "No source — needs Amazon/Flipkart settlement ingestion",
+      amountMinor: fees.marketplaceMinor.toString(),
+      amount: paiseToRupees(fees.marketplaceMinor),
+      covered: marketplaceCovered,
+      hasSource: fees.marketplaceWithFee > 0,
+      note: fees.marketplacePayments === 0
+        ? "No marketplace settlements in this period"
+        : `${fees.marketplaceWithFee} of ${fees.marketplacePayments} marketplace settlements carry a fee (referral + closing + GST)`,
     },
     {
       key: "advertising",
@@ -216,14 +268,21 @@ export async function getContributionMargin(
   const cov = (key: string) => byKey.get(key)!.covered;
 
   const cm0 = netRevenue - amt("cogs");
-  const cm1 = cm0 - amt("packaging") - amt("forwardShipping") - amt("reverseShipping") - amt("rtoCost");
+  // rtoCost is deliberately absent: it is a memo whose rupees are already in
+  // packaging, forward shipping and reverse shipping. §36 lists it as a fourth
+  // CM1 deduction, which would charge the same freight twice — see
+  // fulfilmentCosts.ts for why the formula is wrong and this is not.
+  const cm1 = cm0 - amt("packaging") - amt("forwardShipping") - amt("reverseShipping");
   const cm2 = cm1 - amt("gatewayFees") - amt("codFees") - amt("marketplaceFees");
   const cm3 = cm2 - amt("advertising");
 
   // A CM is only as trustworthy as the least-covered layer above it. This is
-  // cumulative on purpose: CM3 can't be reliable if CM1 wasn't.
+  // cumulative on purpose: CM3 can't be reliable if CM1 wasn't. rtoCost is
+  // excluded for the same reason it is not deducted — an unmeasurable memo must
+  // not mark CM1 unreliable when every rupee it would have contained is already
+  // measured in the layers above it.
   const cm0Reliable = cov("cogs");
-  const cm1Reliable = cm0Reliable && cov("packaging") && cov("forwardShipping") && cov("reverseShipping") && cov("rtoCost");
+  const cm1Reliable = cm0Reliable && cov("packaging") && cov("forwardShipping") && cov("reverseShipping");
   const cm2Reliable = cm1Reliable && cov("gatewayFees") && cov("codFees") && cov("marketplaceFees");
   const cm3Reliable = cm2Reliable && cov("advertising");
 
@@ -240,7 +299,11 @@ export async function getContributionMargin(
     reliable,
   });
 
-  const missingLayers = layers.filter((l) => !l.hasSource).map((l) => `${l.label} (${l.spec})`);
+  // Memo layers are excluded: "RTO cost has no source" would be reported as a
+  // cost treated as zero, when in fact nothing is missing from the margin — its
+  // rupees are counted above. Naming it here sends a founder to fix a gap that
+  // is not there.
+  const missingLayers = layers.filter((l) => !l.hasSource && !l.memo).map((l) => `${l.label} (${l.spec})`);
   const warnings: string[] = [];
   if (!cogsCovered) {
     warnings.push(
@@ -260,7 +323,10 @@ export async function getContributionMargin(
   // only when their layer is covered.
   const dataCompleteness =
     25 + // revenue — always available
-    10 + // refunds/RTO — refund side is real; RTO cost is not, so half credit
+    // Refunds/RTO. The refund side has always been real; the RTO side became
+    // measurable once courier invoices supplied return-leg freight (P6.5), so
+    // this scores in full only when that source exists.
+    (rto.measurable ? 10 : 5) +
     (cogsCovered ? 20 : Math.round(20 * (cogsValueCoveragePct / 100))) +
     (shippingCovered ? 15 : 0) +
     (gatewayCovered ? 10 : 0) +
