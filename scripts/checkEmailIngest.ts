@@ -364,7 +364,48 @@ async function main() {
       (await prisma.bankTransaction.count({ where: { connectionId: bankConn1.id } })) === 1
     );
 
-    console.log("\n[16] a rotated-away address goes dead");
+    console.log("\n[16] a real .xlsx bank statement is converted to CSV and imported the same way");
+    // A hand-built minimal .xlsx (no external tool involved — generated once
+    // via Python's stdlib zipfile against the exact OOXML parts read-excel-file
+    // needs, then base64-embedded here): header row
+    // date,description,amount,type,account plus 3 data rows naming account
+    // "1111" — bankConn1's ("HDFC •••1111") last-4, so it must route there even
+    // with bankConn2 also connected (same disambiguation as section [14], now
+    // proven through the xlsx conversion too, not just plain CSV).
+    const xlsxBase64 =
+      "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";
+    const xlsxMail = await processInboundEmail(address.token, email({
+      from: "statements@hdfcbank.net",
+      subject: "Statement (Excel)",
+      messageId: "bank-xlsx-1",
+      attachments: [{ name: "stmt.xlsx", content: Buffer.from(xlsxBase64, "base64"), contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }],
+    }));
+    ok("xlsx statement imports", xlsxMail?.outcomes[0]?.ok === true, JSON.stringify(xlsxMail?.outcomes[0]));
+    ok("all 3 data rows land as transactions", /3 transactions imported/.test(xlsxMail?.outcomes[0]?.detail ?? ""), xlsxMail?.outcomes[0]?.detail);
+    ok(
+      "routed to bankConn1 by the account column, not bankConn2",
+      (await prisma.bankTransaction.count({ where: { connectionId: bankConn1.id } })) === 4 &&
+        (await prisma.bankTransaction.count({ where: { connectionId: bankConn2.id } })) === 1
+    );
+    ok(
+      "the decimal amount row (42000.5) survived the xlsx round-trip",
+      (await prisma.bankTransaction.findFirst({ where: { connectionId: bankConn1.id, description: "Shopify payout" } }))?.amount === 4200050n
+    );
+
+    console.log("\n[17] a corrupt .xlsx is refused readably, not crashed on");
+    const corruptXlsxMail = await processInboundEmail(address.token, email({
+      from: "statements@hdfcbank.net",
+      subject: "Statement (broken)",
+      messageId: "bank-xlsx-corrupt",
+      attachments: [{ name: "broken.xlsx", content: Buffer.concat([Buffer.from("PK"), Buffer.alloc(64)]), contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }],
+    }));
+    ok(
+      "corrupt xlsx refused, not thrown",
+      corruptXlsxMail?.outcomes[0]?.ok === false && /Excel file could not be read/.test(corruptXlsxMail?.outcomes[0]?.detail ?? ""),
+      corruptXlsxMail?.outcomes[0]?.detail
+    );
+
+    console.log("\n[18] a rotated-away address goes dead");
     await prisma.emailIngestAddress.update({ where: { id: address.id }, data: { disabledAt: new Date() } });
     const afterRotate = await processInboundEmail(address.token, email({ from: "x@y.z", subject: "late", messageId: "late-1" }));
     ok("disabled token → null, same as unknown", afterRotate === null);

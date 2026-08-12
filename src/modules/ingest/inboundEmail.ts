@@ -11,6 +11,7 @@ import type { StatementFormat } from "../connectors/remittance/statement.js";
 import { serializeIngestResult } from "../connectors/remittance/statement.js";
 import { toConnectorContext } from "../connectors/types.js";
 import { getOrCreateDefaultLegalEntity } from "../orgs/legalEntity.js";
+import { convertXlsxToCsv } from "./xlsxToCsv.js";
 
 // Inbound email ingestion — the pipe that removes the merchant from document
 // collection.
@@ -49,6 +50,12 @@ import { getOrCreateDefaultLegalEntity } from "../orgs/legalEntity.js";
 // the size cap. It now runs in modules/ingest/pdfWorker.ts on its own thread
 // with a 20s wall-clock deadline (lib/workerTimeout.ts) — a breach kills the
 // thread and surfaces as unreadable_pdf, same as any other unparseable file.
+//
+// P1.1b, done: .xlsx attachments are converted to the same CSV text every
+// text-based parser below already expects (modules/ingest/xlsxToCsv.ts), on
+// its own worker thread with the identical 20s-deadline posture as the PDF
+// path — same untrusted-attachment threat model, same defence. Legacy binary
+// .xls is refused with a re-export instruction rather than guessed at.
 
 // ---------------------------------------------------------------------------
 // Payload normalisation
@@ -520,79 +527,27 @@ async function processAttachment(organizationId: string, att: NormalizedAttachme
     };
   }
 
-  // Excel is refused by name rather than silently failing text detection,
-  // because "export as CSV" is an instruction the merchant can act on.
+  // Excel is a zip of XML (magic bytes `PK`) wrapping the exact same
+  // statement data a CSV export would carry, so it is converted to CSV text
+  // upstream of dispatchCsv rather than given a second, cell-based copy of
+  // every format's parsing logic. The conversion itself runs on its own
+  // thread with a hard deadline (xlsxToCsv.ts) — same P1.2 posture, because
+  // this is the same untrusted-email-attachment surface.
   if (/\.xlsx?$/i.test(att.name) || att.content.subarray(0, 2).toString("latin1") === "PK") {
-    return {
-      name: att.name,
-      kind: "unrecognised",
-      ok: false,
-      detail: "Excel files are not supported — export the report as CSV and forward that",
-    };
+    const converted = await convertXlsxToCsv(att.content);
+    if (!converted.ok) {
+      return {
+        name: att.name,
+        kind: "unrecognised",
+        ok: false,
+        detail: `Excel file could not be read (${converted.detail}) — export the report as CSV and forward that`,
+      };
+    }
+    return dispatchCsv(organizationId, att.name, converted.csv);
   }
 
   if (looksLikeText(att.content)) {
-    const csv = att.content.toString("utf8");
-    const { detected, reason } = detectCsvFormat(csv);
-
-    if (!detected) {
-      // Tried only after both courier signatures miss — see
-      // looksLikeBankStatementCsv's comment on why the ordering matters.
-      if (looksLikeBankStatementCsv(csv)) {
-        const { connection, reason: resolveReason } = await resolveBankConnectionForEmail(organizationId, csv);
-        if (!connection) {
-          return { name: att.name, kind: "unrecognised", ok: false, detail: `Bank statement refused: ${resolveReason}` };
-        }
-        const ctx = toConnectorContext(connection);
-        const result = await ingestStatement(ctx, csv);
-        await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
-        // Unlike the courier payouts below, bank rows are independent — one
-        // malformed line doesn't invalidate the transactions around it, so
-        // "ok" tracks whether anything actually landed, not zero errors.
-        const ok = result.recordsFetched > 0;
-        return {
-          name: att.name,
-          kind: "statement-csv",
-          format: "Bank statement",
-          ok,
-          detail:
-            `Bank statement: ${result.recordsFetched} transaction${result.recordsFetched === 1 ? "" : "s"} imported` +
-            `${result.skipped > 0 ? `, ${result.skipped} row${result.skipped === 1 ? "" : "s"} skipped` : ""}` +
-            `${result.errors.length > 0 ? ` — ${result.errors[0]}` : ""}`,
-        };
-      }
-      return { name: att.name, kind: "unrecognised", ok: false, detail: `CSV not recognised: ${reason}` };
-    }
-
-    const connection = await getOrCreateIngestConnection(organizationId, detected.provider);
-    const ctx = toConnectorContext(connection);
-    const result =
-      detected.provider === "BLUEDART" ? await ingestCodRemittance(ctx, csv) : await ingestSettlementReport(ctx, csv);
-
-    // Mirrors what the manual upload route does after an import.
-    await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
-
-    const s = serializeIngestResult(result);
-    // ok requires COMPLETENESS, not "something got in". A 10-payout file where
-    // 9 were rejected as out-of-balance and 1 imported must NOT read as
-    // imported — that reports partial cash as reconciled and hides the nine the
-    // merchant needs to look at. Any rejection or error makes the attachment
-    // not-ok, which the email's status then renders as PARTIAL or FAILED.
-    const ok = result.rejected.length === 0 && result.errors.length === 0;
-    return {
-      name: att.name,
-      kind: "statement-csv",
-      format: detected.label,
-      ok,
-      detail:
-        `${detected.label}: ${result.batchesImported} payouts, ${result.linesImported} lines` +
-        `${result.linesUnresolved > 0 ? `, ${result.linesUnresolved} unresolved` : ""}` +
-        `${result.rejected.length > 0 ? `, ${result.rejected.length} batches refused (out of balance)` : ""}` +
-        `${result.errors.length > 0 ? ` — ${result.errors[0]}` : ""}` +
-        (typeof s.amountImportedPaise === "string" && s.amountImportedPaise !== "0"
-          ? ` — ₹${(Number(s.amountImportedPaise) / 100).toLocaleString("en-IN")}`
-          : ""),
-    };
+    return dispatchCsv(organizationId, att.name, att.content.toString("utf8"));
   }
 
   return {
@@ -600,6 +555,72 @@ async function processAttachment(organizationId: string, att: NormalizedAttachme
     kind: "unrecognised",
     ok: false,
     detail: "not a PDF or CSV — only courier invoices (PDF) and statement exports (CSV) are read",
+  };
+}
+
+// Shared by both the plain-text attachment path and the XLSX-converted-to-CSV
+// path above — one classification+import pipeline regardless of which
+// container the same statement data arrived in.
+async function dispatchCsv(organizationId: string, attName: string, csv: string): Promise<AttachmentOutcome> {
+  const { detected, reason } = detectCsvFormat(csv);
+
+  if (!detected) {
+    // Tried only after both courier signatures miss — see
+    // looksLikeBankStatementCsv's comment on why the ordering matters.
+    if (looksLikeBankStatementCsv(csv)) {
+      const { connection, reason: resolveReason } = await resolveBankConnectionForEmail(organizationId, csv);
+      if (!connection) {
+        return { name: attName, kind: "unrecognised", ok: false, detail: `Bank statement refused: ${resolveReason}` };
+      }
+      const ctx = toConnectorContext(connection);
+      const result = await ingestStatement(ctx, csv);
+      await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+      // Unlike the courier payouts below, bank rows are independent — one
+      // malformed line doesn't invalidate the transactions around it, so
+      // "ok" tracks whether anything actually landed, not zero errors.
+      const ok = result.recordsFetched > 0;
+      return {
+        name: attName,
+        kind: "statement-csv",
+        format: "Bank statement",
+        ok,
+        detail:
+          `Bank statement: ${result.recordsFetched} transaction${result.recordsFetched === 1 ? "" : "s"} imported` +
+          `${result.skipped > 0 ? `, ${result.skipped} row${result.skipped === 1 ? "" : "s"} skipped` : ""}` +
+          `${result.errors.length > 0 ? ` — ${result.errors[0]}` : ""}`,
+      };
+    }
+    return { name: attName, kind: "unrecognised", ok: false, detail: `CSV not recognised: ${reason}` };
+  }
+
+  const connection = await getOrCreateIngestConnection(organizationId, detected.provider);
+  const ctx = toConnectorContext(connection);
+  const result =
+    detected.provider === "BLUEDART" ? await ingestCodRemittance(ctx, csv) : await ingestSettlementReport(ctx, csv);
+
+  // Mirrors what the manual upload route does after an import.
+  await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+
+  const s = serializeIngestResult(result);
+  // ok requires COMPLETENESS, not "something got in". A 10-payout file where
+  // 9 were rejected as out-of-balance and 1 imported must NOT read as
+  // imported — that reports partial cash as reconciled and hides the nine the
+  // merchant needs to look at. Any rejection or error makes the attachment
+  // not-ok, which the email's status then renders as PARTIAL or FAILED.
+  const ok = result.rejected.length === 0 && result.errors.length === 0;
+  return {
+    name: attName,
+    kind: "statement-csv",
+    format: detected.label,
+    ok,
+    detail:
+      `${detected.label}: ${result.batchesImported} payouts, ${result.linesImported} lines` +
+      `${result.linesUnresolved > 0 ? `, ${result.linesUnresolved} unresolved` : ""}` +
+      `${result.rejected.length > 0 ? `, ${result.rejected.length} batches refused (out of balance)` : ""}` +
+      `${result.errors.length > 0 ? ` — ${result.errors[0]}` : ""}` +
+      (typeof s.amountImportedPaise === "string" && s.amountImportedPaise !== "0"
+        ? ` — ₹${(Number(s.amountImportedPaise) / 100).toLocaleString("en-IN")}`
+        : ""),
   };
 }
 
