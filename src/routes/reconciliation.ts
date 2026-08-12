@@ -213,11 +213,32 @@ function placedAtCondition(range: ResolvedRange): Prisma.Sql {
 // Deliberately does NOT run the engine. Reading a dashboard must not mutate
 // anything, and a page load that silently rewrites match rows makes the
 // numbers depend on who looked at them last.
+// One serializer for both the period-scoped and all-time COD blocks, so the
+// two can never drift in shape.
+function serializeCod(c: Awaited<ReturnType<typeof getCodExposure>>) {
+  return {
+    inFlightCount: c.inFlightCount,
+    inFlightValue: c.inFlightValue.toString(),
+    deliveredCount: c.deliveredCount,
+    deliveredValue: c.deliveredValue.toString(),
+    rtoCount: c.rtoCount,
+    rtoValue: c.rtoValue.toString(),
+    // Parcels the courier stopped reporting on. Its own field because the
+    // page must be able to say "we cannot see this" rather than filing it
+    // under money still on its way.
+    unknownCount: c.unknownCount,
+    unknownValue: c.unknownValue.toString(),
+    unknownOldestDays: c.unknownOldestDays,
+    onlineDepositsValue: c.onlineDepositsValue.toString(),
+    hasCourierData: c.hasCourierData,
+  };
+}
+
 reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, res) => {
   const organizationId = req.auth!.organizationId;
   const range = req.dateRange!;
 
-  const [statusRows, cod, lastMatch, channelRows, legs, statementCoverage, freight] = await Promise.all([
+  const [statusRows, cod, codPosition, lastMatch, channelRows, legs, statementCoverage, freight] = await Promise.all([
     // sum() over a bigint column returns NUMERIC in Postgres, which Prisma
     // hands back as a Decimal — casting to ::bigint here keeps the whole
     // money path in exact integers rather than routing it through a decimal
@@ -230,6 +251,12 @@ reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, 
       ) t
       GROUP BY status`),
     getCodExposure(organizationId, { from: range.from, to: range.to }),
+    // The same exposure UN-ranged. COD held by a courier is a POSITION (what
+    // exists right now), not a period flow — scoping it to the picker made the
+    // settlements page report ₹0 unknown-COD on the default month-to-date view
+    // while ₹72.2L of parcels sat silent, because none of those orders were
+    // PLACED this month. Pages showing "where is the money now" read this one.
+    getCodExposure(organizationId),
     prisma.reconciliationMatch.findFirst({
       where: { organizationId },
       orderBy: { createdAt: "desc" },
@@ -311,22 +338,10 @@ reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, 
       basis:
         "Prepaid checkout orders, excluding cancelled. COD settles through courier remittance and invoiced orders settle on payment terms — neither produces a gateway payment at order time, so both are reported separately rather than counted as unmatched.",
     },
-    cod: {
-      inFlightCount: cod.inFlightCount,
-      inFlightValue: cod.inFlightValue.toString(),
-      deliveredCount: cod.deliveredCount,
-      deliveredValue: cod.deliveredValue.toString(),
-      rtoCount: cod.rtoCount,
-      rtoValue: cod.rtoValue.toString(),
-      // Parcels the courier stopped reporting on. Its own field because the
-      // page must be able to say "we cannot see this" rather than filing it
-      // under money still on its way.
-      unknownCount: cod.unknownCount,
-      unknownValue: cod.unknownValue.toString(),
-      unknownOldestDays: cod.unknownOldestDays,
-      onlineDepositsValue: cod.onlineDepositsValue.toString(),
-      hasCourierData: cod.hasCourierData,
-    },
+    cod: serializeCod(cod),
+    // All-time COD position — see the getCodExposure call above for why this
+    // exists alongside the period-scoped block.
+    codPosition: serializeCod(codPosition),
     // The chain, always present rather than only after a run.
     legs: legs.map((leg) => ({
       ...leg,
