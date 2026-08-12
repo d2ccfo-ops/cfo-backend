@@ -1,9 +1,11 @@
 import { Router } from "express";
+import { z } from "zod";
 import { withDateRange } from "../lib/dateRange.js";
 import { withTrendWindow } from "../lib/trendWindow.js";
 import { getAdEfficiencySummary, getAdSpendSummary } from "../modules/calc/ads.js";
 import { getAvailableCashSummary, getCashReceivedSummary } from "../modules/calc/cash.js";
 import { DEFAULT_HORIZON, getCashForecast, isForecastHorizon } from "../modules/calc/cashForecast.js";
+import { runCashScenario, type ScenarioParams } from "../modules/calc/cashScenario.js";
 import { getDataFreshness } from "../modules/calc/freshness.js";
 import { getDataStatusMap, FORMULA_VERSION as DATA_STATUS_FORMULA_VERSION } from "../modules/calc/dataStatus.js";
 import { getInventoryCoverSummary, getInventoryValueSummary } from "../modules/calc/inventory.js";
@@ -82,10 +84,11 @@ metricsRouter.get("/available-cash", ...requireAuth, withDateRange, async (req, 
 });
 
 // Forward-looking, so the date filter is deliberately ignored: a forecast
-// always starts from today's balance and runs 30 days out. Filtering it to a
-// past window would be asking what we once expected to happen, which no card
-// on this page means. Still runs through withDateRange so a malformed date is
-// a clean 400 rather than silently disregarded.
+// always starts from today's balance and runs forward. Filtering it to a past
+// window would be asking what we once expected to happen, which no card on
+// this page means. Still runs through withDateRange so a malformed date is a
+// clean 400 rather than silently disregarded.
+//
 // ?horizon=7|30|90 (§16). An unrecognised or absent value falls back to 30
 // rather than 400ing: the horizon is a view preference, and a stale bookmark
 // carrying ?horizon=45 should show the default forecast, not an error page
@@ -99,6 +102,51 @@ metricsRouter.get("/cash-forecast", ...requireAuth, withDateRange, async (req, r
     getDataStatusMap(req.auth!.organizationId),
   ]);
   res.json({ ...forecast, dataStatus: statuses.cash_forecast });
+});
+
+// POST rather than GET, and not because it writes anything — it writes
+// nothing. Seven optional levers (one of them an object) do not survive a
+// query string legibly, and a scenario URL is not something anyone bookmarks
+// or caches. The body IS the question being asked.
+//
+// Returns BOTH lines from one call. The alternative — the client fetching the
+// base separately and diffing — lets the two be computed at different
+// instants, so a new order landing between the requests would show up as a
+// "scenario effect" the founder never asked for.
+const scenarioSchema = z
+  .object({
+    horizon: z.number().optional(),
+    adSpendDeltaPct: z.number().optional(),
+    codShareDeltaPct: z.number().optional(),
+    rtoDeltaPct: z.number().optional(),
+    collectionAccelDays: z.number().optional(),
+    inventoryPurchase: z.object({ amountPaise: z.string(), date: z.string() }).optional(),
+    vendorPaymentDelayDays: z.number().optional(),
+    growthDeltaPct: z.number().optional(),
+  })
+  .strict();
+
+metricsRouter.post("/cash-forecast/scenario", ...requireAuth, async (req, res, next) => {
+  let parsed: z.infer<typeof scenarioSchema>;
+  try {
+    // Parsed inside try/next(err), not thrown from the async body — on
+    // Express 4 a throw here hangs the request instead of returning 400.
+    // See lib/dateRange.ts.
+    parsed = scenarioSchema.parse(req.body ?? {});
+  } catch (err) {
+    next(err);
+    return;
+  }
+
+  const { horizon: requested, ...params } = parsed;
+  const horizon = isForecastHorizon(requested) ? requested : DEFAULT_HORIZON;
+  const { base, scenario } = await runCashScenario(
+    req.auth!.organizationId,
+    params as ScenarioParams,
+    req.auth!.timezone,
+    horizon
+  );
+  res.json({ base, scenario });
 });
 
 // Ignores the resolved range on purpose: only current stock levels exist
