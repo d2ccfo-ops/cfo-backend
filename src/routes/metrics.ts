@@ -5,6 +5,7 @@ import { getAdEfficiencySummary, getAdSpendSummary } from "../modules/calc/ads.j
 import { getAvailableCashSummary, getCashReceivedSummary } from "../modules/calc/cash.js";
 import { getCashForecast } from "../modules/calc/cashForecast.js";
 import { getDataFreshness } from "../modules/calc/freshness.js";
+import { getDataStatusMap, FORMULA_VERSION as DATA_STATUS_FORMULA_VERSION } from "../modules/calc/dataStatus.js";
 import { getInventoryCoverSummary, getInventoryValueSummary } from "../modules/calc/inventory.js";
 import { getNetRevenueSummary } from "../modules/calc/revenue.js";
 import { getBurnAndRunway } from "../modules/calc/burn.js";
@@ -34,9 +35,30 @@ export const metricsRouter = Router();
 // itself "as of now" instead of implying the filter applied. See the comments
 // on each calc module for why they can't be filtered.
 
+// §28 honesty layer — one deterministic status per material metric
+// (estimated | provisional | reconciled) with the reasons attached. The same
+// map is embedded per-metric in the material endpoints below; this endpoint
+// exists so a page can label a figure it derived locally without another
+// metric fetch.
+metricsRouter.get("/status", ...requireAuth, withDateRange, async (req, res) => {
+  const statuses = await getDataStatusMap(req.auth!.organizationId);
+  res.json({
+    formulaVersion: DATA_STATUS_FORMULA_VERSION,
+    // Statuses describe the pipeline's current verification state, not the
+    // picked window — same contract as /freshness.
+    periodFiltered: false,
+    pointInTime: true,
+    computedAt: new Date().toISOString(),
+    statuses,
+  });
+});
+
 metricsRouter.get("/revenue", ...requireAuth, withDateRange, async (req, res) => {
-  const summary = await getNetRevenueSummary(req.auth!.organizationId, req.dateRange!);
-  res.json(summary);
+  const [summary, statuses] = await Promise.all([
+    getNetRevenueSummary(req.auth!.organizationId, req.dateRange!),
+    getDataStatusMap(req.auth!.organizationId),
+  ]);
+  res.json({ ...summary, dataStatus: statuses.revenue });
 });
 
 metricsRouter.get("/rto-rate", ...requireAuth, withDateRange, async (req, res) => {
@@ -45,8 +67,11 @@ metricsRouter.get("/rto-rate", ...requireAuth, withDateRange, async (req, res) =
 });
 
 metricsRouter.get("/cash-received", ...requireAuth, withDateRange, async (req, res) => {
-  const summary = await getCashReceivedSummary(req.auth!.organizationId, req.dateRange!);
-  res.json(summary);
+  const [summary, statuses] = await Promise.all([
+    getCashReceivedSummary(req.auth!.organizationId, req.dateRange!),
+    getDataStatusMap(req.auth!.organizationId),
+  ]);
+  res.json({ ...summary, dataStatus: statuses.cash_received });
 });
 
 // A balance, so the range's END date is what matters — this reports the
@@ -62,8 +87,11 @@ metricsRouter.get("/available-cash", ...requireAuth, withDateRange, async (req, 
 // on this page means. Still runs through withDateRange so a malformed date is
 // a clean 400 rather than silently disregarded.
 metricsRouter.get("/cash-forecast", ...requireAuth, withDateRange, async (req, res) => {
-  const forecast = await getCashForecast(req.auth!.organizationId, req.auth!.timezone);
-  res.json(forecast);
+  const [forecast, statuses] = await Promise.all([
+    getCashForecast(req.auth!.organizationId, req.auth!.timezone),
+    getDataStatusMap(req.auth!.organizationId),
+  ]);
+  res.json({ ...forecast, dataStatus: statuses.cash_forecast });
 });
 
 // Ignores the resolved range on purpose: only current stock levels exist
@@ -113,7 +141,7 @@ metricsRouter.get("/sales", ...requireAuth, withDateRange, async (req, res) => {
 // them separately is how two numbers on one screen end up disagreeing — the
 // exact failure §1 of the finance-engine spec exists to prevent.
 metricsRouter.get("/revenue-ladder", ...requireAuth, withDateRange, async (req, res) => {
-  const [ladder, trend] = await Promise.all([
+  const [ladder, trend, statuses] = await Promise.all([
     getRevenueLadder(req.auth!.organizationId, req.dateRange!),
     // The trend is a trailing-6-month series and ignores the date filter on
     // purpose — it exists to give the selected period context, and a "6-month
@@ -121,6 +149,9 @@ metricsRouter.get("/revenue-ladder", ...requireAuth, withDateRange, async (req, 
     // the ladder so the first paint costs one request; zooming then talks to
     // /revenue-trend below instead of recomputing the whole ladder.
     getRevenueTrend(req.auth!.organizationId),
+    // The revenue page renders from this endpoint, not /revenue — the status
+    // label has to travel with the numbers it describes.
+    getDataStatusMap(req.auth!.organizationId),
   ]);
   // cashCoverage rides alongside the series rather than inside it: the chart
   // needs to decide whether to draw the cash line AT ALL, which is a property
@@ -130,6 +161,7 @@ metricsRouter.get("/revenue-ladder", ...requireAuth, withDateRange, async (req, 
     trend: trend.series,
     trendWindow: trend.window,
     cashCoverage: trend.cashCoverage,
+    dataStatus: statuses.revenue,
   });
 });
 
@@ -151,13 +183,21 @@ metricsRouter.get("/revenue-trend", ...requireAuth, withTrendWindow, async (req,
 // fees silently absent would read as a healthy margin while being materially
 // wrong, so uncovered layers mark the levels below them `reliable: false`.
 metricsRouter.get("/contribution-margin", ...requireAuth, withDateRange, async (req, res) => {
-  res.json(await getContributionMargin(req.auth!.organizationId, req.dateRange!));
+  const [margin, statuses] = await Promise.all([
+    getContributionMargin(req.auth!.organizationId, req.dateRange!),
+    getDataStatusMap(req.auth!.organizationId),
+  ]);
+  res.json({ ...margin, dataStatus: statuses.contribution_margin });
 });
 
 // §40 per-SKU profitability. Stops at CM0 (revenue − product cost) and says so
 // — per-SKU shipping/RTO/ads would need allocation inputs that don't exist.
 metricsRouter.get("/product-profitability", ...requireAuth, withDateRange, async (req, res) => {
-  res.json(await getProductProfitability(req.auth!.organizationId, req.dateRange!));
+  const [products, statuses] = await Promise.all([
+    getProductProfitability(req.auth!.organizationId, req.dateRange!),
+    getDataStatusMap(req.auth!.organizationId),
+  ]);
+  res.json({ ...products, dataStatus: statuses.product_profitability });
 });
 
 // §55 cash movement + §85 runway. Not date-filtered: burn is a trailing rate by
