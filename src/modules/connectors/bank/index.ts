@@ -28,14 +28,20 @@ export interface ParseResult {
   errors: string[]; // one message per skipped line, 1-indexed against the input
 }
 
-const EXPECTED_COLUMNS = ["date", "description", "amount", "type"];
+export const EXPECTED_COLUMNS = ["date", "description", "amount", "type"];
+
+// Optional column naming the account a statement belongs to. Absent from the
+// manual-upload path (the URL already names the connection), but load-bearing
+// for email ingestion (routes/ingest/inboundEmail.ts): with two-plus BANK
+// connections on an org, nothing else says which one an emailed CSV is for.
+const ACCOUNT_COLUMN_CANDIDATES = ["account", "accountnumber", "accountno", "accountid", "last4", "accountlast4"];
 
 // Minimal CSV line parser that handles double-quoted fields (so a
 // comma-containing bank description like `"NEFT, salary credit"` doesn't get
 // split in the wrong place) and `""`-escaped quotes within a quoted field.
 // Not a full RFC 4180 parser, but correct for the cases a bank statement
 // export actually produces.
-function parseCsvLine(line: string): string[] {
+export function parseCsvLine(line: string): string[] {
   const fields: string[] = [];
   let current = "";
   let inQuotes = false;
@@ -117,6 +123,38 @@ export function parseStatementCsv(csvText: string): ParseResult {
   }
 
   return { rows, errors };
+}
+
+export interface AccountIdentifierResult {
+  /** Present only when every row that names an account agrees on the same one. */
+  identifier: string | null;
+  /** True when the file's account column carries more than one distinct value — a mixed-account export the normalized model can't represent (one connection, one set of transactions). */
+  ambiguous: boolean;
+}
+
+/**
+ * The account a statement names, from an optional column — not required by
+ * parseStatementCsv (extra columns are simply ignored there), but read here
+ * for connection resolution. Every non-empty value across all rows must
+ * agree; a file that mixes two accounts is refused rather than guessed at,
+ * same posture as detectCsvFormat's ambiguity handling.
+ */
+export function extractAccountIdentifier(csvText: string): AccountIdentifierResult {
+  const lines = csvText.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return { identifier: null, ambiguous: false };
+
+  const header = parseCsvLine(lines[0] ?? "").map((h) => h.toLowerCase().replace(/[^a-z0-9]/g, ""));
+  const colIndex = header.findIndex((h) => ACCOUNT_COLUMN_CANDIDATES.includes(h));
+  if (colIndex === -1) return { identifier: null, ambiguous: false };
+
+  const values = new Set<string>();
+  for (let i = 1; i < lines.length; i++) {
+    const value = parseCsvLine(lines[i] ?? "")[colIndex]?.trim();
+    if (value) values.add(value);
+  }
+  if (values.size === 0) return { identifier: null, ambiguous: false };
+  if (values.size > 1) return { identifier: null, ambiguous: true };
+  return { identifier: [...values][0]!, ambiguous: false };
 }
 
 async function upsertTransaction(ctx: ConnectorContext, row: ParsedBankRow, externalTxnId: string) {

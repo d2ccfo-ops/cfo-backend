@@ -3,6 +3,7 @@ import type { Prisma, Provider } from "@prisma/client";
 import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
+import { EXPECTED_COLUMNS as BANK_EXPECTED_COLUMNS, extractAccountIdentifier, ingestStatement } from "../connectors/bank/index.js";
 import { BLUEDART_COD_STATEMENT, ingestCodRemittance } from "../connectors/bluedart/index.js";
 import { ingestInvoicePdfDocument } from "../connectors/bluedart/invoice.js";
 import { GOKWIK_SETTLEMENT_STATEMENT, ingestSettlementReport } from "../connectors/gokwik/index.js";
@@ -328,6 +329,22 @@ export function detectCsvFormat(csv: string): { detected: CsvDetection | null; r
   return { detected: { provider: only.provider, format: only.format, label: only.format.label }, reason: "ok" };
 }
 
+// Bank statements don't fit CsvFormatEntry: they're a flat per-transaction
+// format (routes/connections/bank.ts's parseStatementCsv), not a
+// payout-grouped StatementFormat. Detected separately, and only after
+// detectCsvFormat has had first refusal — "date,description,amount,type" are
+// plain enough words that trying courier signatures FIRST is what keeps a
+// generic-looking bank export from ever pre-empting a real courier MIS.
+//
+// All four are required, matched exactly (no candidate-spelling list, unlike
+// the courier formats) — this is a format cfo-backend itself defined, not a
+// document scraped from a bank's own export, so there is exactly one accepted
+// spelling per column.
+function looksLikeBankStatementCsv(csv: string): boolean {
+  const headers = new Set(headerCells(csv).map(normHeader).filter(Boolean));
+  return BANK_EXPECTED_COLUMNS.every((c) => headers.has(c));
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -405,6 +422,59 @@ async function getOrCreateIngestConnection(organizationId: string, provider: Pro
   }
 }
 
+// Bank statements are the one email-ingested document that must land on the
+// merchant's REAL credentialed connection, not an isolated placeholder like
+// Bluedart/GoKwik's forged-document sandbox: cash-received and available-cash
+// sum bank transactions by organizationId, not by connection, so isolation
+// would buy no protection while creating exactly the failure the plan calls
+// out — the same statement forwarded by email AND uploaded by hand would land
+// on two different connections and double the cash on the books. Resolution
+// therefore either lands on the one unambiguous connection, or refuses and
+// imports nothing; it never falls back to creating a connection of its own.
+async function resolveBankConnectionForEmail(
+  organizationId: string,
+  csv: string
+): Promise<{
+  connection: { id: string; organizationId: string; legalEntityId: string; credentialsRef: string; externalAccountId: string | null } | null;
+  reason: string;
+}> {
+  const connections = await prisma.connection.findMany({
+    where: { organizationId, provider: "BANK", status: "ACTIVE" },
+    select: { id: true, organizationId: true, legalEntityId: true, credentialsRef: true, externalAccountId: true },
+  });
+  if (connections.length === 0) {
+    return { connection: null, reason: "no bank account is connected yet — add one on the Connections page, then forward the statement again" };
+  }
+  if (connections.length === 1) {
+    return { connection: connections[0]!, reason: "ok" };
+  }
+
+  const { identifier, ambiguous } = extractAccountIdentifier(csv);
+  const known = connections.map((c) => c.externalAccountId).join(", ");
+  if (ambiguous) {
+    return { connection: null, reason: "the statement's account column names more than one account — split it into one file per account" };
+  }
+  if (!identifier) {
+    return {
+      connection: null,
+      reason: `${connections.length} bank accounts are connected (${known}) and this statement does not say which one it is — add an "Account" column with the account number or last 4 digits`,
+    };
+  }
+
+  const digits = identifier.replace(/\D/g, "");
+  const last4 = digits.length >= 4 ? digits.slice(-4) : null;
+  const matches = connections.filter(
+    (c) => c.externalAccountId && (c.externalAccountId.includes(identifier) || (last4 && c.externalAccountId.endsWith(last4)))
+  );
+  if (matches.length === 0) {
+    return { connection: null, reason: `no connected account matches "${identifier}" — connected accounts: ${known}` };
+  }
+  if (matches.length > 1) {
+    return { connection: null, reason: `"${identifier}" matches more than one connected account (${known}) — ambiguous` };
+  }
+  return { connection: matches[0]!, reason: "ok" };
+}
+
 function looksLikeText(buf: Buffer): boolean {
   // A CSV is overwhelmingly printable ASCII; a binary format is not. Checking
   // the first 2KB is enough to reject xlsx/zip/pdf bytes without decoding 50MB.
@@ -466,7 +536,33 @@ async function processAttachment(organizationId: string, att: NormalizedAttachme
   if (looksLikeText(att.content)) {
     const csv = att.content.toString("utf8");
     const { detected, reason } = detectCsvFormat(csv);
+
     if (!detected) {
+      // Tried only after both courier signatures miss — see
+      // looksLikeBankStatementCsv's comment on why the ordering matters.
+      if (looksLikeBankStatementCsv(csv)) {
+        const { connection, reason: resolveReason } = await resolveBankConnectionForEmail(organizationId, csv);
+        if (!connection) {
+          return { name: att.name, kind: "unrecognised", ok: false, detail: `Bank statement refused: ${resolveReason}` };
+        }
+        const ctx = toConnectorContext(connection);
+        const result = await ingestStatement(ctx, csv);
+        await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+        // Unlike the courier payouts below, bank rows are independent — one
+        // malformed line doesn't invalidate the transactions around it, so
+        // "ok" tracks whether anything actually landed, not zero errors.
+        const ok = result.recordsFetched > 0;
+        return {
+          name: att.name,
+          kind: "statement-csv",
+          format: "Bank statement",
+          ok,
+          detail:
+            `Bank statement: ${result.recordsFetched} transaction${result.recordsFetched === 1 ? "" : "s"} imported` +
+            `${result.skipped > 0 ? `, ${result.skipped} row${result.skipped === 1 ? "" : "s"} skipped` : ""}` +
+            `${result.errors.length > 0 ? ` — ${result.errors[0]}` : ""}`,
+        };
+      }
       return { name: att.name, kind: "unrecognised", ok: false, detail: `CSV not recognised: ${reason}` };
     }
 

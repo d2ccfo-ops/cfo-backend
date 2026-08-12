@@ -1,6 +1,8 @@
 import { prisma } from "../src/lib/prisma.js";
+import { ingestStatement } from "../src/modules/connectors/bank/index.js";
 import { BLUEDART_COD_STATEMENT } from "../src/modules/connectors/bluedart/index.js";
 import { GOKWIK_SETTLEMENT_STATEMENT } from "../src/modules/connectors/gokwik/index.js";
+import { toConnectorContext } from "../src/modules/connectors/types.js";
 import {
   EMAIL_INGEST_ACCOUNT,
   detectCsvFormat,
@@ -283,7 +285,86 @@ async function main() {
     ok("every email is logged", log.length >= 5, String(log.length));
     ok("sender recorded", log.some((l) => l.fromAddress === "remittance@bluedart.com"));
 
-    console.log("\n[12] a rotated-away address goes dead");
+    console.log("\n[12] bank statements — a single connected account needs no identifier");
+    const bankEntity = await prisma.legalEntity.create({ data: { organizationId: org.id, name: "BE" } });
+    const bankConn1 = await prisma.connection.create({
+      data: {
+        organizationId: org.id,
+        legalEntityId: bankEntity.id,
+        provider: "BANK",
+        status: "ACTIVE",
+        externalAccountId: "HDFC •••1111",
+        credentialsRef: "real-bank-1",
+      },
+    });
+    const singleAccountCsv = ["date,description,amount,type", "2026-08-01,Sale settlement,500.00,CREDIT"].join("\n");
+    const singleMail = await processInboundEmail(address.token, email({
+      from: "statements@hdfcbank.net",
+      subject: "Statement",
+      messageId: "bank-single-1",
+      attachments: [{ name: "stmt.csv", content: Buffer.from(singleAccountCsv, "utf8"), contentType: "text/csv" }],
+    }));
+    ok("single-account statement imports", singleMail?.outcomes[0]?.ok === true, JSON.stringify(singleMail?.outcomes[0]));
+    ok(
+      "lands on the real credentialed connection, not an isolated one",
+      (await prisma.bankTransaction.count({ where: { connectionId: bankConn1.id } })) === 1
+    );
+
+    console.log("\n[13] bank statements — a second connected account forces disambiguation");
+    const bankConn2 = await prisma.connection.create({
+      data: {
+        organizationId: org.id,
+        legalEntityId: bankEntity.id,
+        provider: "BANK",
+        status: "ACTIVE",
+        externalAccountId: "ICICI •••2222",
+        credentialsRef: "real-bank-2",
+      },
+    });
+    const noAccountMail = await processInboundEmail(address.token, email({
+      from: "statements@hdfcbank.net",
+      subject: "Statement 2",
+      messageId: "bank-multi-noacct",
+      attachments: [{ name: "stmt2.csv", content: Buffer.from(singleAccountCsv, "utf8"), contentType: "text/csv" }],
+    }));
+    ok(
+      "refused, not guessed, with two accounts and no identifier",
+      noAccountMail?.outcomes[0]?.ok === false && /does not say which one/.test(noAccountMail?.outcomes[0]?.detail ?? ""),
+      noAccountMail?.outcomes[0]?.detail
+    );
+    ok(
+      "nothing was imported by the refused attempt",
+      (await prisma.bankTransaction.count({ where: { connectionId: bankConn1.id } })) === 1 &&
+        (await prisma.bankTransaction.count({ where: { connectionId: bankConn2.id } })) === 0
+    );
+
+    console.log("\n[14] bank statements — a named account routes to the right connection");
+    const namedCsv = [
+      "date,description,amount,type,account",
+      "2026-08-02,Refund,50.00,DEBIT,2222",
+    ].join("\n");
+    const namedMail = await processInboundEmail(address.token, email({
+      from: "statements@icicibank.com",
+      subject: "Statement",
+      messageId: "bank-multi-named",
+      attachments: [{ name: "stmt3.csv", content: Buffer.from(namedCsv, "utf8"), contentType: "text/csv" }],
+    }));
+    ok("named-account statement imports", namedMail?.outcomes[0]?.ok === true, JSON.stringify(namedMail?.outcomes[0]));
+    ok(
+      "routes to the matching connection by last-4, not the other one",
+      (await prisma.bankTransaction.count({ where: { connectionId: bankConn2.id } })) === 1 &&
+        (await prisma.bankTransaction.count({ where: { connectionId: bankConn1.id } })) === 1
+    );
+
+    console.log("\n[15] bank statements — email and manual upload of the SAME statement do not double-count");
+    const ctxConn1 = toConnectorContext({ ...bankConn1, externalAccountId: bankConn1.externalAccountId });
+    await ingestStatement(ctxConn1, singleAccountCsv); // the "manual upload" side, same connection
+    ok(
+      "re-ingesting the identical file via the manual path is a no-op, not a second row",
+      (await prisma.bankTransaction.count({ where: { connectionId: bankConn1.id } })) === 1
+    );
+
+    console.log("\n[16] a rotated-away address goes dead");
     await prisma.emailIngestAddress.update({ where: { id: address.id }, data: { disabledAt: new Date() } });
     const afterRotate = await processInboundEmail(address.token, email({ from: "x@y.z", subject: "late", messageId: "late-1" }));
     ok("disabled token → null, same as unknown", afterRotate === null);
@@ -291,6 +372,8 @@ async function main() {
   } finally {
     await prisma.settlementLine.deleteMany({ where: { organizationId: org.id } });
     await prisma.settlement.deleteMany({ where: { organizationId: org.id } });
+    await prisma.bankTransaction.deleteMany({ where: { organizationId: org.id } });
+    await prisma.rawEvent.deleteMany({ where: { organizationId: org.id } });
     await prisma.inboundEmail.deleteMany({ where: { organizationId: org.id } });
     await prisma.emailIngestAddress.deleteMany({ where: { organizationId: org.id } });
     await prisma.connection.deleteMany({ where: { organizationId: org.id } });
