@@ -15,6 +15,7 @@ import { RECURRING_CADENCES, RECURRING_OUTFLOW_CATEGORIES } from "../calc/recurr
 // later), and this is shared by routes/preferences.ts (read/write, with
 // validation) and every calc module that only needs to read.
 const MAX_RECURRING_OUTFLOWS = 50;
+const MAX_DIGEST_RECIPIENTS = 10;
 const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
 // The cadence fields are deliberately validated per-cadence rather than left
@@ -63,6 +64,19 @@ export const orgSettingsSchema = z
     // API already uses. null explicitly unsets it (no threshold configured,
     // not zero).
     cashThresholdPaise: z.string().regex(/^\d+$/, "must be a non-negative integer string").nullable(),
+
+    // P3.3. Which digests this organisation wants, and where they go.
+    // Recipients are explicit rather than "everyone in the org": a digest
+    // carries the whole cash position, and membership is not the same question
+    // as who should receive that by email.
+    notificationDigest: z
+      .object({
+        daily: z.boolean(),
+        weekly: z.boolean(),
+        recipients: z.array(z.string().email()).max(MAX_DIGEST_RECIPIENTS),
+      })
+      .strict()
+      .nullable(),
 
     // P2.2e. The fixed costs that leave on a DATE rather than as a rate —
     // payroll, rent, EMI, subscriptions, advance tax. Stored here rather than

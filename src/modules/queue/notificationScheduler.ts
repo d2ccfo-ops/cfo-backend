@@ -1,6 +1,7 @@
 import { Queue, Worker } from "bullmq";
 import { logger } from "../../lib/logger.js";
 import { redisConnection } from "../../lib/redis.js";
+import { runDigestSweep } from "../notifications/digest.js";
 import { runNotificationSweep } from "../notifications/notifications.js";
 
 // §23's nightly pass (P3.1). Runs at 02:45 IST — AFTER the anomaly sweep at
@@ -15,7 +16,15 @@ import { runNotificationSweep } from "../notifications/notifications.js";
 
 const SCHEDULER_QUEUE = "notification-scheduler";
 const SWEEP_SCHEDULER_ID = "notification-nightly-sweep";
+const DAILY_DIGEST_ID = "notification-daily-digest";
+const WEEKLY_DIGEST_ID = "notification-weekly-digest";
 const SWEEP_CRON = "45 2 * * *";
+// 07:00 IST, four hours after the emitters run, so a founder opening their
+// inbox over breakfast is reading last night's findings rather than the
+// previous morning's. Weekly goes out Monday at the same hour — same reason,
+// and Monday because a weekly summary is a planning document.
+const DAILY_DIGEST_CRON = "0 7 * * *";
+const WEEKLY_DIGEST_CRON = "0 7 * * 1";
 const SWEEP_TZ = "Asia/Kolkata";
 
 export const notificationSchedulerQueue = new Queue(SCHEDULER_QUEUE, {
@@ -31,7 +40,19 @@ export const notificationSchedulerQueue = new Queue(SCHEDULER_QUEUE, {
 export function startNotificationScheduler() {
   const worker = new Worker(
     SCHEDULER_QUEUE,
-    async () => {
+    async (job) => {
+      // One worker, three schedules, dispatched on the job name. A queue per
+      // schedule would mean three Redis connections and three workers for what
+      // is one nightly concern.
+      if (job.name === "daily-digest" || job.name === "weekly-digest") {
+        const kind = job.name === "daily-digest" ? "daily" : "weekly";
+        const result = await runDigestSweep(kind);
+        logger.info(result, "digest_sweep_completed");
+        // Skips are logged separately and at info: "nobody has configured a
+        // digest" and "the digest is broken" must not look identical in a log.
+        if (result.failed.length > 0) logger.error({ failed: result.failed, kind }, "digest_sweep_failures");
+        return result;
+      }
       const result = await runNotificationSweep();
       logger.info(result, "notification_sweep_completed");
       return result;
@@ -43,10 +64,17 @@ export function startNotificationScheduler() {
     logger.error({ jobId: job?.id, err }, "notification_sweep_failed");
   });
 
-  void notificationSchedulerQueue
-    .upsertJobScheduler(SWEEP_SCHEDULER_ID, { pattern: SWEEP_CRON, tz: SWEEP_TZ }, { name: "sweep" })
-    .then(() => logger.info({ pattern: SWEEP_CRON, tz: SWEEP_TZ }, "notification_scheduler_registered"))
-    .catch((err) => logger.error({ err }, "notification_scheduler_registration_failed"));
+  const schedules: Array<[string, string, string]> = [
+    [SWEEP_SCHEDULER_ID, SWEEP_CRON, "sweep"],
+    [DAILY_DIGEST_ID, DAILY_DIGEST_CRON, "daily-digest"],
+    [WEEKLY_DIGEST_ID, WEEKLY_DIGEST_CRON, "weekly-digest"],
+  ];
+  for (const [id, pattern, name] of schedules) {
+    void notificationSchedulerQueue
+      .upsertJobScheduler(id, { pattern, tz: SWEEP_TZ }, { name })
+      .then(() => logger.info({ id, pattern, tz: SWEEP_TZ }, "notification_scheduler_registered"))
+      .catch((err) => logger.error({ err, id }, "notification_scheduler_registration_failed"));
+  }
 
   return worker;
 }

@@ -15,6 +15,17 @@ const schema = z.object({
   // required even though only Shopify uses it today. 32 bytes as hex.
   CREDENTIALS_ENCRYPTION_KEY: z.string().length(64),
 
+  // P3.3 email digests. Optional: absent means the digest feature is OFF, not
+  // broken — the sweep skips sending and says so in its result rather than
+  // throwing per organisation. Same check-at-use pattern as every connector
+  // credential below.
+  RESEND_API_KEY: z.string().optional(),
+  // Must be a domain verified in the Resend dashboard. Defaulted to nothing
+  // rather than a plausible-looking address: a From that has not been verified
+  // fails at send time with an error nobody reads, and a wrong default would
+  // make that look like a code bug.
+  DIGEST_FROM_EMAIL: z.string().optional(),
+
   BACKEND_URL: z.string().default("http://localhost:4000"),
   FRONTEND_URL: z.string().default("http://localhost:3000"),
 

@@ -128,6 +128,19 @@ async function main() {
     ok("no notification to compare against", true);
   }
 
+  console.log("\n[9] digests are off, loudly, until configured");
+  const { runDigestSweep, sendDigestEmail } = await import("../src/modules/notifications/digest.js");
+  const noKey = await sendDigestEmail(["a@b.com"], { subject: "s", text: "t", html: "h", worthSending: true });
+  ok("no API key → skipped with a stated reason, not an exception",
+    noKey.sent === false && (noKey.skipped ?? "").length > 10, noKey.skipped ?? noKey.error ?? "");
+  ok("no recipients → skipped, not sent to nobody",
+    (await sendDigestEmail([], { subject: "s", text: "t", html: "h", worthSending: true })).sent === false);
+  const digestSweep = await runDigestSweep("daily");
+  ok("the sweep visits every organisation without throwing", digestSweep.organizations >= 1, `${digestSweep.organizations} orgs`);
+  ok("nothing failed", digestSweep.failed.length === 0, JSON.stringify(digestSweep.failed).slice(0, 160));
+  ok("no org is eligible until one opts in", digestSweep.eligible === 0, `${digestSweep.eligible} eligible`);
+  ok("and nothing was sent", digestSweep.sent === 0);
+
   console.log("\n" + "─".repeat(60));
   console.log(`${pass} passed, ${fail} failed`);
   if (failures.length) failures.forEach((f) => console.log(`  ✗ ${f}`));
