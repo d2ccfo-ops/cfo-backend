@@ -34,6 +34,7 @@ import { organizationRouter } from "./routes/organization.js";
 import { metricsRouter } from "./routes/metrics.js";
 import { evidenceRouter } from "./routes/evidence.js";
 import { auditRouter } from "./routes/audit.js";
+import { aiRouter } from "./routes/ai.js";
 import { anomaliesRouter } from "./routes/anomalies.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { reconciliationRouter } from "./routes/reconciliation.js";
@@ -108,6 +109,7 @@ export function createApp() {
   app.use("/metrics", metricsRouter);
   app.use("/evidence", evidenceRouter);
   app.use("/audit", auditRouter);
+  app.use("/ai", aiRouter);
   app.use("/anomalies", anomaliesRouter);
   app.use("/notifications", notificationsRouter);
   app.use("/inventory", inventoryRouter);

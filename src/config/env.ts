@@ -15,6 +15,16 @@ const schema = z.object({
   // required even though only Shopify uses it today. 32 bytes as hex.
   CREDENTIALS_ENCRYPTION_KEY: z.string().length(64),
 
+  // P4 AI CFO. Optional: absent means /ai returns a clear "not configured"
+  // rather than a 500, and every other route is unaffected. Same
+  // check-at-use pattern as every connector credential below.
+  ANTHROPIC_API_KEY: z.string().optional(),
+  // Overridable so a cheaper model can be pinned for eval runs without a
+  // deploy. The default is the strongest model available, because this one
+  // reads financial statements and the cost of a wrong answer is far above
+  // the cost of a token.
+  AI_MODEL: z.string().default("claude-opus-5"),
+
   // P3.3 email digests. Optional: absent means the digest feature is OFF, not
   // broken — the sweep skips sending and says so in its result rather than
   // throwing per organisation. Same check-at-use pattern as every connector
