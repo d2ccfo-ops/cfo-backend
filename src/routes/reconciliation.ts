@@ -15,6 +15,7 @@ import {
   RECONCILIATION_VERSION,
 } from "../modules/calc/reconciliation.js";
 import { getPairCandidates, pairOrderToPayment, unpairOrder } from "../modules/reconciliation/manualMatch.js";
+import { flagMatchAsException, getExceptionReport, unflagMatch } from "../modules/reconciliation/exceptions.js";
 
 export const reconciliationRouter = Router();
 
@@ -927,6 +928,72 @@ reconciliationRouter.post("/items/:orderId/unpair", ...requireAuth, async (req, 
     // supports, rather than an empty state that resolves at some later run.
     await runReconciliation(organizationId);
     res.json({ status: "unpaired" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P6.4 — THE §15 EXCEPTION TAXONOMY
+// ---------------------------------------------------------------------------
+// Eleven named kinds of exception instead of one word for all of them.
+// "Missing COD remittance" is a call to the courier; "duplicate settlement" is
+// money received twice; "unknown deduction" is a fee nobody agreed to. Same
+// badge until now, three different afternoons.
+//
+// Derived at read time — see modules/reconciliation/exceptions.ts for why
+// storing them would make the leg summary less accurate rather than more.
+
+reconciliationRouter.get("/exceptions", ...requireAuth, withDateRange, async (req, res, next) => {
+  try {
+    const range = req.dateRange!;
+    const report = await getExceptionReport(req.auth!.organizationId, range);
+    res.json({
+      ...report,
+      window: describeRange(range),
+      types: report.types.map((t) => ({
+        ...t,
+        sample: t.sample.map((s) => ({ ...s })),
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Mark a specific pairing as wrong. The one stored EXCEPTION. */
+reconciliationRouter.post("/matches/:matchId/flag", ...requireAuth, async (req, res, next) => {
+  try {
+    const matchId = req.params.matchId;
+    if (!matchId) {
+      res.status(400).json({ error: "match_id_required" });
+      return;
+    }
+    const note = typeof req.body?.note === "string" ? req.body.note.trim().slice(0, 500) || null : null;
+    const { flagged } = await flagMatchAsException(req.auth!.organizationId, matchId, note, req.auth!.userId);
+    if (!flagged) {
+      res.status(404).json({ error: "match_not_found_or_already_flagged" });
+      return;
+    }
+    res.json({ status: "flagged" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+reconciliationRouter.post("/matches/:matchId/unflag", ...requireAuth, async (req, res, next) => {
+  try {
+    const matchId = req.params.matchId;
+    if (!matchId) {
+      res.status(400).json({ error: "match_id_required" });
+      return;
+    }
+    const { unflagged } = await unflagMatch(req.auth!.organizationId, matchId, req.auth!.userId);
+    if (!unflagged) {
+      res.status(404).json({ error: "not_flagged" });
+      return;
+    }
+    res.json({ status: "unflagged" });
   } catch (err) {
     next(err);
   }
