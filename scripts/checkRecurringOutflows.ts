@@ -1,7 +1,14 @@
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import { prisma } from "../src/lib/prisma.js";
 import { getCashForecast } from "../src/modules/calc/cashForecast.js";
 import { applyScenario } from "../src/modules/calc/cashScenario.js";
-import { expandSchedule, type RecurringOutflow } from "../src/modules/calc/recurringOutflows.js";
+import {
+  RECURRING_CADENCES,
+  RECURRING_OUTFLOW_CATEGORIES,
+  expandSchedule,
+  type RecurringOutflow,
+} from "../src/modules/calc/recurringOutflows.js";
 import { orgSettingsSchema } from "../src/modules/orgs/settings.js";
 import { findDemoOrg } from "./lib/demoOrg.js";
 
@@ -222,6 +229,48 @@ async function main() {
     // 1st, that is an outflow source, and the badge has to reflect it.
     ok("reliability is not inflows_only with a schedule configured", after90.reliability !== "inflows_only", after90.reliability);
     ok("the schedule counts toward the outflow side", BigInt(afterSchedule.valueMinor) > 0n);
+
+    console.log("\n[11] the Settings editor offers exactly what the server accepts");
+    // The editor is Clerk-gated, so no script can render it. What CAN be
+    // checked is the seam that breaks: a category or cadence the dropdown
+    // offers but the schema rejects 400s the whole save, and a founder sees
+    // "save failed" with no way to tell which row caused it. Read out of the
+    // component's own source so this cannot drift from the component.
+    const panel = await readFile(
+      new URL("../../cfo-frontend/components/settings/RecurringCosts.js", pathToFileURL(import.meta.dirname + "/")),
+      "utf8"
+    );
+    const listValues = (constName: string) => {
+      const block = panel.match(new RegExp(`const ${constName} = \\[([\\s\\S]*?)\\n\\];`))?.[1] ?? "";
+      return [...block.matchAll(/value:\s*"([A-Z_]+)"/g)].map((m) => m[1]!);
+    };
+    const uiCategories = listValues("CATEGORIES");
+    const uiCadences = listValues("CADENCES");
+    ok("the editor offers categories", uiCategories.length > 0, uiCategories.join(", "));
+    ok(
+      "every category it offers is one the server accepts",
+      uiCategories.every((c) => (RECURRING_OUTFLOW_CATEGORIES as readonly string[]).includes(c)),
+      uiCategories.filter((c) => !(RECURRING_OUTFLOW_CATEGORIES as readonly string[]).includes(c)).join(", ")
+    );
+    ok(
+      "and it offers all of them — a category the server knows but the UI hides is unreachable",
+      RECURRING_OUTFLOW_CATEGORIES.every((c) => uiCategories.includes(c)),
+      RECURRING_OUTFLOW_CATEGORIES.filter((c) => !uiCategories.includes(c)).join(", ")
+    );
+    ok("the editor offers cadences", uiCadences.length > 0, uiCadences.join(", "));
+    ok(
+      "every cadence it offers is one the server accepts",
+      uiCadences.every((c) => (RECURRING_CADENCES as readonly string[]).includes(c)),
+      uiCadences.filter((c) => !(RECURRING_CADENCES as readonly string[]).includes(c)).join(", ")
+    );
+    ok(
+      "and it offers all of them",
+      RECURRING_CADENCES.every((c) => uiCadences.includes(c)),
+      RECURRING_CADENCES.filter((c) => !uiCadences.includes(c)).join(", ")
+    );
+    // The editor sends only the fields the chosen cadence uses, because the
+    // schema is .strict() and requires a weekday on weekly entries only.
+    ok("the editor branches its payload on cadence", /cadence === "WEEKLY"[\s\S]{0,200}weekday:/.test(panel));
 
     console.log("\n" + "─".repeat(60));
     console.log(`${pass} passed, ${fail} failed`);
