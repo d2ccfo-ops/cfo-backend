@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { getStateProfitability } from "../modules/calc/geography.js";
+import { getCampaignProfitability } from "../modules/calc/campaigns.js";
+import { getChannelProfitability } from "../modules/calc/channels.js";
 import { getCashConversionCycle } from "../modules/calc/cashCycle.js";
 import { unsupportedScopeMessage, withEntityScope } from "../lib/entityScope.js";
 import { z } from "zod";
@@ -359,4 +361,20 @@ metricsRouter.get("/state-profitability", ...requireAuth, withDateRange, withEnt
 // its three terms cannot be measured — a partial cycle is not a shorter cycle.
 metricsRouter.get("/cash-conversion-cycle", ...requireAuth, withDateRange, async (req, res) => {
   res.json(await getCashConversionCycle(req.auth!.organizationId, req.dateRange!));
+});
+
+// §14 channel profitability (P6.7). CM2 per channel — everything that hangs
+// off an order and therefore allocates exactly. Advertising is reported as an
+// unallocated pool rather than spread across channels: see modules/calc/
+// channels.ts for why spreading it in proportion to revenue is a fabrication
+// with a formula attached.
+metricsRouter.get("/channel-profitability", ...requireAuth, withDateRange, async (req, res) => {
+  res.json(await getChannelProfitability(req.auth!.organizationId, req.dateRange!));
+});
+
+// §14 campaign profitability (P6.6). Spend is measured; the platform's
+// conversion and revenue claims are quoted as the platform's, never summed
+// into anything this product calls revenue.
+metricsRouter.get("/campaign-profitability", ...requireAuth, withDateRange, async (req, res) => {
+  res.json(await getCampaignProfitability(req.auth!.organizationId, req.dateRange!));
 });

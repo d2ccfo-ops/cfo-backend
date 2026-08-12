@@ -628,6 +628,61 @@ model AdSpend {
   @@map("ad_spend")
 }
 
+// P6.6 — campaign-grain ad spend (§14).
+//
+// WHY A SEPARATE TABLE AND NOT COLUMNS ON AdSpend
+// -----------------------------------------------
+// A campaign row is a FINER GRAIN of the same fact, not a different fact. Put
+// both in one table and the advertising cost layer — which sums
+// AdSpend.spendAmount — silently doubles the moment a campaign pull lands
+// alongside an account pull for the same day. Nothing would throw, contribution
+// margin would just quietly halve, and the number would look like a bad month.
+//
+// Keeping them apart makes that impossible: AdSpend stays the authoritative
+// account-day total that every cost calculation reads, and this table answers
+// "which campaign" without ever being summed into the same place. The two can
+// then be CROSS-CHECKED — a campaign total that does not reconcile to its
+// account-day total means a pull is incomplete, which is a fact worth knowing
+// and would be invisible if they shared a row.
+//
+// `channel` is nullable on purpose. Meta and Google spend usually drives the
+// D2C store, but a brand running Amazon-directed campaigns through Meta is
+// ordinary, and guessing would attribute a marketplace's cost to the website.
+// Null means "not attributable", and channel profitability reports it as
+// unallocated rather than spreading it.
+model AdCampaignSpend {
+  id                String   @id @default(cuid())
+  organizationId    String
+  legalEntityId     String
+  connectionId      String
+  provider          Provider // META_ADS or GOOGLE_ADS
+  externalAccountId String
+  date              DateTime // the day this spend covers, UTC midnight
+  /** The provider's own campaign id — stable across renames. */
+  campaignId        String
+  /** The campaign's name at pull time. Renamed campaigns keep their id. */
+  campaignName      String?
+  /** Sales channel this campaign drove, where the provider states it. Null = not attributable. */
+  channel           String?
+  spendAmount       BigInt // paise
+  impressions       Int?
+  clicks            Int?
+  /** Conversions the ad platform claims. Platform-attributed, NOT our order count — see modules/calc/campaigns.ts. */
+  conversions       Int?
+  /** Revenue the ad platform claims it drove, paise. Same caveat as conversions. */
+  attributedRevenue BigInt?
+  currency          String   @default("INR")
+  raw               Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([connectionId, externalAccountId, campaignId, date])
+  @@index([organizationId, legalEntityId])
+  @@index([organizationId, date])
+  @@index([campaignId])
+  @@map("ad_campaign_spend")
+}
+
 // First real inventory data source (Shopify's products.json — see
 // modules/connectors/shopify/index.ts's pullProducts()). Deliberately
 // current-state only, not a time series: each sync overwrites `variants`'

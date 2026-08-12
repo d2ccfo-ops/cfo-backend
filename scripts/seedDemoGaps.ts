@@ -184,6 +184,10 @@ async function purge(target: Target) {
   const payments = await prisma.payment.deleteMany({
     where: { organizationId: target.organizationId, connectionId: { in: marketplaceConnIds } },
   });
+  // Campaign rows are a split of the base seeder's account-day spend, so they
+  // belong to this script even though the connection does not.
+  const campaigns = await prisma.adCampaignSpend.deleteMany({ where: { organizationId: target.organizationId } });
+  if (campaigns.count > 0) console.log(`  · ${campaigns.count} campaign-day rows`);
 
   console.log(
     `purged: ${invoices.count} freight invoices, ${settlements.count} settlements, ` +
@@ -592,6 +596,112 @@ async function seedPackagingRate(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
+// 5. CAMPAIGN-GRAIN AD SPEND (data register D4)
+// ---------------------------------------------------------------------------
+// Ad spend arrives at account-day grain, so "which campaign is losing money"
+// has never been answerable. This splits each existing account-day row across
+// a stable set of campaigns.
+//
+// SPLIT, NOT ADDED. The campaign rows must sum to the account-day total they
+// came from, because that reconciliation is exactly what getCampaignProfitability
+// checks and reports on. Generating independent campaign spend would make the
+// demo permanently fail its own coverage check.
+//
+// Only some campaigns state a channel, which is the real situation: a Meta
+// prospecting campaign drives the store, the marketplace, and brand search
+// that converts three days later, and nothing in the data says which.
+async function seedCampaignSpend(target: Target) {
+  const existing = await prisma.adCampaignSpend.count({ where: { organizationId: target.organizationId } });
+  if (existing > 0) {
+    console.log(`  ${existing} campaign rows already present — skipping`);
+    return;
+  }
+
+  const accountDays = await prisma.adSpend.findMany({
+    where: { organizationId: target.organizationId },
+    select: {
+      connectionId: true, provider: true, externalAccountId: true, date: true,
+      spendAmount: true, impressions: true, clicks: true, currency: true,
+    },
+    orderBy: { date: "asc" },
+  });
+  if (accountDays.length === 0) {
+    console.log("  no ad spend to split — skipping");
+    return;
+  }
+
+  // Weights sum to 1 within each provider, so the split is exact.
+  const CAMPAIGNS = {
+    META_ADS: [
+      { id: "23851", name: "Prospecting — Broad IN", weight: 0.42, channel: null },
+      { id: "23852", name: "Retargeting — 30d viewers", weight: 0.24, channel: "shopify" },
+      { id: "23853", name: "Catalogue — Best sellers", weight: 0.19, channel: "shopify" },
+      { id: "23854", name: "Amazon listing traffic", weight: 0.15, channel: "amazon" },
+    ],
+    GOOGLE_ADS: [
+      { id: "GA-9041", name: "Brand — exact", weight: 0.31, channel: "shopify" },
+      { id: "GA-9042", name: "Shopping — all products", weight: 0.44, channel: null },
+      { id: "GA-9043", name: "Performance Max — IN", weight: 0.25, channel: null },
+    ],
+  } as const;
+
+  const rows: Prisma.AdCampaignSpendCreateManyInput[] = [];
+  for (const day of accountDays) {
+    const set = CAMPAIGNS[day.provider as keyof typeof CAMPAIGNS];
+    if (!set) continue;
+
+    // Distributed on integer paise with the remainder given to the last
+    // campaign, so the parts sum to the whole exactly rather than to within
+    // a rounding error that grows with the row count.
+    let assigned = 0n;
+    set.forEach((c, i) => {
+      const isLast = i === set.length - 1;
+      const share = isLast ? day.spendAmount - assigned : BigInt(Math.round(Number(day.spendAmount) * c.weight));
+      assigned += share;
+      const clicks = day.clicks === null ? null : Math.round(day.clicks * c.weight);
+      // The platform's claim, derived FROM a plausible ROAS rather than from a
+      // conversion rate times an assumed order value. Doing it the other way
+      // round produced a demo showing ROAS of 24, which no D2C brand has ever
+      // seen — 1.6–4.2 is the real range, and a demo that quotes an impossible
+      // number teaches a reader to ignore the field.
+      //
+      // Deliberately still generous relative to truth: Meta and Google both
+      // count the same purchase, which is exactly why the calc module reports
+      // these as the platform's numbers and never sums them into revenue.
+      const claimedRoas = between(1.6, 4.2);
+      const attributedMinor = BigInt(Math.round(Number(share) * claimedRoas));
+      const DEMO_AOV_RUPEES = 1_035;
+      const conversions = Math.max(0, Math.round(Number(attributedMinor) / 100 / DEMO_AOV_RUPEES));
+      rows.push({
+        organizationId: target.organizationId,
+        legalEntityId: target.legalEntityId,
+        connectionId: day.connectionId,
+        provider: day.provider,
+        externalAccountId: day.externalAccountId,
+        date: day.date,
+        campaignId: c.id,
+        campaignName: c.name,
+        channel: c.channel,
+        spendAmount: share,
+        impressions: day.impressions === null ? null : Math.round(day.impressions * c.weight),
+        clicks,
+        conversions,
+        attributedRevenue: attributedMinor,
+        currency: day.currency,
+        raw: { campaign_id: c.id, campaign_name: c.name, split_from: "account_day_total" },
+      });
+    });
+  }
+
+  for (let i = 0; i < rows.length; i += 500) {
+    await prisma.adCampaignSpend.createMany({ data: rows.slice(i, i + 500), skipDuplicates: true });
+  }
+
+  const withChannel = rows.filter((r) => r.channel !== null).length;
+  console.log(`  → ${rows.length} campaign-day rows across ${accountDays.length} account-days, ${withChannel} carrying a channel`);
+}
+
+// ---------------------------------------------------------------------------
 async function main() {
   if (!ORG_QUERY) {
     console.error('Usage: npx tsx scripts/seedDemoGaps.ts --org "DEMO — technox pvt ltd" [--purge]');
@@ -621,6 +731,9 @@ async function main() {
 
   console.log("\n[4] packaging rate");
   await seedPackagingRate(target);
+
+  console.log("\n[5] campaign-grain ad spend (D4)");
+  await seedCampaignSpend(target);
 
   console.log("\ndone.\n");
   await prisma.$disconnect();
