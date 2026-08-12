@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
+import { readSyncHealth } from "../../modules/sync/health.js";
+import { readDeadLetters } from "../../modules/sync/deadLetters.js";
 import { requireAuth } from "../../middleware/auth.js";
 import { writeAudit } from "../../lib/audit.js";
 import { claimAndEnqueueSync } from "../../modules/queue/syncQueue.js";
@@ -39,6 +41,24 @@ connectionsRouter.get("/", ...requireAuth, async (req, res) => {
       openingBalanceMinor: c.openingBalanceMinor == null ? null : c.openingBalanceMinor.toString(),
     })),
   });
+});
+
+// ---------------------------------------------------------------------------
+// GET /connections/health — the pattern across every connection (P5.5)
+// ---------------------------------------------------------------------------
+// Registered ABOVE the /:connectionId routes on purpose. Express matches in
+// definition order, and a literal segment that lives below a parameterised one
+// is a bug waiting for someone to add GET /:connectionId.
+//
+// What this answers that no single connection's status can: four consecutive
+// runs that fetched nothing, on a store that takes orders daily, is a dead
+// feed reporting success. syncStatus only ever describes the last attempt.
+connectionsRouter.get("/health", ...requireAuth, async (req, res) => {
+  const [connections, dlq] = await Promise.all([
+    readSyncHealth(req.auth!.organizationId),
+    readDeadLetters(req.auth!.organizationId),
+  ]);
+  res.json({ connections, deadLetters: dlq });
 });
 
 // Sets the balance anchor modules/calc/cash.ts's available-cash figure needs
@@ -170,4 +190,42 @@ connectionsRouter.get("/:connectionId/sync-status", ...requireAuth, async (req, 
     return;
   }
   res.json(connection);
+});
+
+// ---------------------------------------------------------------------------
+// GET /connections/:connectionId/runs — §26/§31 sync history (P5.5)
+// ---------------------------------------------------------------------------
+// Connection carries only the CURRENT sync state, every field overwritten by
+// the next run. "Failed four nights running" and "failed once last Tuesday"
+// are indistinguishable there, and only one of them is a dead feed.
+connectionsRouter.get("/:connectionId/runs", ...requireAuth, async (req, res) => {
+  const connection = await prisma.connection.findFirst({
+    where: { id: req.params.connectionId, organizationId: req.auth!.organizationId },
+    select: { id: true, provider: true },
+  });
+  // 404, not 403 — a valid id from another tenant must not be confirmed.
+  if (!connection) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+
+  const runs = await prisma.syncRun.findMany({
+    where: { connectionId: connection.id },
+    orderBy: { startedAt: "desc" },
+    take: 30,
+    select: {
+      id: true, trigger: true, status: true, recordsFetched: true,
+      cursor: true, error: true, startedAt: true, finishedAt: true, durationMs: true,
+    },
+  });
+
+  res.json({
+    connectionId: connection.id,
+    provider: connection.provider,
+    runs: runs.map((r) => ({
+      ...r,
+      startedAt: r.startedAt.toISOString(),
+      finishedAt: r.finishedAt?.toISOString() ?? null,
+    })),
+  });
 });

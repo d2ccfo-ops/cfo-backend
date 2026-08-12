@@ -5,6 +5,20 @@ import { redisConnection } from "../../lib/redis.js";
 
 export interface SyncJobData {
   connectionId: string;
+  /**
+   * Why this run was enqueued (P5.5). Recorded on the SyncRun row so a
+   * founder reading the history can tell a nightly pass from a repair pass
+   * from someone pressing the button — three things that produce identical
+   * rows otherwise, and only one of which is worth investigating when it
+   * fails at 02:00.
+   */
+  trigger?: "MANUAL" | "SCHEDULED" | "REPAIR" | "BACKFILL";
+  /**
+   * §12.4 repair window. When set, the connector re-pulls from this many days
+   * ago regardless of the stored cursor — the only way an edit made to an
+   * order after its last sync, whose webhook was missed, ever gets corrected.
+   */
+  repairWindowDays?: number;
 }
 
 // One queue, shared by every provider — the job payload is just a
@@ -44,10 +58,10 @@ export const syncQueue = new Queue<SyncJobData>("connection-sync", {
 // `updateMany(... syncStatus: { in: ["IDLE", "FAILED"] } ...)` guard, which
 // runs *before* this is ever called, so by the time we get here the caller
 // has already confirmed no sync is in flight for this connection.
-export function enqueueSync(connectionId: string) {
+export function enqueueSync(connectionId: string, opts: Omit<SyncJobData, "connectionId"> = {}) {
   // BullMQ uses ":" as its own Redis key separator and rejects custom job
   // ids containing one — "-" instead.
-  return syncQueue.add("sync", { connectionId }, { jobId: `${connectionId}-${randomUUID()}` });
+  return syncQueue.add("sync", { connectionId, ...opts }, { jobId: `${connectionId}-${randomUUID()}` });
 }
 
 // The claim-then-enqueue transition, in ONE place because there are now two
@@ -60,7 +74,10 @@ export function enqueueSync(connectionId: string) {
 // Returns false when the connection was already in flight. On a Redis failure
 // the QUEUED flag is rolled back — otherwise the guard above would keep
 // blocking this connection forever, wedging it with no way back to IDLE.
-export async function claimAndEnqueueSync(connectionId: string): Promise<boolean> {
+export async function claimAndEnqueueSync(
+  connectionId: string,
+  opts: Omit<SyncJobData, "connectionId"> = {}
+): Promise<boolean> {
   const claimed = await prisma.connection.updateMany({
     where: { id: connectionId, syncStatus: { in: ["IDLE", "FAILED"] } },
     data: { syncStatus: "QUEUED", lastSyncError: null, syncProgressCurrent: null, syncProgressTotal: null },
@@ -68,7 +85,7 @@ export async function claimAndEnqueueSync(connectionId: string): Promise<boolean
   if (claimed.count === 0) return false;
 
   try {
-    await enqueueSync(connectionId);
+    await enqueueSync(connectionId, opts);
     return true;
   } catch (err) {
     await prisma.connection

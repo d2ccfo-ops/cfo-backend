@@ -71,6 +71,32 @@ async function processSyncJob(job: Job<SyncJobData>) {
     data: { syncStatus: "SYNCING", syncStartedAt: new Date(), syncProgressCurrent: null, syncProgressTotal: null },
   });
 
+  // P5.5 (§26/§31). One row per attempt. Connection carries only the CURRENT
+  // state — every field overwritten by the next run — so "failed four nights
+  // running" and "failed once last Tuesday" look identical there, and the
+  // second is noise while the first is a dead feed.
+  // §12.4 repair: rewind the cursor by the requested window rather than
+  // resuming from the last sync. A Shopify order edited after we last saw it
+  // — a refund keyed in by hand, a cancelled line — only ever reaches this
+  // system through a webhook, and a missed webhook is silent and permanent.
+  // Re-pulling the trailing window is the only correction that exists.
+  const repairFrom =
+    job.data.repairWindowDays && job.data.repairWindowDays > 0
+      ? new Date(Date.now() - job.data.repairWindowDays * 86_400_000)
+      : null;
+  const startCursor = cursorFor(connection.provider, repairFrom ?? connection.lastSyncedAt);
+  const run = await prisma.syncRun.create({
+    data: {
+      organizationId: connection.organizationId,
+      connectionId,
+      provider: connection.provider,
+      trigger: (job.data.trigger as never) ?? "SCHEDULED",
+      status: "RUNNING",
+      cursor: startCursor,
+    },
+  });
+  const startedAtMs = Date.now();
+
   const ctx = toConnectorContext(connection);
   // Real progress, not a fake spinner — see modules/connectors/types.ts's
   // ConnectorContext.reportProgress. Only Shopify calls this today; every
@@ -89,7 +115,40 @@ async function processSyncJob(job: Job<SyncJobData>) {
     }
   };
 
-  const result = await connector.sync(ctx, cursorFor(connection.provider, connection.lastSyncedAt));
+  let result: Awaited<ReturnType<typeof connector.sync>>;
+  try {
+    result = await connector.sync(ctx, startCursor);
+  } catch (err) {
+    // Recorded before rethrowing, so a failed attempt leaves a row. The
+    // worker's `failed` handler runs only after BullMQ gives up entirely —
+    // without this, the intermediate attempts would be invisible and a
+    // connector that fails twice then succeeds would look clean.
+    await prisma.syncRun
+      .update({
+        where: { id: run.id },
+        data: {
+          status: "FAILED",
+          error: (err instanceof Error ? err.message : String(err)).slice(0, 500),
+          finishedAt: new Date(),
+          durationMs: Date.now() - startedAtMs,
+        },
+      })
+      .catch(() => {});
+    throw err;
+  }
+
+  await prisma.syncRun.update({
+    where: { id: run.id },
+    data: {
+      // EMPTY, not SUCCEEDED. A run that completes and pulls nothing is the
+      // signature of a credential the provider still answers 200 to, and
+      // nothing else in this system would notice it.
+      status: result.recordsFetched === 0 ? "EMPTY" : "SUCCEEDED",
+      recordsFetched: result.recordsFetched,
+      finishedAt: new Date(),
+      durationMs: Date.now() - startedAtMs,
+    },
+  });
 
   await prisma.connection.update({
     where: { id: connectionId },

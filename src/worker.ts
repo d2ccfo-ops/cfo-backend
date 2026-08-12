@@ -4,6 +4,7 @@ import { redisConnection } from "./lib/redis.js";
 import { aiBriefSchedulerQueue, startAiBriefScheduler } from "./modules/queue/aiBriefScheduler.js";
 import { anomalySchedulerQueue, startAnomalyScheduler } from "./modules/queue/anomalyScheduler.js";
 import { notificationSchedulerQueue, startNotificationScheduler } from "./modules/queue/notificationScheduler.js";
+import { repairSchedulerQueue, startRepairScheduler } from "./modules/queue/repairScheduler.js";
 import { snapshotSchedulerQueue, startSnapshotScheduler } from "./modules/queue/snapshotScheduler.js";
 import { startSyncScheduler, syncSchedulerQueue } from "./modules/queue/syncScheduler.js";
 import { startSyncWorker } from "./modules/queue/syncWorker.js";
@@ -40,6 +41,10 @@ const notificationScheduler = startNotificationScheduler();
 // snapshot capture wrote thirty minutes earlier, so running it any earlier
 // would have it describe the day before yesterday while claiming yesterday.
 const aiBriefScheduler = startAiBriefScheduler();
+// §12.4's trailing-window repair, at 01:30 — BEFORE the 02:05 snapshot
+// capture, deliberately. The snapshot should record the corrected belief
+// about yesterday, not the one repair exists to fix.
+const repairScheduler = startRepairScheduler();
 
 // Re-entrancy guard. Without it a second signal — or the same signal delivered
 // to both the `tsx watch` wrapper and this child, which is what happens on
@@ -66,6 +71,8 @@ async function shutdown(signal: string) {
     await notificationSchedulerQueue.close();
     await aiBriefScheduler.close();
     await aiBriefSchedulerQueue.close();
+    await repairScheduler.close();
+    await repairSchedulerQueue.close();
     await worker.close();
     await redisConnection.quit();
     await prisma.$disconnect();

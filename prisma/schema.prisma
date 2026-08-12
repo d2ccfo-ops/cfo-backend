@@ -227,6 +227,8 @@ model Connection {
   @@index([organizationId])
   @@index([legalEntityId])
   @@map("connections")
+
+  syncRuns SyncRun[]
 }
 
 enum ProcessingStatus {
@@ -1400,6 +1402,66 @@ enum ApprovalActionType {
   // Anything a later consumer adds. Present so a new action type is a code
   // change rather than a migration.
   OTHER
+}
+
+// §26/§31 sync history (P5.5).
+//
+// Connection carries the CURRENT sync state — status, last error, last synced
+// at — and that is all it can carry: each field is overwritten by the next
+// run. So "this connector has failed four nights running" and "it failed once
+// last Tuesday" look identical, and the second is noise while the first is a
+// dead feed. The whole point of a per-run row is that the pattern survives.
+//
+// Also the only place the SHAPE of a sync is recorded: how many records it
+// pulled. A run that succeeds and pulls zero records is the signature of an
+// expired credential that the provider answers 200 to, and nothing else in
+// this system would notice it.
+enum SyncRunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  // Ran, completed, and pulled nothing at all. Not a failure — a store with
+  // no orders yesterday is a real thing — but distinct from SUCCEEDED so a
+  // run of empty nights is visible as a run of empty nights.
+  EMPTY
+}
+
+enum SyncTrigger {
+  // Someone pressed Sync now.
+  MANUAL
+  // The cadence scheduler.
+  SCHEDULED
+  // The §12.4 trailing-window repair pass.
+  REPAIR
+  // First pull after connecting.
+  BACKFILL
+}
+
+model SyncRun {
+  id             String        @id @default(cuid())
+  organizationId String
+  connectionId   String
+  provider       Provider
+  trigger        SyncTrigger   @default(SCHEDULED)
+  status         SyncRunStatus @default(RUNNING)
+  // What the connector said it fetched. Nullable because a failed run does
+  // not know, and 0 is a different fact from "unknown".
+  recordsFetched Int?
+  recordsWritten Int?
+  // The cursor this run started from, verbatim. The single most useful field
+  // when a sync silently stops advancing: a cursor that never moves explains
+  // an empty run that reports success.
+  cursor         String?
+  error          String?
+  startedAt      DateTime      @default(now())
+  finishedAt     DateTime?
+  durationMs     Int?
+
+  connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, startedAt])
+  @@index([connectionId, startedAt])
+  @@map("sync_runs")
 }
 
 model ApprovalRequest {
