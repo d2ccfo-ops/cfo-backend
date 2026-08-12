@@ -147,23 +147,33 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
   // levers (codShare, rto) act on the day's PROJECTED inflow as a whole,
   // scaled by the share they would affect. Stated in `appliedLevers` rather
   // than silently approximated.
-  const totalOutflowBefore = base.days.reduce((a, d) => a + BigInt(d.outflowMinor), 0n);
-  const hasOutflow = totalOutflowBefore > 0n;
   const hasProjected = base.days.some((d) => BigInt(d.inflowFromProjectedOrdersMinor) > 0n);
   const hasPlaced = base.days.some((d) => BigInt(d.inflowFromPlacedOrdersMinor) > 0n);
 
   // --- Step 1: per-day inflow/outflow adjustments -------------------------
+  // Outflow is tracked in its three parts, not as one number, because the
+  // levers act on different ones: ad spend scales the run-rate, a vendor delay
+  // re-times bills, and the recurring schedule (P2.2e) moves for neither —
+  // payroll is not deferrable by asking, and it is not an advertising decision.
   interface Working {
     date: string;
     placed: bigint;
     projected: bigint;
-    outflow: bigint;
+    bills: bigint;
+    schedule: bigint;
+    runRate: bigint;
+    /** One-off scenario spending that belongs to no base component. */
+    extra: bigint;
   }
+  const outflowOf = (w: Working) => w.bills + w.schedule + w.runRate + w.extra;
   let working: Working[] = base.days.map((d) => ({
     date: d.date,
     placed: BigInt(d.inflowFromPlacedOrdersMinor),
     projected: BigInt(d.inflowFromProjectedOrdersMinor),
-    outflow: BigInt(d.outflowMinor),
+    bills: BigInt(d.outflowFromBillsMinor),
+    schedule: BigInt(d.outflowFromScheduleMinor),
+    runRate: BigInt(d.outflowFromRunRateMinor),
+    extra: 0n,
   }));
 
   // Growth acts ONLY on projected inflow. Orders already placed are a fact;
@@ -187,13 +197,14 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
     working = working.map((w) => ({ ...w, projected: w.projected - pointsOf(w.projected, params.rtoDeltaPct!) }));
   }
 
-  // Ad spend moves the outflow run-rate. It is a % of the ads component, not
-  // of total outflow — raising ad spend 50% must not also raise rent 50%.
-  const adComponent = base.components.find((c) => c.key === "outflow_run_rate");
-  const adRunRateTotal = adComponent ? BigInt(adComponent.valueMinor) : 0n;
-  if (params.adSpendDeltaPct != null && adRunRateTotal > 0n && working.length > 0) {
-    const perDayDelta = (applyPct(adRunRateTotal, params.adSpendDeltaPct) - adRunRateTotal) / BigInt(working.length);
-    working = working.map((w) => ({ ...w, outflow: w.outflow + perDayDelta }));
+  // Ad spend moves the outflow run-rate. It is a % of the run-rate component,
+  // not of total outflow — raising ad spend 50% must not also raise rent 50%.
+  // Now applied to each day's own run-rate figure rather than to a total
+  // spread back across days: P2.2e made the per-day split available, and the
+  // run-rate is flat anyway, so this is exact.
+  const adRunRateTotal = working.reduce((a, w) => a + w.runRate, 0n);
+  if (params.adSpendDeltaPct != null && adRunRateTotal > 0n) {
+    working = working.map((w) => ({ ...w, runRate: applyPct(w.runRate, params.adSpendDeltaPct!) }));
   }
 
   // --- Step 2: re-timing levers ------------------------------------------
@@ -213,33 +224,25 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
     working = working.map((w) => ({ ...w, placed: moved.get(w.date) ?? 0n }));
   }
 
-  // Vendor payment delay moves BILL outflow later. The run-rate half of
-  // outflow is rent/ads/payroll — not a thing you can defer by asking — so
-  // only the bills component is shifted.
-  const billComponent = base.components.find((c) => c.key === "outflow_vendor_bills");
-  const billTotal = billComponent ? BigInt(billComponent.valueMinor) : 0n;
+  // Vendor payment delay moves BILL outflow later, and ONLY bill outflow.
+  //
+  // This used to infer the bill part of a day as "whatever exceeds the flat
+  // run-rate", because the base response carried no per-day split. That was a
+  // declared approximation, and P2.2e turned it into a real bug: a scheduled
+  // ₹4L payroll makes a day lumpy, and the inference would have happily
+  // deferred someone's salary by 30 days on the strength of it. The base now
+  // carries the split, so the shift is exact and touches nothing else.
+  const billTotal = working.reduce((a, w) => a + w.bills, 0n);
   if (params.vendorPaymentDelayDays != null && params.vendorPaymentDelayDays !== 0 && billTotal > 0n) {
-    // Per-day bill amounts are not in the base response, so the shift is
-    // applied to the bill TOTAL as a block: removed from where the base put
-    // it (spread across the days that carry outflow above the run-rate) and
-    // re-landed `n` days later. Declared as an approximation in appliedLevers.
-    const runRatePerDay = working.length > 0 ? (totalOutflowBefore - billTotal) / BigInt(working.length) : 0n;
-    const billByDate = new Map<string, bigint>();
-    for (const w of working) {
-      const billPart = w.outflow - runRatePerDay;
-      if (billPart > 0n) billByDate.set(w.date, billPart);
-    }
     const shifted = new Map<string, bigint>();
-    for (const [date, amount] of billByDate) {
-      const target = addZonedDays(date, params.vendorPaymentDelayDays);
+    for (const w of working) {
+      if (w.bills === 0n) continue;
+      const target = addZonedDays(w.date, params.vendorPaymentDelayDays);
       // A bill pushed past the horizon leaves the window — that IS the
       // scenario ("pay it next quarter"), not a rounding loss.
-      if (working.some((w) => w.date === target)) shifted.set(target, (shifted.get(target) ?? 0n) + amount);
+      if (working.some((x) => x.date === target)) shifted.set(target, (shifted.get(target) ?? 0n) + w.bills);
     }
-    working = working.map((w) => ({
-      ...w,
-      outflow: runRatePerDay + (shifted.get(w.date) ?? 0n),
-    }));
+    working = working.map((w) => ({ ...w, bills: shifted.get(w.date) ?? 0n }));
   }
 
   // A one-off purchase is a single outflow on a named day. Outside the
@@ -251,7 +254,7 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
     working = working.map((w) => {
       if (w.date !== date) return w;
       inventoryApplied = true;
-      return { ...w, outflow: w.outflow + BigInt(amountPaise) };
+      return { ...w, extra: w.extra + BigInt(amountPaise) };
     });
   }
 
@@ -272,7 +275,15 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
     const placed = w.placed < 0n ? 0n : w.placed;
     const projected = w.projected < 0n ? 0n : w.projected;
     const inflow = placed + projected;
-    const outflow = w.outflow < 0n ? 0n : w.outflow;
+    // Each part floors independently, then sums. Flooring only the total would
+    // let a negative run-rate (ad spend cut past −100%, which normaliseParams
+    // already prevents, but the invariant should not depend on that) cancel a
+    // real bill and hide money that is genuinely leaving.
+    const bills = w.bills < 0n ? 0n : w.bills;
+    const scheduleOut = w.schedule < 0n ? 0n : w.schedule;
+    const runRate = w.runRate < 0n ? 0n : w.runRate;
+    const extra = w.extra < 0n ? 0n : w.extra;
+    const outflow = bills + scheduleOut + runRate + extra;
 
     const openingOfDay = running;
     running = openingOfDay + inflow - outflow;
@@ -294,6 +305,13 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
       closingMinor: running.toString(),
       inflowFromPlacedOrdersMinor: placed.toString(),
       inflowFromProjectedOrdersMinor: projected.toString(),
+      outflowFromBillsMinor: bills.toString(),
+      outflowFromScheduleMinor: scheduleOut.toString(),
+      // The one-off purchase rides here rather than getting a fourth field:
+      // it IS operating outflow for the day, and adding a field to ForecastDay
+      // that only a scenario can ever populate would make the base and
+      // scenario shapes diverge for no reader's benefit.
+      outflowFromRunRateMinor: (runRate + extra).toString(),
     });
   }
 
@@ -311,7 +329,13 @@ export function applyScenario(base: CashForecast, rawParams: ScenarioParams): Ca
   );
   lever("adSpendDeltaPct", adRunRateTotal > 0n, adRunRateTotal > 0n ? "Applied to the measured ads and operating run-rate." : "No ads or expense data connected, so there is no run-rate to change.");
   lever("collectionAccelDays", hasPlaced, hasPlaced ? "Re-timed inflow from orders already placed." : "No inflow from already-placed orders inside this horizon to re-time.");
-  lever("vendorPaymentDelayDays", billTotal > 0n, billTotal > 0n ? "Bill outflow shifted as a block; per-day bill amounts are not carried on the base response, so this is approximate within the horizon." : "No vendor bills due inside this horizon.");
+  lever(
+    "vendorPaymentDelayDays",
+    billTotal > 0n,
+    billTotal > 0n
+      ? "Each bill re-timed on its own due date. Payroll, rent and other scheduled fixed costs are deliberately not moved — they are not deferrable by asking a supplier."
+      : "No vendor bills due inside this horizon."
+  );
   lever("inventoryPurchase", inventoryApplied, inventoryApplied ? "Applied as a one-off outflow on the named day." : "The purchase date falls outside this horizon, so it is not shown. Nothing was clamped onto an adjacent day.");
 
   const warnings = [...(base.reliability === "inflows_only" ? ["The base forecast has no outflow source connected, so no scenario built on it is a cash balance."] : [])];

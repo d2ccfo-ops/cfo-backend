@@ -1,8 +1,10 @@
 import { Prisma } from "@prisma/client";
 import { addZonedDays, DEFAULT_TIMEZONE, startOfZonedDay, zonedDayKey } from "../../lib/dateRange.js";
 import { prisma } from "../../lib/prisma.js";
-import { paiseToRupees } from "./money.js";
+import { getOrgSettings } from "../orgs/settings.js";
+import { formatInr, paiseToRupees } from "./money.js";
 import { getAvailableCashSummary } from "./cash.js";
+import { expandSchedule } from "./recurringOutflows.js";
 
 // Cash forecast over a 7, 30 or 90-day horizon (§16).
 //
@@ -36,12 +38,21 @@ import { getAvailableCashSummary } from "./cash.js";
 // With none of those, outflow is not "zero" — it is UNKNOWN, and a projection
 // that quietly treats unknown as zero draws a line that rises forever. That
 // distinction is the whole reason `reliability` exists below.
+//
+// Outflow has three parts, and P2.2e made the split explicit on every day:
+//   - vendor bills:  a dated amount from a real unpaid bill
+//   - recurring schedule: payroll/rent/EMI on the day the founder says they
+//     leave (P2.2e), because a month of rent is a DATE, not a rate
+//   - run-rate:      everything else, smeared evenly from measured history
+// They are carried separately because they behave differently under a
+// scenario: a bill can be deferred by asking, payroll cannot.
 
-// v2: the horizon became a parameter and the response gained
-// lowestBalance/cashShortageDate/projectedInflowSharePct. v1 snapshots stay
-// as they are (§92) — the 30-day numbers themselves are unchanged, so this
-// is an additive version bump, not a restatement.
-export const CASH_FORECAST_VERSION = "v2";
+// v3: every ForecastDay now carries its outflow split three ways
+// (bills / recurring schedule / run-rate), and the recurring schedule from
+// P2.2e participates in the walk. Additive on the response — no existing field
+// changed meaning — but the day shape grew, so v2 readers stay valid and v2
+// snapshots stay as they are (§92).
+export const CASH_FORECAST_VERSION = "v3";
 
 // The three §16 horizons. A closed set rather than a free integer: each one
 // is a different QUESTION (this week's squeeze, this month's plan, this
@@ -103,6 +114,19 @@ export interface ForecastDay {
   /** Split so a reader can see how much of a day is real vs projected. */
   inflowFromPlacedOrdersMinor: string;
   inflowFromProjectedOrdersMinor: string;
+  /**
+   * Outflow split three ways, summing to outflowMinor.
+   *
+   * Carried per-day rather than as a total because the scenario engine has to
+   * tell them apart: `vendorPaymentDelayDays` moves bills and must not move
+   * payroll. Before this existed the scenario inferred "bill" as whatever
+   * exceeded the flat run-rate on a day — which was a documented
+   * approximation, and became an outright bug the moment a scheduled ₹4L
+   * salary made a day lumpy.
+   */
+  outflowFromBillsMinor: string;
+  outflowFromScheduleMinor: string;
+  outflowFromRunRateMinor: string;
 }
 
 export interface CashForecast {
@@ -310,11 +334,36 @@ export async function getCashForecast(
   // schedule — it makes no claim about WHICH day rent leaves the account, only
   // that a month of operating cost does.
   const historyDays = BigInt(Math.max(1, SEASONALITY_WINDOW_DAYS));
-  const dailyExpenseRunRate = (recentExpenses._sum.amount ?? 0n) / historyDays;
+  const measuredExpenseRunRate = (recentExpenses._sum.amount ?? 0n) / historyDays;
   const dailyAdRunRate = (adSpendRows._sum.spendAmount ?? 0n) / historyDays;
   const hasExpenseData = recentExpenses._count._all > 0;
   const hasAdData = adSpendRows._count._all > 0;
   const hasBillData = bills.length > 0;
+
+  // --- P2.2e: the fixed costs that leave on a date, not as a rate ---------
+  const settings = await getOrgSettings(organizationId);
+  const schedule = expandSchedule(settings.recurringOutflows ?? [], today, zonedDayKey(horizonEnd, timeZone));
+  const hasSchedule = (settings.recurringOutflows ?? []).length > 0;
+
+  // The double-counting problem, and the reason this is a subtraction rather
+  // than an addition.
+  //
+  // A founder whose accounting is connected ALREADY has payroll and rent in
+  // `Expense`, so they are already inside measuredExpenseRunRate — smeared
+  // across every day. Adding a schedule on top would charge the same salary
+  // twice and make the forecast worse than before P2.2e. So the schedule's
+  // typical-month cost is REMOVED from the run-rate and re-placed on its real
+  // days: the monthly total is preserved, only its timing sharpens.
+  //
+  // Floored at zero. If a founder schedules more than their measured expenses
+  // (common — they pay salary from a personal account, or the books are
+  // incomplete), the run-rate simply goes to zero rather than negative, and
+  // the displaced figure below reports how much of the schedule the run-rate
+  // could not account for.
+  const dailyScheduleEquivalent = schedule.monthlyEquivalentPaise / 30n;
+  const dailyExpenseRunRate =
+    measuredExpenseRunRate > dailyScheduleEquivalent ? measuredExpenseRunRate - dailyScheduleEquivalent : 0n;
+  const displacedRunRatePerDay = measuredExpenseRunRate - dailyExpenseRunRate;
 
   // --- Walk the horizon -------------------------------------------------
   const days: ForecastDay[] = [];
@@ -324,6 +373,7 @@ export async function getCashForecast(
   let totalPlaced = 0n;
   let totalProjected = 0n;
   let totalBills = 0n;
+  let totalSchedule = 0n;
   let totalRunRate = 0n;
   // Seeded from the opening balance, not from the first projected day: if
   // today's balance is already the lowest point the horizon ever sees, that
@@ -361,8 +411,9 @@ export async function getCashForecast(
     const inflow = placed + projected;
 
     const billOutflow = billsByDay.get(day) ?? 0n;
+    const scheduleOutflow = schedule.byDay.get(day) ?? 0n;
     const runRateOutflow = dailyExpenseRunRate + dailyAdRunRate;
-    const outflow = billOutflow + runRateOutflow;
+    const outflow = billOutflow + scheduleOutflow + runRateOutflow;
 
     const opening = running;
     running = opening + inflow - outflow;
@@ -372,6 +423,7 @@ export async function getCashForecast(
     totalPlaced += placed;
     totalProjected += projected;
     totalBills += billOutflow;
+    totalSchedule += scheduleOutflow;
     totalRunRate += runRateOutflow;
 
     if (running < lowestBalance) {
@@ -390,11 +442,26 @@ export async function getCashForecast(
       closingMinor: running.toString(),
       inflowFromPlacedOrdersMinor: placed.toString(),
       inflowFromProjectedOrdersMinor: projected.toString(),
+      outflowFromBillsMinor: billOutflow.toString(),
+      outflowFromScheduleMinor: scheduleOutflow.toString(),
+      outflowFromRunRateMinor: runRateOutflow.toString(),
     });
   }
 
   // --- Coverage ---------------------------------------------------------
   const hasRtoData = (await prisma.shipment.count({ where: { organizationId } })) > 0;
+
+  const scheduleCount = (settings.recurringOutflows ?? []).length;
+  const scheduleNote =
+    `${scheduleCount} configured cost${scheduleCount === 1 ? "" : "s"}, placed on the day each is actually paid.` +
+    (displacedRunRatePerDay > 0n
+      ? ` ${formatInr(displacedRunRatePerDay * 30n)} a month of this was already inside the measured expense run-rate and has been removed from it, so nothing is counted twice.`
+      : hasExpenseData
+        ? " None of it was found in the measured expense run-rate, so it is added on top — check that these costs are not also in your accounting feed under another name."
+        : "") +
+    (schedule.clampedLabels.length > 0
+      ? ` ${schedule.clampedLabels.join(", ")} fall${schedule.clampedLabels.length === 1 ? "s" : ""} on a day the month does not have and land on its last day instead.`
+      : "");
 
   const components: ComponentCoverage[] = [
     {
@@ -441,21 +508,40 @@ export async function getCashForecast(
         : "No accounting connection, so scheduled vendor payments are unknown.",
     },
     {
+      key: "outflow_recurring_schedule",
+      label: "Payroll, rent and other fixed costs",
+      // "assumed" rather than "measured": a founder typed these. They are far
+      // better than nothing — and better than a smear — but nothing verified
+      // them against a bank debit, and §42.8 does not let a typed figure wear
+      // the same badge as an ingested one.
+      basis: hasSchedule ? "assumed" : "unavailable",
+      valueMinor: totalSchedule.toString(),
+      note: !hasSchedule
+        ? "No recurring-cost schedule configured. Salary, rent and EMI leave the account on fixed dates; without them this projection shows the days they happen as no worse than any other."
+        : scheduleNote,
+    },
+    {
       key: "outflow_run_rate",
       label: "Operating spend and ads",
       basis: hasExpenseData || hasAdData ? "measured" : "unavailable",
       valueMinor: totalRunRate.toString(),
       note:
         hasExpenseData || hasAdData
-          ? "Daily run-rate from measured spend over the trailing period. A rate, not a payment schedule."
-          : "No accounting or ads connection, so payroll, rent, GST and ad spend are all missing from this projection.",
+          ? displacedRunRatePerDay > 0n
+            ? `Daily run-rate from measured spend, less ${formatInr(displacedRunRatePerDay * 30n)} a month already covered by the recurring schedule above — counted once, on its real dates, instead of twice.`
+            : "Daily run-rate from measured spend over the trailing period. A rate, not a payment schedule."
+          : "No accounting or ads connection, so ad spend and ad-hoc operating costs are missing from this projection.",
     },
   ];
 
-  const hasAnyOutflow = hasBillData || hasExpenseData || hasAdData;
+  // A configured schedule counts as an outflow source in its own right. For an
+  // org with no accounting connection it is the ONLY one — and a forecast that
+  // knows ₹4L of payroll leaves on the 1st is emphatically not "inflows only",
+  // which is the badge that tells a reader the line is not a balance at all.
+  const hasAnyOutflow = hasBillData || hasExpenseData || hasAdData || hasSchedule;
   const reliability = !hasAnyOutflow
     ? ("inflows_only" as const)
-    : hasBillData && (hasExpenseData || hasAdData) && hasOpeningBalance
+    : (hasBillData || hasSchedule) && (hasExpenseData || hasAdData || hasSchedule) && hasOpeningBalance
       ? ("usable" as const)
       : ("directional" as const);
 
@@ -484,7 +570,22 @@ export async function getCashForecast(
         ? ` Over ${horizonDays} days, ${projectedInflowSharePct}% of projected inflow comes from orders not yet placed.`
         : ` Most inflow over these ${horizonDays} days comes from orders already placed.`;
 
-  const reliabilityNote = baseNote + horizonNote;
+  // P2.2e's missing-schedule warning, and it is scoped to 30- and 90-day
+  // horizons on purpose. Over 7 days a fixed cost either falls inside the
+  // window or it doesn't, and a founder can see for themselves. Over 30 or 90
+  // days payroll lands one or three times for certain — so a line without a
+  // schedule is not merely imprecise, it is missing a known, dated, and
+  // usually the largest single outflow the business has. The two cases are
+  // worded differently because they are different failures: nothing at all,
+  // versus a real total smeared into a shape that hides the squeeze.
+  const scheduleWarning =
+    hasSchedule || horizonDays < 30
+      ? ""
+      : hasExpenseData
+        ? ` No recurring-cost schedule is configured, so payroll, rent and EMI enter this ${horizonDays}-day line only as a flat daily rate. The monthly total is about right; the days they actually leave the account are not, so a squeeze around a pay date will not show up here.`
+        : ` No recurring-cost schedule is configured and no accounting is connected, so payroll, rent, EMI and tax appear NOWHERE in this ${horizonDays}-day projection. Add them in Settings before reading this line as a runway.`;
+
+  const reliabilityNote = baseNote + horizonNote + scheduleWarning;
 
   return {
     version: CASH_FORECAST_VERSION,

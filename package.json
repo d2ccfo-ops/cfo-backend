@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run && tsc --noEmit",
     "test:watch": "vitest",
-    "check:integration": "for f in scripts/check*.ts; do echo \"--- $f ---\"; npx tsx \"$f\" || exit 1; done",
+    "check:integration": "failed=\"\"; for f in scripts/check*.ts; do echo \"--- $f ---\"; npx tsx \"$f\" || failed=\"$failed $f\"; done; if [ -n \"$failed\" ]; then echo; echo \"FAILED SCRIPTS:$failed\"; exit 1; fi; echo; echo \"all integration checks passed\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio"
