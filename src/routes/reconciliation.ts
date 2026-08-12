@@ -1,5 +1,6 @@
 import { Router } from "express";
-import { Prisma } from "@prisma/client";
+import { Prisma, MatchType } from "@prisma/client";
+import { buildCodDataStatus, buildSettlementDataStatus } from "../modules/calc/dataStatus.js";
 import { prisma } from "../lib/prisma.js";
 import { describeRange, withDateRange, type ResolvedRange } from "../lib/dateRange.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -354,6 +355,10 @@ reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, 
       earliest: statementCoverage._min.settledAt?.toISOString() ?? null,
       latest: statementCoverage._max.settledAt?.toISOString() ?? null,
     },
+    // §28 status labels for the two figure families this summary carries.
+    // Derived from the legs already loaded above — no extra queries.
+    codDataStatus: buildCodDataStatus(legs.find((l) => l.matchType === MatchType.COD_REMITTANCE)),
+    settlementDataStatus: buildSettlementDataStatus(legs.find((l) => l.matchType === MatchType.SETTLEMENT_BANK)),
     // What the imported freight invoices cover, including the part the leg
     // cannot express: lines billed for waybills that match no shipment at all.
     freight: {

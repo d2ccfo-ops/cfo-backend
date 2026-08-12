@@ -199,6 +199,54 @@ export function buildDataStatusMap(i: DataStatusInputs): Record<MaterialMetricKe
 }
 
 // ---------------------------------------------------------------------------
+// Leg-derived statuses for the reconciliation summary
+// ---------------------------------------------------------------------------
+
+type LegLike = {
+  state: string;
+  blockedReason?: string;
+  matchedValue: bigint;
+  unmatchedValue: bigint;
+};
+
+// COD figures are courier-reported until a remittance ties them to money in
+// the bank; settlement figures are gateway-reported until a bank credit does
+// the same. Both climb the same ladder, so one classifier serves both — only
+// the words differ.
+function legStatus(
+  leg: LegLike | undefined,
+  wording: { subject: string; verifier: string; fallback: string }
+): MetricDataStatus {
+  const pct = legMatchedPct(leg);
+  if (pct === null) {
+    return { status: "provisional", reasons: [leg?.blockedReason ?? wording.fallback] };
+  }
+  if (pct >= RECONCILED_MIN_PCT) {
+    return { status: "reconciled", reasons: [`${pctLabel(pct)} of ${wording.subject} is traced to ${wording.verifier}.`] };
+  }
+  return {
+    status: "provisional",
+    reasons: [`Only ${pctLabel(pct)} of ${wording.subject} is traced to ${wording.verifier} — the rest is reported, not verified.`],
+  };
+}
+
+export function buildCodDataStatus(leg: LegLike | undefined): MetricDataStatus {
+  return legStatus(leg, {
+    subject: "delivered COD value",
+    verifier: "a courier remittance",
+    fallback: "COD figures are courier-reported — no remittance statement verifies the money actually arrived.",
+  });
+}
+
+export function buildSettlementDataStatus(leg: LegLike | undefined): MetricDataStatus {
+  return legStatus(leg, {
+    subject: "settlement value",
+    verifier: "a bank credit",
+    fallback: "Settlement figures are gateway-reported — no bank statement verifies the payouts landed.",
+  });
+}
+
+// ---------------------------------------------------------------------------
 // DB wrapper
 // ---------------------------------------------------------------------------
 
