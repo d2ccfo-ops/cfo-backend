@@ -33,14 +33,29 @@ async function main() {
     appSecret: string;
   };
 
+  // ---------------------------------------------------------------------------
+  // THE SECRET IS NOT PRINTED. IT IS READ FROM THE ENVIRONMENT AT RUN TIME.
+  // ---------------------------------------------------------------------------
+  // This used to interpolate c.appSecret directly into the curl line, so the
+  // merchant's live GoKwik credential landed in terminal scrollback, shell
+  // history, and any transcript of a debugging session — including one pasted
+  // into a chat to ask why the call was failing.
+  //
+  // The emitted command references $GOKWIK_APPSECRET instead. Whoever runs it
+  // exports the value themselves, which is the same rule this project already
+  // applies everywhere else: debug output prints SHAPES, never values.
   const url = `${HOST}/v1/order/list?mid=${encodeURIComponent(c.merchantId)}&limit=1`;
   const curl = [
+    `export GOKWIK_APPSECRET='<paste the app secret>'   # not printed here on purpose`,
     `curl -i '${url}' \\`,
     `  -H 'appid: ${c.appId}' \\`,
-    `  -H 'appsecret: ${c.appSecret}'`,
+    `  -H "appsecret: $GOKWIK_APPSECRET"`,
   ].join("\n");
 
-  console.log(`\n# org: ${org?.name}   merchant: ${c.merchantId}\n`);
+  console.log(`\n# org: ${org?.name}   merchant: ${c.merchantId}`);
+  // Shape only, so a wrong-length or empty credential is still diagnosable
+  // without the value ever being displayed.
+  console.log(`# appSecret: ${c.appSecret.length} chars, ends "${c.appSecret.slice(-4)}"\n`);
   console.log(curl);
   console.log(`
 # Expected today — note the HTTP status is 200 while the BODY says 500:

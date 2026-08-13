@@ -497,6 +497,9 @@ export interface IngestContext {
 // statement costs nine queries instead of one.
 const LOOKUP_CHUNK = 4_000;
 
+/** Generous enough for a 35k-line courier MIS in one transaction. */
+const STATEMENT_TX_TIMEOUT_MS = 120_000;
+
 // A NUL separator, not a hyphen: references come from a provider's CSV and can
 // contain anything, so a printable separator could be forged by a reference
 // that happens to contain it and collide two different lines onto one payment.
@@ -721,112 +724,134 @@ export async function ingestStatement(
       }
     }
 
-    const settlement = await prisma.settlement.upsert({
-      where: {
-        connectionId_externalSettlementId: {
-          connectionId: ctx.connectionId,
-          externalSettlementId: batch.batchId,
-        },
-      },
-      create: {
-        organizationId: ctx.organizationId,
-        legalEntityId: ctx.legalEntityId,
-        connectionId: ctx.connectionId,
-        externalSettlementId: batch.batchId,
-        amount: batch.netPaise,
-        feeAmount: batch.lines.reduce((a, l) => a + l.feePaise, 0n),
-        utr: batch.utr,
-        status: "processed",
-        settledAt: batch.paidOn,
-        provider: format.provider,
-        kind: kindOf(batch),
-        raw: { source: "statement_import", label: format.label, lineCount: batch.lines.length } as Prisma.InputJsonValue,
-      },
-      update: {
-        amount: batch.netPaise,
-        feeAmount: batch.lines.reduce((a, l) => a + l.feePaise, 0n),
-        utr: batch.utr,
-        settledAt: batch.paidOn,
-        provider: format.provider,
-        kind: kindOf(batch),
-      },
-    });
+    // ---------------------------------------------------------------------------
+    // ONE TRANSACTION PER PAYOUT, AND A SET WRITE INSTEAD OF N UPSERTS
+    // ---------------------------------------------------------------------------
+    // The header (which states the payout's full amount) and its lines were
+    // written outside any transaction, in a sequential await loop, with the
+    // stale-line cleanup afterwards. A crash, restart or DB error anywhere in
+    // the middle left a Settlement claiming the whole payout with only some of
+    // its lines — and the reconciliation legs and the settlement lateral in
+    // routes/reconciliation.ts then present that partial import as reconciled
+    // fact. That breaks this module's own stated invariant (lines must sum to
+    // the batch total) and §42.8's spirit at the same time, in the one place
+    // where the damage is invisible: the numbers still render.
+    //
+    // The loop was also an N+1 write — a 35,000-row courier MIS meant 35,000
+    // sequential round trips inside a single HTTP request. deleteMany +
+    // createMany is two statements regardless of size, and delete-then-insert
+    // is what "re-import replaces a payout's lines" already meant.
+    const { settlementId, replaced, imported, unresolved } = await prisma.$transaction(
+      async (tx) => {
+        const settlement = await tx.settlement.upsert({
+          where: {
+            connectionId_externalSettlementId: {
+              connectionId: ctx.connectionId,
+              externalSettlementId: batch.batchId,
+            },
+          },
+          create: {
+            organizationId: ctx.organizationId,
+            legalEntityId: ctx.legalEntityId,
+            connectionId: ctx.connectionId,
+            externalSettlementId: batch.batchId,
+            amount: batch.netPaise,
+            feeAmount: batch.lines.reduce((a, l) => a + l.feePaise, 0n),
+            utr: batch.utr,
+            status: "processed",
+            settledAt: batch.paidOn,
+            provider: format.provider,
+            kind: kindOf(batch),
+            raw: { source: "statement_import", label: format.label, lineCount: batch.lines.length } as Prisma.InputJsonValue,
+          },
+          update: {
+            amount: batch.netPaise,
+            feeAmount: batch.lines.reduce((a, l) => a + l.feePaise, 0n),
+            utr: batch.utr,
+            settledAt: batch.paidOn,
+            provider: format.provider,
+            kind: kindOf(batch),
+          },
+        });
+        // Rows this file states, keyed exactly as the unique index is. Built
+        // before any write so the stale set can be computed in the same pass.
+        const seenKeys = new Set<string>();
+        let unresolvedCount = 0;
+        const rows: Prisma.SettlementLineCreateManyInput[] = [];
 
-    // Track what this file says the payout contains, so anything left over
-    // from a previous import can be removed below.
-    const seenKeys = new Set<string>();
-
-    for (const line of batch.lines) {
-      // A COD row must only ever resolve to a shipment and a prepaid row only
-      // to a payment. Reading both maps for both types would let an order
-      // number that exists on both sides attach a card capture to a parcel.
-      const shipmentId = line.lineType === "SHIPMENT_COD" ? (shipmentByRef.get(line.reference) ?? null) : null;
-      // Amount-specific first, then the plain reference. The specific key only
-      // exists for orders with several captures, so for the ordinary one-line
-      // one-payment case this is the same lookup it always was.
-      const paymentId =
-        line.lineType === "PAYMENT"
-          ? (paymentByRef.get(refGrossKey(line.reference, line.grossPaise)) ?? paymentByRef.get(line.reference) ?? null)
-          : null;
-      if (line.lineType !== "ADJUSTMENT" && shipmentId === null && paymentId === null) {
-        result.linesUnresolved += 1;
-      }
-      await prisma.settlementLine.upsert({
-        where: {
-          settlementId_type_externalReference: {
+        for (const line of batch.lines) {
+          // A COD row must only ever resolve to a shipment and a prepaid row only
+          // to a payment. Reading both maps for both types would let an order
+          // number that exists on both sides attach a card capture to a parcel.
+          const shipmentId = line.lineType === "SHIPMENT_COD" ? (shipmentByRef.get(line.reference) ?? null) : null;
+          // Amount-specific first, then the plain reference. The specific key only
+          // exists for orders with several captures, so for the ordinary one-line
+          // one-payment case this is the same lookup it always was.
+          const paymentId =
+            line.lineType === "PAYMENT"
+              ? (paymentByRef.get(refGrossKey(line.reference, line.grossPaise)) ?? paymentByRef.get(line.reference) ?? null)
+              : null;
+          if (line.lineType !== "ADJUSTMENT" && shipmentId === null && paymentId === null) {
+            unresolvedCount += 1;
+          }
+          const key = `${line.lineType}\u0000${line.reference}`;
+          // A file may state the same (type, reference) twice. The upsert this
+          // replaced resolved that as last-one-wins; createMany would instead
+          // violate the unique index and abort the whole batch, so the same
+          // rule is applied explicitly.
+          const existingIdx = rows.findIndex((r) => `${r.type}\u0000${r.externalReference}` === key);
+          const row: Prisma.SettlementLineCreateManyInput = {
+            organizationId: ctx.organizationId,
             settlementId: settlement.id,
             type: line.lineType,
             externalReference: line.reference,
-          },
-        },
-        create: {
-          organizationId: ctx.organizationId,
-          settlementId: settlement.id,
-          type: line.lineType,
-          externalReference: line.reference,
-          shipmentId,
-          paymentId,
-          grossAmount: line.grossPaise,
-          feeAmount: line.feePaise,
-          netAmount: line.netPaise,
-          raw: line.row as Prisma.InputJsonValue,
-        },
-        update: {
-          shipmentId,
-          paymentId,
-          grossAmount: line.grossPaise,
-          feeAmount: line.feePaise,
-          netAmount: line.netPaise,
-        },
-      });
-      seenKeys.add(`${line.lineType}\u0000${line.reference}`);
-      result.linesImported += 1;
-    }
+            shipmentId,
+            paymentId,
+            grossAmount: line.grossPaise,
+            feeAmount: line.feePaise,
+            netAmount: line.netPaise,
+            raw: line.row as Prisma.InputJsonValue,
+          };
+          if (existingIdx >= 0) rows[existingIdx] = row;
+          else rows.push(row);
+          seenKeys.add(key);
+        }
 
-    // RE-IMPORT REPLACES A PAYOUT'S LINES, it does not merely add to them.
-    //
-    // SettlementLine is unique on (settlementId, type, externalReference), so a
-    // line whose TYPE changes between imports — which is exactly what happens
-    // when classification improves, e.g. a row that used to fall back to
-    // SHIPMENT_COD now correctly reading as PAYMENT — upserts as a NEW row and
-    // leaves the old one behind, double-counting the payout. Anything this file
-    // did not mention is removed.
-    const stale = await prisma.settlementLine.findMany({
-      where: { settlementId: settlement.id },
-      select: { id: true, type: true, externalReference: true },
-    });
-    const staleIds = stale
-      .filter((l) => !seenKeys.has(`${l.type}\u0000${l.externalReference}`))
-      .map((l) => l.id);
-    if (staleIds.length > 0) {
-      // Chunked for the same bind-variable ceiling as the lookups above. This
-      // one is per-batch rather than per-file so it takes a much larger payout
-      // to reach, but a marketplace's monthly settlement is exactly that.
-      for (let i = 0; i < staleIds.length; i += LOOKUP_CHUNK) {
-        await prisma.settlementLine.deleteMany({ where: { id: { in: staleIds.slice(i, i + LOOKUP_CHUNK) } } });
+        // RE-IMPORT REPLACES A PAYOUT'S LINES, it does not merely add to them.
+        //
+        // SettlementLine is unique on (settlementId, type, externalReference), so a
+        // line whose TYPE changes between imports — which is exactly what happens
+        // when classification improves, e.g. a row that used to fall back to
+        // SHIPMENT_COD now correctly reading as PAYMENT — would survive as a
+        // second row and double-count the payout. Counted before the delete so
+        // the reported figure still means "lines this import removed".
+        const existing = await tx.settlementLine.findMany({
+          where: { settlementId: settlement.id },
+          select: { type: true, externalReference: true },
+        });
+        const staleCount = existing.filter((l) => !seenKeys.has(`${l.type}\u0000${l.externalReference}`)).length;
+
+        await tx.settlementLine.deleteMany({ where: { settlementId: settlement.id } });
+        if (rows.length > 0) await tx.settlementLine.createMany({ data: rows });
+
+        return {
+          settlementId: settlement.id,
+          replaced: staleCount,
+          imported: rows.length,
+          unresolved: unresolvedCount,
+        };
+      },
+      {
+        // A single courier MIS batch can carry tens of thousands of lines, and
+        // Prisma's 5s interactive default would abort a legitimate import.
+        maxWait: 10_000,
+        timeout: STATEMENT_TX_TIMEOUT_MS,
       }
-      result.linesReplaced += staleIds.length;
-    }
+    );
+    void settlementId;
+    result.linesReplaced += replaced;
+    result.linesImported += imported;
+    result.linesUnresolved += unresolved;
 
     result.batchesImported += 1;
     result.amountImportedPaise += batch.netPaise;

@@ -888,7 +888,7 @@ reconciliationRouter.post("/items/:orderId/pair", ...requireAuth, async (req, re
           error: result.reason,
           // Names the other order. "Already matched" alone leaves someone
           // hunting through the table for which one.
-          message: `That payment is already matched to order ${result.conflictingOrderRef ?? result.conflictingOrderId}. Unpair it there first — one payment cannot settle two orders.`,
+          message: `That payment is already matched to ${result.conflictingOrderRef ?? result.conflictingOrderId ?? "another order"}. Unpair it there first — one payment cannot settle two orders.`,
           conflictingOrderId: result.conflictingOrderId,
         });
         return;

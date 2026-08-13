@@ -90,7 +90,7 @@ export async function getContributionMargin(
           cancelledAt: null,
         },
       },
-      select: { cogsAmount: true, totalAmount: true },
+      select: { cogsAmount: true, totalAmount: true, quantity: true },
     }),
     // Scoped like every other cost query below. Org-wide here meant an
     // entity-scoped request divided one entity's revenue by the whole
@@ -136,7 +136,12 @@ export async function getContributionMargin(
 
   // --- Packaging (§23). The one layer whose source is a typed rate rather than
   // an ingested record: nothing a brand connects reports what a mailer costs.
-  const packaging = computePackaging(settings, orderCount, lineItems.length);
+  // UNITS, not lines. This passed `lineItems.length`, so an order line for
+  // three of the same SKU paid for one item's packaging instead of three — the
+  // layer understated by exactly the multi-quantity share of the basket, which
+  // is large for any brand selling bundles or refills.
+  const itemUnits = lineItems.reduce((sum, l) => sum + (l.quantity ?? 0), 0);
+  const packaging = computePackaging(settings, orderCount, itemUnits);
 
   // --- Transaction fees (§27–§30). Gateway and marketplace are the same column
   // on the same table, split by the provider that produced the payment; COD
@@ -283,11 +288,18 @@ export async function getContributionMargin(
       // that contradict each other on the same screen. Same fix as
       // marketplaceFees; codCovered already drew the distinction correctly.
       hasSource: fees.hasCodSource || fees.codOrders === 0,
-      note: fees.codLines > 0
-        ? `${fees.codLines} COD remittance lines in this period`
-        : fees.codOrders === 0
+      // Reports the COVERED FRACTION, not just a line count. "412 COD
+      // remittance lines in this period" read as reassurance whether those
+      // lines covered every delivered parcel or two percent of them.
+      note:
+        fees.codOrders === 0
           ? "No COD orders in this period"
-          : `${fees.codOrders} COD orders in this period and no remittance statement covering them — the collection charge on that cash is unknown, not zero`,
+          : fees.codSettleableShipments === 0
+            ? `${fees.codOrders} COD orders, none delivered long enough ago for a remittance to have arrived yet`
+            : `${fees.codRemittedShipments} of ${fees.codSettleableShipments} delivered COD parcels are claimed by a remittance line` +
+              (fees.codRemittedShipments < fees.codSettleableShipments
+                ? ` — the collection charge on the other ${fees.codSettleableShipments - fees.codRemittedShipments} is unknown, not zero`
+                : ""),
     },
     {
       key: "marketplaceFees",

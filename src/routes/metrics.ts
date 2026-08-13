@@ -132,7 +132,14 @@ const scenarioSchema = z
     codShareDeltaPct: z.number().optional(),
     rtoDeltaPct: z.number().optional(),
     collectionAccelDays: z.number().optional(),
-    inventoryPurchase: z.object({ amountPaise: z.string(), date: z.string() }).optional(),
+    // amountPaise is fed straight to BigInt(), which THROWS on anything that
+    // is not an integer literal — "abc", "1.5", "" all produced a 500 from a
+    // request that was simply malformed. A regex here turns that into the 400
+    // it always was. The 18-digit bound is ~₹10^16, far past any real figure
+    // and short of anything that would overflow downstream arithmetic.
+    inventoryPurchase: z
+      .object({ amountPaise: z.string().regex(/^-?\d{1,18}$/, "amountPaise must be an integer number of paise"), date: z.string() })
+      .optional(),
     vendorPaymentDelayDays: z.number().optional(),
     growthDeltaPct: z.number().optional(),
   })

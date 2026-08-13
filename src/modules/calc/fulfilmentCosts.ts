@@ -71,6 +71,19 @@ const INVOICE_EXPECTED_AFTER_DAYS = 45;
 const PAYOUT_EXPECTED_AFTER_DAYS = 10;
 
 /**
+ * How long after DELIVERY a courier COD remittance is expected.
+ *
+ * Couriers collect the cash on delivery and remit on their own cycle — 9 days
+ * is the lag calc/cashForecast.ts already assumes for the same event. A parcel
+ * delivered yesterday has no statement, and counting it as an uncovered gap
+ * would leave this layer permanently short for any org still delivering.
+ */
+const COD_REMITTANCE_EXPECTED_AFTER_DAYS = 12;
+
+/** Same bind-variable ceiling as the statement importer's LOOKUP_CHUNK. */
+const FREIGHT_LOOKUP_CHUNK = 4_000;
+
+/**
  * Shipments that were DISPATCHED in this window — not merely inserted in it.
  *
  * ---------------------------------------------------------------------------
@@ -186,15 +199,26 @@ export async function getFreightSplit(
   // than AWB — a line the courier billed for a parcel we never shipped has no
   // shipmentId, and it must not be attributed to this period's fulfilment cost
   // just because its ship date happens to fall inside the window.
-  const reverseRows = await prisma.freightInvoiceLine.groupBy({
-    by: ["shipmentId"],
-    where: {
-      organizationId,
-      isReturnLeg: true,
-      shipmentId: { in: billed.map((s) => s.id) },
-    },
-    _sum: { amount: true },
-  });
+  // CHUNKED. Postgres refuses a prepared statement carrying more than 32,767
+  // bind variables and every element of an `in` list is one, so an org with
+  // more than ~32k billed shipments in the window crashed the whole
+  // contribution-margin request — the same ceiling already fixed in
+  // connectors/remittance/statement.ts and bluedart/invoice.ts, missed here.
+  // A year-range query on a brand doing 3,000 parcels a month reaches it.
+  const billedIds = billed.map((s) => s.id);
+  const reverseRows: Array<{ shipmentId: string | null; _sum: { amount: bigint | null } }> = [];
+  for (let i = 0; i < billedIds.length; i += FREIGHT_LOOKUP_CHUNK) {
+    const chunk = await prisma.freightInvoiceLine.groupBy({
+      by: ["shipmentId"],
+      where: {
+        organizationId,
+        isReturnLeg: true,
+        shipmentId: { in: billedIds.slice(i, i + FREIGHT_LOOKUP_CHUNK) },
+      },
+      _sum: { amount: true },
+    });
+    reverseRows.push(...chunk);
+  }
 
   const reverseMinor = reverseRows.reduce((sum, r) => sum + (r._sum.amount ?? 0n), 0n);
 
@@ -238,6 +262,7 @@ export interface PackagingCost {
 export function computePackaging(
   settings: OrgSettings,
   orders: number,
+  /** UNITS shipped, not order lines — a line for 3 units needs 3 items' worth. */
   items: number
 ): PackagingCost {
   const cfg = settings.packagingCost;
@@ -367,6 +392,10 @@ export interface TransactionFees {
   hasCodSource: boolean;
   /** COD orders placed in this period — the cash that should have a statement. */
   codOrders: number;
+  /** COD parcels delivered long enough ago that a remittance should have arrived. */
+  codSettleableShipments: number;
+  /** Of those, how many a remittance line actually claims. */
+  codRemittedShipments: number;
   /**
    * Whether this period's COD charges are actually known.
    *
@@ -398,7 +427,8 @@ export async function getTransactionFees(
   });
   const marketplaceIds = new Set(marketplaceConnections.map((c) => c.id));
 
-  const [payments, settledFees, codAgg, codSourceCount, codOrders, marketplaceOrders] = await Promise.all([
+  const [payments, settledFees, codAgg, codSourceCount, codOrders, codSettleable, codRemitted, marketplaceOrders] =
+    await Promise.all([
     prisma.payment.findMany({
       where: { ...scopeWhere(organizationId, scope), capturedAt: { gte: range.from, lte: range.to } },
       select: { id: true, feeAmount: true, connectionId: true, capturedAt: true },
@@ -431,6 +461,24 @@ export async function getTransactionFees(
       _count: true,
     }),
     prisma.settlementLine.count({ where: { organizationId, type: "SHIPMENT_COD" } }),
+    // COD parcels DELIVERED long enough ago that a courier remittance should
+    // have arrived — the honest denominator for this layer's coverage.
+    prisma.shipment.count({
+      where: {
+        ...scopeWhere(organizationId, scope),
+        deliveredAt: { gte: range.from, lte: new Date(Date.now() - COD_REMITTANCE_EXPECTED_AFTER_DAYS * 86_400_000) },
+        order: { paymentMode: "COD", cancelledAt: null },
+      },
+    }),
+    // Of those, how many a remittance line actually claims.
+    prisma.shipment.count({
+      where: {
+        ...scopeWhere(organizationId, scope),
+        deliveredAt: { gte: range.from, lte: new Date(Date.now() - COD_REMITTANCE_EXPECTED_AFTER_DAYS * 86_400_000) },
+        order: { paymentMode: "COD", cancelledAt: null },
+        settlementLines: { some: { type: "SHIPMENT_COD" } },
+      },
+    }),
     prisma.order.count({
       where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.from, lte: range.to }, paymentMode: "COD", cancelledAt: null },
     }),
@@ -520,8 +568,22 @@ export async function getTransactionFees(
     codLines: codAgg._count,
     hasCodSource: codSourceCount > 0,
     codOrders,
-    // Measured zero only when there was no COD to charge for. Otherwise a
-    // statement is missing and the layer must say so.
-    codCovered: codAgg._count > 0 || codOrders === 0,
+    codSettleableShipments: codSettleable,
+    codRemittedShipments: codRemitted,
+    // ---------------------------------------------------------------------------
+    // COVERED MEANS EVERY SETTLEABLE PARCEL, NOT "at least one line exists"
+    // ---------------------------------------------------------------------------
+    // This was `codAgg._count > 0 || codOrders === 0` — ONE remittance line
+    // anywhere in the window marked the whole period's COD fees measured, no
+    // matter how few of the period's parcels it covered. A statement covering
+    // 2% of deliveries reported the same confidence as one covering all of
+    // them, which contradicts this field's own doc comment.
+    //
+    // Same construction the gateway and forward-shipping layers already use:
+    // count what a remitter COULD have paid for by now, and require the lines
+    // to reach it. Parcels delivered inside the remittance lag are excluded
+    // rather than counted missing — a courier remits ~9 days after delivery, so
+    // yesterday's delivery has no statement and that is the cycle, not a gap.
+    codCovered: codSettleable === 0 ? codOrders === 0 || codAgg._count > 0 : codRemitted >= codSettleable,
   };
 }

@@ -7,6 +7,7 @@ import { paiseToRupees } from "../calc/money.js";
 import { getSettlementSummary } from "../calc/moneyMovement.js";
 import { readReconciliationLegs } from "../calc/reconciliation.js";
 import { getRevenueLadder } from "../calc/revenueLadder.js";
+import { escapeCsvCell } from "../../lib/csv.js";
 
 // §20.14 reports (P5.3).
 //
@@ -253,11 +254,9 @@ export async function buildReport(
  * in a header block above the data, before anyone scrolls.
  */
 export function reportToCsv(report: ReportResult): string {
-  const escape = (v: string | number | null | undefined) => {
-    if (v === null || v === undefined) return "";
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
+  // Shared with the evidence export — both had an identical copy that quoted
+  // correctly and never neutralised a leading formula character. See lib/csv.ts.
+  const escape = escapeCsvCell;
 
   const lines: string[] = [];
   lines.push(`# ${report.title}`);

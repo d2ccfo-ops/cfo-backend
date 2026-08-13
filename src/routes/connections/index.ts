@@ -70,7 +70,16 @@ connectionsRouter.get("/health", ...requireAuth, async (req, res) => {
 // to a more recent statement date).
 connectionsRouter.patch("/:connectionId/opening-balance", ...requireAuth, async (req, res) => {
   const { balanceRupees, asOfDate } = req.body ?? {};
-  if (typeof balanceRupees !== "number" || Number.isNaN(balanceRupees) || !asOfDate) {
+  // Number.isFinite, not just !isNaN: Infinity passes an isNaN check and then
+  // throws inside BigInt() when the rupee figure is converted to paise,
+  // turning a malformed request into a 500. The magnitude bound keeps a
+  // plausible-but-absurd balance from becoming an unreadable paise integer.
+  if (
+    typeof balanceRupees !== "number" ||
+    !Number.isFinite(balanceRupees) ||
+    Math.abs(balanceRupees) > 1e14 ||
+    !asOfDate
+  ) {
     res.status(400).json({ error: "missing_fields" });
     return;
   }

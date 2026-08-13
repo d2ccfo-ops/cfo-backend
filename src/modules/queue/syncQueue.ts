@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Queue } from "bullmq";
 import { prisma } from "../../lib/prisma.js";
 import { redisConnection } from "../../lib/redis.js";
+import { logger } from "../../lib/logger.js";
 
 export interface SyncJobData {
   connectionId: string;
@@ -85,12 +86,59 @@ export async function claimAndEnqueueSync(
   if (claimed.count === 0) return false;
 
   try {
-    await enqueueSync(connectionId, opts);
+    // ---------------------------------------------------------------------------
+    // A DEADLINE, BECAUSE THE ENQUEUE CAN HANG FOREVER
+    // ---------------------------------------------------------------------------
+    // lib/redis.ts sets `maxRetriesPerRequest: null` (BullMQ requires it) and
+    // leaves ioredis's `enableOfflineQueue` at its default of true. With that
+    // pair, a command issued while Redis is unreachable is parked in an
+    // in-memory queue and its promise NEVER settles — it does not reject, so
+    // the catch below was dead code for the exact outage it was written for.
+    //
+    // The consequence was not a slow request, it was a permanent one: POST
+    // /connections/:id/sync awaited forever, Node applies no response timeout,
+    // and the socket plus the whole auth chain stayed pinned until the client
+    // gave up. Meanwhile the Postgres claim had already flipped the row to
+    // QUEUED, which only IDLE/FAILED can leave — so the connection was wedged
+    // too.
+    //
+    // Racing it converts an unbounded hang into a 5-second failure that the
+    // rollback below can actually act on.
+    await withDeadline(
+      enqueueSync(connectionId, opts),
+      ENQUEUE_TIMEOUT_MS,
+      `enqueue timed out after ${ENQUEUE_TIMEOUT_MS}ms — the queue backend is unreachable`
+    );
     return true;
   } catch (err) {
+    // Rolled back so the IDLE/FAILED guard does not block this connection
+    // forever. Logged rather than swallowed: if the compensating write also
+    // fails the row STAYS QUEUED, and that is precisely the wedged state the
+    // sweep in syncCadence.ts has to recover — silence here made it
+    // undiagnosable.
     await prisma.connection
       .updateMany({ where: { id: connectionId, syncStatus: "QUEUED" }, data: { syncStatus: "IDLE" } })
-      .catch(() => {});
+      .catch((rollbackErr) => {
+        logger.error(
+          { err: rollbackErr, connectionId },
+          "sync_claim_rollback_failed — connection left QUEUED, the stale-claim sweep will recover it"
+        );
+      });
     throw err;
   }
+}
+
+/** How long to wait for the queue to accept a job before treating it as down. */
+const ENQUEUE_TIMEOUT_MS = 5_000;
+
+function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+    // The winning branch clears the timer so a resolved enqueue does not hold
+    // the event loop open for five seconds.
+  ]).finally(() => clearTimeout(timer!)) as Promise<T>;
 }

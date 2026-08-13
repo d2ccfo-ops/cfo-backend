@@ -89,8 +89,8 @@ const TEXT: Record<LongTailMetricKey, { definition: string; formula: string; pro
   },
   inventory_value: {
     definition:
-      "Stock on hand valued at landed cost (§14). Variants carrying implausible placeholder quantities are excluded from the headline and counted separately, because one Shopify variant at 1,000,000 units once valued this brand's stock at ₹2,274 crore.",
-    formula: "Σ (variant inventoryQuantity × landed cost), excluding variants above the implausibility bound",
+      "Stock on hand valued at its SELLING price (§14) — what the inventory would fetch, not what it cost. A landed-cost total is reported alongside it and is what any ratio against COGS uses; see calc/cashCycle.ts. This text previously claimed landed cost, describing behaviour the code did not have, so a reader checking the definition was told the DIO unit mismatch was not there. Variants carrying implausible placeholder quantities are excluded from the headline and counted separately, because one Shopify variant at 1,000,000 units once valued this brand's stock at ₹2,274 crore.",
+    formula: "Σ (variant inventoryQuantity × variant price), excluding variants above the implausibility bound",
     providers: ["SHOPIFY"],
   },
 };

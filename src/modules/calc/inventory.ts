@@ -1,5 +1,6 @@
 import { prisma } from "../../lib/prisma.js";
 import { paiseToRupees, sumPaise } from "./money.js";
+import { buildCostResolver } from "./cogs.js";
 
 // Inventory value = sum(variant.price * variant.inventoryQuantity) across
 // every Product this org has, as of right now. Unlike revenue/cash-received/
@@ -50,6 +51,37 @@ export async function getInventoryValueSummary(organizationId: string) {
   // reported beside it, because hiding the difference would leave someone
   // comparing this page against Shopify's own number with no explanation.
   const valueMinor = sumPaise(tracked.map((v) => v.price * BigInt(v.inventoryQuantity)));
+
+  // ---------------------------------------------------------------------------
+  // THE SAME STOCK, VALUED AT COST
+  // ---------------------------------------------------------------------------
+  // `valueMinor` above is at the SELLING price, which is the right basis for
+  // "what is my stock worth" and the wrong one for any ratio against COGS.
+  // calc/cashCycle.ts divided this retail figure by a landed-cost COGS to get
+  // DIO — numerator at retail, denominator at cost — so DIO came out
+  // overstated by the gross-margin multiple (a 60%-margin brand read ~2.5x too
+  // many days), and CCC inherited the error while presenting all three terms
+  // as measured.
+  //
+  // Both are returned rather than one replacing the other, because they answer
+  // different questions and a caller picking the wrong one should have to say
+  // which it wanted.
+  const costResolver = await buildCostResolver(
+    organizationId,
+    tracked.map((v) => v.sku).filter((s): s is string => Boolean(s))
+  );
+  let costValueMinor = 0n;
+  let costedUnits = 0;
+  let uncostedUnits = 0;
+  for (const v of tracked) {
+    const cost = costResolver(v.sku, now);
+    if (cost) {
+      costValueMinor += cost.landedCost * BigInt(v.inventoryQuantity);
+      costedUnits += v.inventoryQuantity;
+    } else {
+      uncostedUnits += v.inventoryQuantity;
+    }
+  }
   const unitsOnHand = tracked.reduce((sum, v) => sum + v.inventoryQuantity, 0);
   const allVariantsValueMinor = sumPaise(variants.map((v) => v.price * BigInt(v.inventoryQuantity)));
   const excludedUnits = untracked.reduce((sum, v) => sum + v.inventoryQuantity, 0);
@@ -101,6 +133,18 @@ export async function getInventoryValueSummary(organizationId: string) {
     currency: "INR",
     valueMinor: valueMinor.toString(),
     value: paiseToRupees(valueMinor),
+    /**
+     * The same stock at LANDED COST. Use this — never valueMinor — for any
+     * ratio against COGS; see the note where it is computed.
+     *
+     * costedUnits/uncostedUnits report how much of the stock the figure
+     * actually covers, because a cost-basis total built from 12% of units is
+     * not a smaller inventory, it is an unknown one.
+     */
+    costValueMinor: costValueMinor.toString(),
+    costValue: paiseToRupees(costValueMinor),
+    costedUnits,
+    uncostedUnits,
     unitsOnHand,
     variantCount: tracked.length,
     // Stated so the difference from Shopify's own figure is explicable rather

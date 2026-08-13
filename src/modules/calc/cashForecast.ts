@@ -52,7 +52,12 @@ import { expandSchedule } from "./recurringOutflows.js";
 // P2.2e participates in the walk. Additive on the response — no existing field
 // changed meaning — but the day shape grew, so v2 readers stay valid and v2
 // snapshots stay as they are (§92).
-export const CASH_FORECAST_VERSION = "v3";
+// v4 (2026-08-13, §92): COD inflow is now REDUCED by the measured RTO rate.
+// v3 reported a cod_rto_risk component with basis "measured" and a note saying
+// returned orders "can be excluded" while excluding nothing — the forecast
+// promised cash that never arrives. Every projected COD rupee changes, so a v3
+// line must not be compared against a v4 one.
+export const CASH_FORECAST_VERSION = "v4";
 
 // The three §16 horizons. A closed set rather than a free integer: each one
 // is a different QUESTION (this week's squeeze, this month's plan, this
@@ -76,6 +81,16 @@ const VELOCITY_WINDOW_DAYS = 28;
 // weekday multiplier needs more than four observations per day to be stable.
 const SEASONALITY_WINDOW_DAYS = 56;
 const MIN_DAYS_FOR_SEASONALITY = 28;
+/**
+ * Below this many dispatched COD parcels the RTO ratio is noise, not a rate,
+ * and the forecast says the risk is unmeasured rather than applying it.
+ * 50 is deliberately low — a brand doing 50 COD parcels a quarter still has a
+ * real RTO problem worth reflecting — but high enough that one early return
+ * cannot move the horizon.
+ */
+const MIN_COD_SHIPMENTS_FOR_RTO_RATE = 50;
+/** How far back the RTO rate is measured. Long enough to cover the return leg. */
+const RTO_RATE_WINDOW_DAYS = 90;
 
 // ---------------------------------------------------------------------------
 // Assumptions — stated, not buried
@@ -192,6 +207,50 @@ interface DailyOrderValue {
 // Order cash value, not revenue: what the customer actually pays, less anything
 // already refunded. Cancelled orders never produce cash and are excluded
 // outright (§16) rather than netted out later.
+/**
+ * The share of dispatched COD parcels that come back undelivered, measured.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS EXISTS: THE FORECAST WAS CLAIMING TO DO SOMETHING IT DID NOT
+ * ---------------------------------------------------------------------------
+ * The `cod_rto_risk` component reported basis "measured" the moment an org had
+ * any shipment row at all, with the note "Courier data is connected, so
+ * returned COD orders can be excluded" — and nothing anywhere excluded
+ * anything. valueMinor was the literal string "0", and the horizon walk applied
+ * no reduction to either the placed pipeline or the projected COD inflow.
+ *
+ * An RTO'd COD order is not refunded — no cash was ever collected — so
+ * `grossAmount - refundedAmount` does not catch it either. The forecast was
+ * therefore promising cash that will never arrive, and labelling the promise
+ * measured. For a tool whose output is runway, overstating cash is the
+ * dangerous direction, and §42.8 forbids exactly this: an assumption dressed
+ * as a measurement.
+ *
+ * Returns null when there is nothing to measure from, so the caller can say so
+ * rather than substitute a plausible-looking default.
+ */
+async function measureCodRtoRate(organizationId: string, since: Date): Promise<number | null> {
+  // COD parcels only. A prepaid RTO is a refund, which the revenue side
+  // already accounts for — folding it in here would reduce COD inflow for
+  // returns that never touched COD.
+  const rows = await prisma.$queryRaw<{ dispatched: bigint; returned: bigint }[]>(Prisma.sql`
+    SELECT count(*) FILTER (WHERE s."awbCode" IS NOT NULL)::bigint AS dispatched,
+           count(*) FILTER (WHERE s.status IN ('RTO_INITIATED', 'RTO_DELIVERED'))::bigint AS returned
+    FROM shipments s
+    JOIN orders o ON o.id = s."orderId"
+    WHERE s."organizationId" = ${organizationId}
+      AND o."paymentMode" = 'COD'
+      AND o."cancelledAt" IS NULL
+      AND coalesce(s."pickedUpAt", s."createdAt") >= ${since}`);
+
+  const dispatched = Number(rows[0]?.dispatched ?? 0n);
+  const returned = Number(rows[0]?.returned ?? 0n);
+  // A handful of parcels is a ratio, not a rate. Applying 1/3 from three
+  // shipments would swing the forecast on noise.
+  if (dispatched < MIN_COD_SHIPMENTS_FOR_RTO_RATE) return null;
+  return returned / dispatched;
+}
+
 async function dailyOrderValues(
   organizationId: string,
   from: Date,
@@ -268,6 +327,26 @@ export async function getCashForecast(
   const historyFrom = startOfZonedDay(addZonedDays(today, -SEASONALITY_WINDOW_DAYS), timeZone);
   const history = await dailyOrderValues(organizationId, historyFrom, now, timeZone);
 
+  // Measured BEFORE the inflow is assembled, because both the placed pipeline
+  // and the projection have to be reduced by it — reducing only one would make
+  // the forecast step at the pipeline/projection boundary.
+  const codRtoRate = await measureCodRtoRate(
+    organizationId,
+    startOfZonedDay(addZonedDays(today, -RTO_RATE_WINDOW_DAYS), timeZone)
+  );
+  // Null = not measurable. Collect the full COD amount and say so, rather than
+  // invent a rate; the component note already tells the reader the number is
+  // optimistic in that case.
+  const codCollectionRate = codRtoRate === null ? 1 : 1 - codRtoRate;
+  /** COD cash actually expected, after parcels that will come back. */
+  let codRtoWithheldMinor = 0n;
+  const collectableCod = (amount: bigint) => {
+    if (codRtoRate === null) return amount;
+    const kept = (amount * BigInt(Math.round(codCollectionRate * 10_000))) / 10_000n;
+    codRtoWithheldMinor += amount - kept;
+    return kept;
+  };
+
   const velocityCutoff = addZonedDays(today, -VELOCITY_WINDOW_DAYS);
   const recent = history.filter((d) => d.day >= velocityCutoff && d.day < today);
   const dailyPrepaid = mean(recent.map((d) => d.prepaid));
@@ -297,7 +376,7 @@ export async function getCashForecast(
   };
   for (const d of pipeline) {
     addInflow(addZonedDays(d.day, FORECAST_ASSUMPTIONS.prepaidSettlementLagDays), d.prepaid);
-    addInflow(addZonedDays(d.day, FORECAST_ASSUMPTIONS.codRemittanceLagDays), d.cod);
+    addInflow(addZonedDays(d.day, FORECAST_ASSUMPTIONS.codRemittanceLagDays), collectableCod(d.cod));
   }
 
   // --- Outflows ---------------------------------------------------------
@@ -405,7 +484,7 @@ export async function getCashForecast(
     // none is dropped between them.
     let projected = 0n;
     if (prepaidOrigin >= today) projected += applyShape(dailyPrepaid, prepaidOrigin);
-    if (codOrigin >= today) projected += applyShape(dailyCod, codOrigin);
+    if (codOrigin >= today) projected += collectableCod(applyShape(dailyCod, codOrigin));
 
     const placed = placedInflowByDay.get(day) ?? 0n;
     const inflow = placed + projected;
@@ -492,11 +571,21 @@ export async function getCashForecast(
     {
       key: "cod_rto_risk",
       label: "COD returns (RTO)",
-      basis: hasRtoData ? "measured" : "unavailable",
-      valueMinor: "0",
-      note: hasRtoData
-        ? "Courier data is connected, so returned COD orders can be excluded."
-        : "No courier connected, so COD inflow is NOT reduced for orders that will be returned undelivered. Real COD collection will be lower than shown.",
+      // "measured" only when a rate was actually measured AND applied. This
+      // used to read `hasRtoData ? "measured" : "unavailable"` — true the
+      // moment any shipment row existed — beside a note claiming returns "can
+      // be excluded" and a hard-coded value of 0, while nothing was excluded
+      // anywhere. That is an assumption wearing a measurement's label, which
+      // is the one thing §42.8 forbids outright.
+      basis: codRtoRate === null ? "unavailable" : "measured",
+      // The rupees actually removed from the horizon, not a placeholder.
+      valueMinor: codRtoWithheldMinor.toString(),
+      note:
+        codRtoRate === null
+          ? hasRtoData
+            ? `Fewer than ${MIN_COD_SHIPMENTS_FOR_RTO_RATE} COD parcels dispatched in ${RTO_RATE_WINDOW_DAYS} days, so the return rate would be noise rather than a rate. COD inflow is NOT reduced, and real collection will be lower than shown.`
+            : "No courier connected, so COD inflow is NOT reduced for orders that will be returned undelivered. Real COD collection will be lower than shown."
+          : `${(codRtoRate * 100).toFixed(1)}% of COD parcels dispatched in the last ${RTO_RATE_WINDOW_DAYS} days came back undelivered. That share has been removed from COD inflow — an RTO'd COD order collects nothing and is never refunded, so it would otherwise sit in the forecast as cash that never arrives.`,
     },
     {
       key: "outflow_vendor_bills",

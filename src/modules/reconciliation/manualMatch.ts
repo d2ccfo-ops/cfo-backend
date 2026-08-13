@@ -42,7 +42,13 @@ export const PAIR_WINDOW_DAYS = 45;
 export type PairFailure =
   | { ok: false; reason: "order_not_found" }
   | { ok: false; reason: "payment_not_found" }
-  | { ok: false; reason: "payment_already_matched"; conflictingOrderId: string; conflictingOrderRef: string | null };
+  | {
+      ok: false;
+      reason: "payment_already_matched";
+      /** Null only if the claiming row vanished between detection and read. */
+      conflictingOrderId: string | null;
+      conflictingOrderRef: string | null;
+    };
 
 export type PairSuccess = {
   ok: true;
@@ -175,7 +181,38 @@ export async function pairOrderToPayment(
 
   // Replace, do not stack. Leaving the engine's row behind would mean two rows
   // for one order, and which one wins would depend on the reader.
-  const match = await prisma.$transaction(async (tx) => {
+  let match: { id: string };
+  try {
+    match = await prisma.$transaction(async (tx) => {
+    // ---------------------------------------------------------------------------
+    // THE CLAIM CHECK, RE-RUN INSIDE THE TRANSACTION
+    // ---------------------------------------------------------------------------
+    // The check above runs before this transaction opens, so two people pairing
+    // the SAME payment to DIFFERENT orders at the same moment both passed it and
+    // both wrote — one payment counted as settling two orders, which is exactly
+    // the double-count the check exists to prevent.
+    //
+    // Re-checking here closes the window to the transaction's own duration
+    // rather than the whole request's. It does not close it completely: under
+    // Postgres READ COMMITTED two concurrent transactions can still both see no
+    // conflict. The durable fix is a partial unique index on
+    // (organizationId, targetId) for ORDER_PAYMENT/PAYMENT rows — the data
+    // supports one today (0 violations across 16,403 rows) — and it is left for
+    // a deliberate migration rather than bundled into a security pass, because
+    // it would also make the nightly engine throw on a case it currently
+    // resolves by refusing.
+    const raced = await tx.reconciliationMatch.findFirst({
+      where: {
+        organizationId,
+        matchType: "ORDER_PAYMENT",
+        targetType: "PAYMENT",
+        targetId: paymentId,
+        sourceId: { not: orderId },
+      },
+      select: { id: true },
+    });
+    if (raced) throw new PaymentAlreadyClaimedError();
+
     await tx.reconciliationMatch.deleteMany({
       where: { organizationId, matchType: "ORDER_PAYMENT", sourceType: "ORDER", sourceId: orderId },
     });
@@ -217,10 +254,43 @@ export async function pairOrderToPayment(
         },
       },
     });
-    return created;
-  });
+      return created;
+    });
+  } catch (err) {
+    // The race, reported exactly as the pre-check reports a plain conflict.
+    if (err instanceof PaymentAlreadyClaimedError) {
+      const other = await prisma.reconciliationMatch.findFirst({
+        where: { organizationId, matchType: "ORDER_PAYMENT", targetType: "PAYMENT", targetId: paymentId },
+        select: { sourceId: true },
+      });
+      const conflicting = other
+        ? await prisma.order.findUnique({ where: { id: other.sourceId }, select: { externalOrderId: true } })
+        : null;
+      return {
+        ok: false,
+        reason: "payment_already_matched",
+        conflictingOrderId: other?.sourceId ?? null,
+        conflictingOrderRef: conflicting?.externalOrderId ?? null,
+      };
+    }
+    throw err;
+  }
 
   return { ok: true, matchId: match.id, differencePaise: delta };
+}
+
+/**
+ * Thrown inside pairOrderToPayment's transaction when a concurrent request
+ * claimed the payment first. Converted back into the ordinary
+ * `payment_already_matched` result by the caller — a race and a plain conflict
+ * are the same answer to the person clicking, and only one of them should ever
+ * reach a stack trace.
+ */
+class PaymentAlreadyClaimedError extends Error {
+  constructor() {
+    super("payment_already_matched");
+    this.name = "PaymentAlreadyClaimedError";
+  }
 }
 
 export async function unpairOrder(

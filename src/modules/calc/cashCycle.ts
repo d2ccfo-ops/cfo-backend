@@ -20,7 +20,12 @@ import { paiseToRupees } from "./money.js";
 // null, and the reason is stated per term. A partial cycle is not reported as
 // a cycle.
 
-export const CASH_CYCLE_VERSION = "v1";
+// v2 (2026-08-13, §92): DIO values stock at LANDED COST. v1 divided a
+// retail-priced inventory by a cost-priced COGS, overstating DIO — and
+// therefore CCC — by the gross-margin multiple, while reporting both as
+// measured. Every v1 DIO/CCC figure is wrong by that factor, so a v1 snapshot
+// must not be compared against a v2 one.
+export const CASH_CYCLE_VERSION = "v2";
 
 // COVERAGE THRESHOLDS, and the reason they exist is a bug this module had on
 // its first run against real data: it reported DIO of 1,684,116 days and DSO
@@ -118,7 +123,28 @@ export async function getCashConversionCycle(
   const netRevenueMinor =
     (orders._sum.grossAmount ?? 0n) - (orders._sum.taxAmount ?? 0n) - (orders._sum.refundedAmount ?? 0n);
   const cogsMinor = cogsRows._sum.cogsAmount ?? 0n;
-  const inventoryMinor = BigInt(inventory.valueMinor ?? "0");
+  // ---------------------------------------------------------------------------
+  // COST BASIS, NOT RETAIL — the two sides of DIO must be in the same units
+  // ---------------------------------------------------------------------------
+  // This read `inventory.valueMinor`, which values stock at the Shopify SELLING
+  // price, and divided it by a landed-cost COGS. Numerator at retail over
+  // denominator at cost overstates DIO by the gross-margin multiple: a brand on
+  // 60% margins read roughly 2.5x too many days, CCC inherited it, and all
+  // three terms were presented as measured with reason: null.
+  //
+  // The evidence envelope compounded it by describing the correct behaviour
+  // rather than the actual one — "Stock on hand valued at landed cost" — so a
+  // reader checking the definition was told the bug was not there.
+  const inventoryMinor = BigInt(inventory.costValueMinor ?? "0");
+  const inventoryCostedUnits = inventory.costedUnits ?? 0;
+  const inventoryUncostedUnits = inventory.uncostedUnits ?? 0;
+  const inventoryUnits = inventoryCostedUnits + inventoryUncostedUnits;
+  // A cost-basis total covering a fraction of the stock is not a smaller
+  // inventory — it is an unknown one, and dividing by COGS would understate DIO
+  // by exactly the share of units with no cost. Same refusal the COGS-coverage
+  // gate below already makes for the denominator.
+  const inventoryCostCoveragePct =
+    inventoryUnits === 0 ? 0 : Math.round((inventoryCostedUnits / inventoryUnits) * 1000) / 10;
   const payablesMinor = BigInt(payables.totalOutstandingMinor ?? "0");
   const receiptsMinor = receipts._sum.amount ?? 0n;
 
@@ -129,18 +155,26 @@ export async function getCashConversionCycle(
   const receiptCoveragePct =
     netRevenueMinor === 0n ? 0 : Math.round((Number(receiptsMinor) / Number(netRevenueMinor)) * 1000) / 10;
   const cogsUsable = cogsMinor > 0n && cogsCoveragePct >= MIN_COGS_LINE_COVERAGE_PCT;
+  // The numerator needs the same standard as the denominator. Reusing the COGS
+  // threshold on purpose: both answer "is enough of this population costed for
+  // the total to mean anything", and a second, different number here would be
+  // one more constant nobody could justify.
+  const inventoryUsable = inventoryUnits > 0 && inventoryCostCoveragePct >= MIN_COGS_LINE_COVERAGE_PCT;
   const receiptsUsable = receiptsMinor > 0n && receiptCoveragePct >= MIN_RECEIPT_COVERAGE_PCT;
 
   // ---- DIO: how long stock sits before it sells. -----------------------------
-  if (!cogsUsable) {
+  if (!cogsUsable || !inventoryUsable) {
     terms.push({
       key: "dio",
       label: "Days inventory outstanding",
       days: null,
       numerator: paiseToRupees(inventoryMinor),
       denominator: paiseToRupees(cogsMinor),
-      reason:
-        cogsMinor === 0n
+      reason: !inventoryUsable
+        ? inventoryUnits === 0
+          ? "No stock on hand to value, so there is nothing to divide."
+          : `Only ${inventoryCostCoveragePct}% of units on hand carry a product cost, so stock cannot be valued at cost. Valuing the rest at its selling price and dividing by a cost-based COGS would overstate DIO by the whole gross margin. ${MIN_COGS_LINE_COVERAGE_PCT}% coverage is needed.`
+        : cogsMinor === 0n
           ? "No costed order lines in this period, so there is no cost of goods sold to divide by. Enter product costs on the Costs page."
           : `Only ${cogsCoveragePct}% of order lines carry a product cost, so the cost of goods sold here is a sample of ${cogsRows._count._all} lines out of ${totalLines}, not the period's COGS. Dividing inventory by it would report a number wrong by orders of magnitude. ${MIN_COGS_LINE_COVERAGE_PCT}% coverage is needed.`,
     });

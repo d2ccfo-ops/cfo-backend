@@ -10,6 +10,7 @@ import { getCashForecast } from "../modules/calc/cashForecast.js";
 import { getDataStatusMap, type MaterialMetricKey } from "../modules/calc/dataStatus.js";
 import { paiseToRupees } from "../modules/calc/money.js";
 import { buildLongTailEvidence, isLongTailMetric, LONG_TAIL_METRIC_KEYS } from "../modules/calc/evidenceLongTail.js";
+import { toCsv } from "../lib/csv.js";
 
 // §21 evidence. One envelope for the 5 material metrics — every figure a
 // founder might be challenged on can answer "show me the workings" with its
@@ -324,16 +325,9 @@ export async function buildEvidence(
   }
 }
 
-export function toCsv(rows: Array<Record<string, string | number | null>>): string {
-  if (rows.length === 0) return "";
-  const headers = Object.keys(rows[0]!);
-  const escape = (v: string | number | null) => {
-    if (v === null || v === undefined) return "";
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  return [headers.join(","), ...rows.map((r) => headers.map((h) => escape(r[h] ?? null)).join(","))].join("\n");
-}
+// Re-exported rather than reimplemented: this and modules/reports/reports.ts
+// both had their own copy with the same formula-injection hole. See lib/csv.ts.
+export { toCsv };
 
 evidenceRouter.get("/:metricKey", ...requireAuth, withDateRange, async (req, res) => {
   const requested = req.params.metricKey ?? "";
