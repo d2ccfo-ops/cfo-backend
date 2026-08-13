@@ -1,4 +1,5 @@
 import { prisma } from "../../lib/prisma.js";
+import { capturedStatusFilter } from "../calc/paymentStatus.js";
 
 // P6.3 — manual match pairing (§15).
 //
@@ -80,7 +81,7 @@ export async function getPairCandidates(organizationId: string, orderId: string)
   const rows = await prisma.payment.findMany({
     where: {
       organizationId,
-      status: "captured",
+      ...capturedStatusFilter(),
       capturedAt: { gte: from, lte: to },
       // A payment already carrying a different order's id is that order's
       // money. Excluded here rather than shown and refused on submit —

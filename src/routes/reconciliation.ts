@@ -16,6 +16,7 @@ import {
 } from "../modules/calc/reconciliation.js";
 import { getPairCandidates, pairOrderToPayment, unpairOrder } from "../modules/reconciliation/manualMatch.js";
 import { flagMatchAsException, getExceptionReport, unflagMatch } from "../modules/reconciliation/exceptions.js";
+import { capturedStatusSql } from "../modules/calc/paymentStatus.js";
 
 export const reconciliationRouter = Router();
 
@@ -512,7 +513,7 @@ reconciliationRouter.get("/items", ...requireAuth, withDateRange, async (req, re
     ${BASE_FROM}
     LEFT JOIN LATERAL (
       SELECT sum(p2.amount)::bigint AS amount FROM payments p2
-      WHERE p2."orderId" = o.id AND p2.status = 'captured'
+      WHERE p2."orderId" = o.id AND ${capturedStatusSql(Prisma.sql`p2.status`)}
     ) paid ON true
     ${SETTLED_LATERAL}
     ${where}
@@ -795,7 +796,7 @@ reconciliationRouter.post("/items/:orderId/restore", ...requireAuth, async (req,
     ${BASE_FROM}
     LEFT JOIN LATERAL (
       SELECT sum(p2.amount)::bigint AS amount FROM payments p2
-      WHERE p2."orderId" = o.id AND p2.status = 'captured'
+      WHERE p2."orderId" = o.id AND ${capturedStatusSql(Prisma.sql`p2.status`)}
     ) paid ON true
     WHERE o."organizationId" = ${organizationId} AND o.id = ${orderId}`);
   const row = rows[0];

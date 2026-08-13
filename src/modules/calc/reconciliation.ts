@@ -2,6 +2,7 @@ import { MatchConfidence, MatchStatus, MatchType, Prisma, type ShipmentStatus } 
 import { prisma } from "../../lib/prisma.js";
 import { CARRIER_SQL } from "../connectors/courier.js";
 import { isCashAtDoorGateway } from "../connectors/shopify/gateways.js";
+import { capturedStatusSql, capturedStatusFilter } from "./paymentStatus.js";
 
 // Reconciliation — §110's trust layer applied to money movement.
 //
@@ -186,7 +187,7 @@ async function runOrderPaymentLeg(organizationId: string, pending: PendingMatch[
       organizationId,
       // An authorised-but-uncaptured payment has moved no money yet, and a
       // failed one never will. Neither settles an order.
-      status: { in: ["captured", "CAPTURED", "processed", "PROCESSED", "paid", "PAID"] },
+      ...capturedStatusFilter(),
     },
     select: { id: true, orderId: true, amount: true, capturedAt: true, createdAt: true, raw: true },
   });
@@ -424,7 +425,7 @@ async function runPaymentSettlementLeg(
 ): Promise<LegOutcome> {
   const [payments, lines] = await Promise.all([
     prisma.payment.findMany({
-      where: { organizationId, status: "captured" },
+      where: { organizationId, ...capturedStatusFilter() },
       select: { id: true, amount: true },
     }),
     prisma.settlementLine.findMany({
@@ -1038,7 +1039,7 @@ export async function readReconciliationLegs(organizationId: string): Promise<Le
       MatchType.PAYMENT_SETTLEMENT,
       "PAYMENT",
       Prisma.sql`SELECT id, amount AS value FROM payments
-                 WHERE "organizationId" = ${organizationId} AND status = 'captured'`
+                 WHERE "organizationId" = ${organizationId} AND ${capturedStatusSql(Prisma.sql`status`)}`
     ),
     aggregateLeg(
       organizationId,
@@ -1354,7 +1355,7 @@ export async function getCodExposure(
     // two apart is a gateway-name test (see connectors/shopify/gateways.ts)
     // that SQL can't share.
     prisma.payment.findMany({
-      where: { organizationId, status: "captured", order: orderScope },
+      where: { organizationId, ...capturedStatusFilter(), order: orderScope },
       select: { amount: true, method: true },
     }),
     prisma.shipment.aggregate({

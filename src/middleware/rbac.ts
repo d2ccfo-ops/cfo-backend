@@ -125,8 +125,26 @@ export interface RbacDecision {
  * no database. An access-control rule that is only exercised through HTTP is
  * a rule whose edge cases are untested.
  */
-export function decideAccess(role: MembershipRole, method: string, path: string): RbacDecision {
+export function decideAccess(role: MembershipRole, method: string, rawPath: string): RbacDecision {
   const normalised = normaliseRole(role);
+  // ---------------------------------------------------------------------------
+  // CASE. Express 4 routes case-INSENSITIVELY by default; these policies match
+  // case-SENSITIVELY. That gap was a privilege escalation, not a cosmetic one:
+  // POST /Connections/shopify/connect reaches the real handler, misses the
+  // /connections prefix and every explicit pattern, and falls through to the
+  // catch-all "/" policy — so a FINANCE_MANAGER, who must never touch
+  // credentials, could set a provider access token by capitalising one letter.
+  // Reproduced against this repo's own Express before this fix.
+  //
+  // Lowercasing here is safe precisely because every prefix and pattern below
+  // is lowercase ASCII, and this value is used ONLY to choose a policy — never
+  // to route, and never to look anything up. The audit row records the path as
+  // it actually arrived, so a probing attempt is still visible as one.
+  //
+  // app.ts also sets "case sensitive routing", so a capitalised path now 404s
+  // before it gets here. Both, deliberately: the routing flag is a global
+  // someone could turn off, and this function is unit-tested.
+  const path = rawPath.toLowerCase();
 
   if (READ_METHODS.has(method.toUpperCase())) {
     // Reads: all roles, including EXTERNAL_CA. §12.2 says an external CA is

@@ -29,7 +29,17 @@ import { getRevenueLadder } from "./revenueLadder.js";
 // is marked `reliable: false`. §109: if meaningful inputs are missing, say so
 // rather than showing false precision.
 
-export const FORMULA_VERSION = "v1";
+// v2 (2026-08-13, §92). Three changes that alter what the number MEANS, so a
+// v1 snapshot must not be compared against a v2 one:
+//
+//  1. Freight and RTO cost bucket by dispatch (pickedUpAt) instead of row
+//     insertion (createdAt). Under v1 a backfill put a year of shipping cost
+//     into one month and left every other month reporting ₹0 as covered.
+//  2. Gateway fees resolve from the payout line where the capture states none,
+//     so GoKwik-settled orgs stop reporting ₹0 fees.
+//  3. Entity-scoped requests now scope the COST side too; v1 subtracted the
+//     whole organisation's costs from one entity's revenue.
+export const FORMULA_VERSION = "v2";
 
 interface Layer {
   key: string;
@@ -63,7 +73,12 @@ export async function getContributionMargin(
   // caller passed before this existed and remains the default.
   scope: EntityScope | null = null
 ) {
-  const [ladder, lineItems, shipments, adSpend, payments, settings, freight, fees, orderCount] = await Promise.all([
+  // `shipments` and `payments` used to be fetched here and then never read —
+  // the freight and fee arithmetic moved into getFreightSplit/getTransactionFees,
+  // which run their own queries in this same Promise.all. Two full range scans
+  // (~20k shipment rows and ~25k payment rows on a real org) were being loaded
+  // and discarded on every dashboard render, report and nightly snapshot.
+  const [ladder, lineItems, adSpend, settings, freight, fees, orderCount] = await Promise.all([
     getRevenueLadder(organizationId, range, scope),
     prisma.orderLineItem.findMany({
       where: {
@@ -77,21 +92,16 @@ export async function getContributionMargin(
       },
       select: { cogsAmount: true, totalAmount: true },
     }),
-    prisma.shipment.findMany({
-      where: { organizationId, createdAt: { gte: range.from, lte: range.to } },
-      select: { freightAmount: true, status: true },
-    }),
+    // Scoped like every other cost query below. Org-wide here meant an
+    // entity-scoped request divided one entity's revenue by the whole
+    // organisation's ad bill.
     prisma.adSpend.findMany({
-      where: { organizationId, date: { gte: range.from, lte: range.to } },
+      where: { ...scopeWhere(organizationId, scope), date: { gte: range.from, lte: range.to } },
       select: { spendAmount: true, currency: true },
     }),
-    prisma.payment.findMany({
-      where: { organizationId, capturedAt: { gte: range.from, lte: range.to } },
-      select: { feeAmount: true },
-    }),
     getOrgSettings(organizationId),
-    getFreightSplit(organizationId, range),
-    getTransactionFees(organizationId, range),
+    getFreightSplit(organizationId, range, scope),
+    getTransactionFees(organizationId, range, scope),
     prisma.order.count({
       where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.from, lte: range.to }, cancelledAt: null },
     }),
@@ -151,7 +161,7 @@ export async function getContributionMargin(
 
   // --- What returns cost (§17). Reported, never deducted — the freight in it
   // is already inside forward and reverse shipping above.
-  const rto = await getRtoCost(organizationId, range, packaging);
+  const rto = await getRtoCost(organizationId, range, packaging, scope);
 
   const layers: Layer[] = [
     {

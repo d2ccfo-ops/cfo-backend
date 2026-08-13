@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import type { ResolvedRange } from "../../lib/dateRange.js";
 import { prisma } from "../../lib/prisma.js";
 import { AMOUNT_TOLERANCE_PAISE } from "../calc/reconciliation.js";
+import { capturedStatusSql } from "../calc/paymentStatus.js";
 
 // P6.4 — the §15 exception taxonomy.
 //
@@ -253,7 +254,7 @@ const DETECTORS: Record<string, Detector> = {
       SELECT p.id, coalesce(p."externalPaymentId", p.id) AS ref, p.amount, p."capturedAt" AS captured
       FROM payments p
       WHERE p."organizationId" = ${organizationId}
-        AND p.status = 'captured'
+        AND ${capturedStatusSql(Prisma.sql`p.status`)}
         AND p."capturedAt" BETWEEN ${range.from} AND ${range.to}
         AND NOT EXISTS (SELECT 1 FROM settlement_lines sl WHERE sl."paymentId" = p.id)
       ORDER BY p.amount DESC`);

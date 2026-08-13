@@ -49,12 +49,29 @@ import { razorpayWebhookRouter } from "./routes/webhooks/razorpay.js";
 import { setuWebhookRouter } from "./routes/webhooks/setu.js";
 import { shiprocketWebhookRouter } from "./routes/webhooks/shiprocket.js";
 import { shopifyWebhookRouter } from "./routes/webhooks/shopify.js";
-import { logger } from "./lib/logger.js";
+import { httpSerializers, logger } from "./lib/logger.js";
 
 export function createApp() {
   const app = express();
 
-  app.use(pinoHttp({ logger }));
+  // Express 4 routes case-insensitively by default, so /Connections/x/connect
+  // reached the same handler as /connections/x/connect while missing every
+  // lowercase policy prefix in middleware/rbac.ts — a role that must never
+  // touch credentials could set one by capitalising a letter. The policy
+  // matcher normalises case now too; this makes the mismatch impossible rather
+  // than merely handled, and costs nothing because every path this API and its
+  // frontend use is lowercase.
+  app.set("case sensitive routing", true);
+  // A trailing slash is the same idea in a different disguise: /connections/
+  // and /connections are one route, and only one of them matches a prefix
+  // written without the slash.
+  app.set("strict routing", false);
+
+  // serializers, not just `logger`: pino-http installs pino-std-serializers by
+  // default, whose req serializer logs originalUrl WITH the query string — so
+  // OAuth `?code=` and the Setu webhook's `?key=<secret>` were written in
+  // plaintext on every request. See lib/logger.ts.
+  app.use(pinoHttp({ logger, serializers: httpSerializers }));
   app.use(cors());
 
   // Needs the raw body for svix signature verification, so it's mounted with

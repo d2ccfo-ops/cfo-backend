@@ -123,7 +123,14 @@ const INGEST_PREFIXES = ["/connections/bank", "/connections/gokwik", "/connectio
  * Exported and pure so the choice can be swept in tests over every real path,
  * rather than inferred from where somebody happened to mount a limiter.
  */
-export function limitFor(method: string, path: string): RateLimitOptions {
+export function limitFor(method: string, rawPath: string): RateLimitOptions {
+  // Lowercased for the same reason middleware/rbac.ts does it: Express 4 routes
+  // case-insensitively, so /Costs reached the handler while missing this
+  // prefix list and silently got the 120/min write ceiling instead of the
+  // 20/min ingest one — the tighter limit that exists because the route parses
+  // a 50 MB upload. Every prefix here is lowercase, and this value only picks a
+  // bucket.
+  const path = rawPath.toLowerCase();
   if (path.startsWith("/ai")) return AI_LIMIT;
   if (INGEST_PREFIXES.some((p) => path === p || path.startsWith(`${p}/`))) return INGEST_LIMIT;
   const isRead = method === "GET" || method === "HEAD" || method === "OPTIONS";

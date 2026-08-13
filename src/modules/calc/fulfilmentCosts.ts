@@ -1,6 +1,7 @@
 import type { ResolvedRange } from "../../lib/dateRange.js";
 import { prisma } from "../../lib/prisma.js";
 import type { OrgSettings } from "../orgs/settings.js";
+import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 
 // §23–§25 fulfilment cost layers (P6.5) — packaging, the forward/reverse
 // freight split, and what an RTO actually costs.
@@ -69,6 +70,37 @@ const INVOICE_EXPECTED_AFTER_DAYS = 45;
  */
 const PAYOUT_EXPECTED_AFTER_DAYS = 10;
 
+/**
+ * Shipments that were DISPATCHED in this window — not merely inserted in it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BUG THIS REPLACES
+ * ---------------------------------------------------------------------------
+ * Both freight functions filtered on `createdAt`, which is `@default(now())` —
+ * the moment the row was written, never the moment the parcel moved. So a
+ * backfill of a year of history dumped twelve months of freight and RTO cost
+ * into whatever month the connection happened to be connected, and every other
+ * month reported ₹0 shipping with the layer marked covered.
+ *
+ * calc/shipments.ts hit exactly this and fixed it in its v2, with the reasoning
+ * written down at the top of that file. This is the same predicate, so the RTO
+ * rate on the Overview and the shipping cost inside CM1 finally describe the
+ * same set of parcels — they disagreed before, and nothing said so.
+ *
+ * The null branch is not a fallback to convenience: a shipment with no
+ * pickedUpAt has no known dispatch date, and createdAt is the only timestamp
+ * there is. getFreightSplit already reports `neverDispatched` separately, so a
+ * period dominated by those is visible rather than implied.
+ */
+function dispatchedWithin(range: ResolvedRange) {
+  return {
+    OR: [
+      { pickedUpAt: { gte: range.from, lte: range.to } },
+      { pickedUpAt: null, createdAt: { gte: range.from, lte: range.to } },
+    ],
+  };
+}
+
 export interface FreightSplit {
   /** Outbound freight: total billed minus return legs. */
   forwardMinor: bigint;
@@ -107,9 +139,16 @@ export interface FreightSplit {
   hasReverseSource: boolean;
 }
 
-export async function getFreightSplit(organizationId: string, range: ResolvedRange): Promise<FreightSplit> {
+export async function getFreightSplit(
+  organizationId: string,
+  range: ResolvedRange,
+  // §12.2. Shipment carries legalEntityId, so an entity-scoped contribution
+  // margin can scope its shipping cost too. Without this, CM1 subtracted the
+  // whole organisation's freight from one entity's revenue.
+  scope: EntityScope | null = null
+): Promise<FreightSplit> {
   const shipments = await prisma.shipment.findMany({
-    where: { organizationId, createdAt: { gte: range.from, lte: range.to } },
+    where: { ...scopeWhere(organizationId, scope), ...dispatchedWithin(range) },
     select: { id: true, freightAmount: true, awbCode: true, pickedUpAt: true, createdAt: true },
   });
 
@@ -239,10 +278,11 @@ export interface RtoCost {
 export async function getRtoCost(
   organizationId: string,
   range: ResolvedRange,
-  packaging: PackagingCost
+  packaging: PackagingCost,
+  scope: EntityScope | null = null
 ): Promise<RtoCost> {
   const shipments = await prisma.shipment.findMany({
-    where: { organizationId, createdAt: { gte: range.from, lte: range.to } },
+    where: { ...scopeWhere(organizationId, scope), ...dispatchedWithin(range) },
     select: { id: true, status: true, freightAmount: true },
   });
 
@@ -340,7 +380,14 @@ export interface TransactionFees {
   codCovered: boolean;
 }
 
-export async function getTransactionFees(organizationId: string, range: ResolvedRange): Promise<TransactionFees> {
+export async function getTransactionFees(
+  organizationId: string,
+  range: ResolvedRange,
+  // §12.2. Payment carries legalEntityId, so gateway and marketplace fees scope
+  // with the revenue they belong to. Org-wide here meant an entity-scoped CM2
+  // deducted every entity's fees from one entity's margin.
+  scope: EntityScope | null = null
+): Promise<TransactionFees> {
   // Payment carries connectionId but no `connection` relation, so which
   // provider produced a payment is resolved through the connection table first.
   // One query rather than a join — an org has a handful of connections and
@@ -353,7 +400,7 @@ export async function getTransactionFees(organizationId: string, range: Resolved
 
   const [payments, settledFees, codAgg, codSourceCount, codOrders, marketplaceOrders] = await Promise.all([
     prisma.payment.findMany({
-      where: { organizationId, capturedAt: { gte: range.from, lte: range.to } },
+      where: { ...scopeWhere(organizationId, scope), capturedAt: { gte: range.from, lte: range.to } },
       select: { id: true, feeAmount: true, connectionId: true, capturedAt: true },
     }),
     // THE SECOND PLACE A GATEWAY FEE IS STATED, and for several providers the
@@ -385,7 +432,7 @@ export async function getTransactionFees(organizationId: string, range: Resolved
     }),
     prisma.settlementLine.count({ where: { organizationId, type: "SHIPMENT_COD" } }),
     prisma.order.count({
-      where: { organizationId, placedAt: { gte: range.from, lte: range.to }, paymentMode: "COD", cancelledAt: null },
+      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.from, lte: range.to }, paymentMode: "COD", cancelledAt: null },
     }),
     // Marketplace orders placed in this period — the sales that should have a
     // referral fee against them. Same role codOrders plays: it separates "this
@@ -393,7 +440,7 @@ export async function getTransactionFees(organizationId: string, range: Resolved
     // connector is not attached".
     prisma.order.count({
       where: {
-        organizationId,
+        ...scopeWhere(organizationId, scope),
         placedAt: { gte: range.from, lte: range.to },
         channel: { in: [...MARKETPLACE_CHANNELS] },
         cancelledAt: null,

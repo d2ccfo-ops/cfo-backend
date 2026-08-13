@@ -1,5 +1,6 @@
 import { prisma } from "../../lib/prisma.js";
 import type { ResolvedRange } from "../../lib/dateRange.js";
+import { capturedStatusFilter } from "./paymentStatus.js";
 
 // P4.1b. Three positions the AI tool registry needed and no calc module owned:
 // what a provider has paid us, what it still owes us, and what actually moved
@@ -103,7 +104,10 @@ export async function getPendingSettlements(organizationId: string): Promise<Pen
   const rows = await prisma.payment.findMany({
     where: {
       organizationId,
-      status: "CAPTURED",
+      // Was `status: "CAPTURED"`, which matched zero rows — every writer stores
+      // lowercase and Prisma equality is case-sensitive — so this reported the
+      // gateway owing ₹0 as a measured fact. See calc/paymentStatus.ts.
+      ...capturedStatusFilter(),
       settlementLines: { none: {} },
     },
     select: { amount: true, capturedAt: true },

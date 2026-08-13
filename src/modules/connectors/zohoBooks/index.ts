@@ -75,9 +75,38 @@ const LOCATION_TO_ACCOUNTS: Record<string, string> = {
   uk: "https://accounts.zoho.uk",
 };
 
+/**
+ * Every accounts host Zoho actually operates. An ALLOWLIST, not a pattern.
+ *
+ * ---------------------------------------------------------------------------
+ * THE SSRF THIS REPLACES
+ * ---------------------------------------------------------------------------
+ * This was `/^https:\/\/accounts\.zoho(cloud)?\.[a-z.]+$/`, and the character
+ * class `[a-z.]+` contains a DOT — so it does not match a top-level domain, it
+ * matches any remaining dotted string. `https://accounts.zoho.attacker.com`
+ * passed it cleanly.
+ *
+ * `accounts-server` is a plain query parameter on an UNAUTHENTICATED callback
+ * route, and the only gate before it, verifyOAuthState, is satisfied by any
+ * state this server itself signed — which any user with an account can obtain
+ * by starting the flow. So an attacker could send themselves to
+ * /connections/zoho-books/callback?code=x&state=<their own valid state>
+ * &accounts-server=https://accounts.zoho.attacker.com, and exchangeCodeForTokens
+ * would POST client_id AND ZOHO_CLIENT_SECRET straight to that host.
+ *
+ * That is the application's Zoho app credential — not one user's token — so the
+ * blast radius is every Zoho connection this deployment will ever make. A
+ * pattern cannot express "a host Zoho runs"; only a list can.
+ */
+const ALLOWED_ACCOUNTS_SERVERS: ReadonlySet<string> = new Set(Object.values(LOCATION_TO_ACCOUNTS));
+
 export function accountsServerFor(location?: string, accountsServerParam?: string): string {
-  // Prefer what Zoho itself sent on the callback; the map is the fallback.
-  if (accountsServerParam && /^https:\/\/accounts\.zoho(cloud)?\.[a-z.]+$/.test(accountsServerParam)) {
+  // Prefer what Zoho itself sent on the callback, but only if it is a host Zoho
+  // actually runs. Anything else is discarded silently rather than throwing:
+  // the datacenter map below resolves the overwhelming majority of real logins,
+  // and a hard failure here would turn a probing attempt into a broken connect
+  // flow for the legitimate user who happens to hit an edge case.
+  if (accountsServerParam && ALLOWED_ACCOUNTS_SERVERS.has(accountsServerParam)) {
     return accountsServerParam;
   }
   return LOCATION_TO_ACCOUNTS[(location ?? "").toLowerCase()] ?? DEFAULT_ACCOUNTS_SERVER;
@@ -141,8 +170,32 @@ export async function exchangeCodeForTokens(
   return {
     refreshToken: json.refresh_token,
     accessToken: json.access_token ?? "",
-    apiDomain: json.api_domain ?? DEFAULT_API_DOMAIN,
+    // api_domain is STORED in the connection's credentials and then used to
+    // build every subsequent Books API URL, so a bad value is durable, not
+    // per-request. With the accounts server allowlisted above this response can
+    // only come from Zoho, which makes this defence in depth rather than a
+    // second hole — but a field that decides where an access token gets sent
+    // for the life of a connection is worth checking even when its source is
+    // trusted.
+    apiDomain: isZohoApiDomain(json.api_domain) ? json.api_domain! : DEFAULT_API_DOMAIN,
   };
+}
+
+/** A host Zoho serves the Books API from. Same allowlist discipline as accountsServerFor. */
+export function isZohoApiDomain(value: string | undefined | null): boolean {
+  if (!value) return false;
+  let host: string;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") return false;
+    host = url.host.toLowerCase();
+  } catch {
+    return false;
+  }
+  // Exact hosts, or a subdomain of a Zoho-owned API domain. Written as a
+  // suffix check against a leading dot so "zohoapis.com.evil.net" cannot pass.
+  const roots = ["zohoapis.com", "zohoapis.in", "zohoapis.eu", "zohoapis.com.au", "zohoapis.jp", "zohoapis.ca", "zohoapis.sa", "zohoapis.uk", "zohocloud.ca"];
+  return roots.some((r) => host === r || host.endsWith(`.${r}`));
 }
 
 // Access tokens last one hour, so this runs on every sync rather than being

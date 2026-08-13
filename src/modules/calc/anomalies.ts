@@ -10,6 +10,7 @@ import { getProductProfitability } from "./productProfitability.js";
 import { getNetRevenueSummary } from "./revenue.js";
 import { getRevenueLadder } from "./revenueLadder.js";
 import { getRtoRateSummary } from "./shipments.js";
+import { capturedStatusFilter } from "./paymentStatus.js";
 
 // §17 anomaly detection — rule-based, per the spec's explicit instruction for
 // v1. Every rule here is a pure function of a pre-fetched summary (easy to
@@ -439,7 +440,7 @@ export function decideDuplicatePayments(
 
 async function checkDuplicatePayments(ctx: RuleContext): Promise<AnomalyCandidate | null> {
   const payments = await prisma.payment.findMany({
-    where: { organizationId: ctx.organizationId, status: "captured", orderId: { not: null }, capturedAt: { gte: ctx.range.from, lte: ctx.range.to } },
+    where: { organizationId: ctx.organizationId, ...capturedStatusFilter(), orderId: { not: null }, capturedAt: { gte: ctx.range.from, lte: ctx.range.to } },
     select: { id: true, orderId: true, amount: true },
   });
   const byOrder = new Map<string, typeof payments>();

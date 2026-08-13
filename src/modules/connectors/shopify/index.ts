@@ -749,6 +749,91 @@ async function upsertProduct(ctx: ConnectorContext, payload: ShopifyProduct): Pr
   }
 }
 
+/**
+ * HMAC verification against an EXPLICIT secret, so the caller decides which
+ * one — the app-wide secret, or the specific connection's own.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS FAILS CLOSED ON A MISSING SECRET
+ * ---------------------------------------------------------------------------
+ * This used to read `env.SHOPIFY_WEBHOOK_SECRET ?? ""` and then HMAC normally.
+ * HMAC-SHA256 with a zero-length key is perfectly valid and computable by
+ * anyone, so with the env var unset the check did not fail closed — it
+ * verified attacker-supplied signatures against a key the whole world knows.
+ *
+ * That was not a hypothetical configuration. SHOPIFY_WEBHOOK_SECRET is
+ * optional in config/env.ts, and the Custom App connect path
+ * (routes/connections/shopify.ts) creates ACTIVE connections without it. Any
+ * deployment using that path — the only one this system has ever run against —
+ * accepted forged order webhooks from anyone who knew a shop domain.
+ *
+ * A webhook with no secret to check against is unverifiable, and unverifiable
+ * means rejected. Same rule routes/webhooks/setu.ts already followed.
+ */
+export function verifyShopifyWebhook(
+  rawBody: Buffer,
+  headers: Record<string, string>,
+  secret: string | undefined
+): WebhookVerificationResult {
+  const base = {
+    externalEventId: headers["x-shopify-webhook-id"] ?? "",
+    eventType: headers["x-shopify-topic"] ?? "unknown",
+  };
+
+  // No secret, no verification. Never an empty-key HMAC.
+  if (!secret) return { ...base, valid: false };
+
+  const hmac = headers["x-shopify-hmac-sha256"];
+  if (!hmac) return { ...base, valid: false };
+
+  const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
+  const digestBuf = Buffer.from(digest);
+  const hmacBuf = Buffer.from(hmac);
+  const valid = digestBuf.length === hmacBuf.length && crypto.timingSafeEqual(digestBuf, hmacBuf);
+  return { ...base, valid };
+}
+
+/**
+ * The shop a webhook payload says it belongs to, or null when the payload does
+ * not state one.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS EXISTS: THE HEADER IS NOT SIGNED
+ * ---------------------------------------------------------------------------
+ * Shopify's HMAC covers the BODY only. `x-shopify-shop-domain` — the header the
+ * webhook route used to pick WHICH organisation to write into — is outside the
+ * signed material, and under the Partner-app model every merchant's webhook is
+ * signed with the SAME app-wide secret.
+ *
+ * So any merchant who installed the app could take one of their own genuinely
+ * Shopify-signed deliveries, resend the identical body with the header swapped
+ * to a competitor's shop, and have their order and revenue rows written into
+ * that competitor's books. The signature still validates, because the body did
+ * not change.
+ *
+ * Order payloads carry `order_status_url` (and often `checkout_url`), which is
+ * built from the shop's own domain and IS inside the signed body. Matching it
+ * against the header turns the tenant choice into something the attacker
+ * cannot forge without also breaking the HMAC.
+ *
+ * Returns null for payloads that state no shop (product webhooks) — the caller
+ * decides what to do with "cannot tell", and must not read null as "matches".
+ */
+export function shopFromPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  for (const key of ["order_status_url", "checkout_url", "abandoned_checkout_url"]) {
+    const raw = p[key];
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    try {
+      return new URL(raw).host.toLowerCase();
+    } catch {
+      // A malformed URL is not evidence of anything; keep looking.
+    }
+  }
+  return null;
+}
+
 export const shopifyConnector: Connector = {
   provider: "SHOPIFY",
 
@@ -761,18 +846,7 @@ export const shopifyConnector: Connector = {
   },
 
   verifyWebhook(rawBody: Buffer, headers: Record<string, string>): WebhookVerificationResult {
-    const hmac = headers["x-shopify-hmac-sha256"];
-    const secret = env.SHOPIFY_WEBHOOK_SECRET ?? "";
-    const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
-    const digestBuf = Buffer.from(digest);
-    const hmacBuf = Buffer.from(hmac ?? "");
-    const valid = Boolean(hmac) && digestBuf.length === hmacBuf.length && crypto.timingSafeEqual(digestBuf, hmacBuf);
-
-    return {
-      valid,
-      externalEventId: headers["x-shopify-webhook-id"] ?? "",
-      eventType: headers["x-shopify-topic"] ?? "unknown",
-    };
+    return verifyShopifyWebhook(rawBody, headers, env.SHOPIFY_WEBHOOK_SECRET);
   },
 
   async processEvent(ctx: ConnectorContext, payload: unknown, eventType: string): Promise<void> {

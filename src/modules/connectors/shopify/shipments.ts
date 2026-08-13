@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { Prisma, type ShipmentStatus } from "@prisma/client";
 import { prisma } from "../../../lib/prisma.js";
 import { isCashAtDoorGateway } from "./gateways.js";
+import { capturedStatusFilter } from "../../calc/paymentStatus.js";
 
 // Shipment rows derived from the Shopify fulfillments ALREADY STORED in
 // Order.raw — no API call, no new credentials. Until this existed the
@@ -234,7 +235,7 @@ export async function syncShipmentsFromStoredOrders(
     // grouped query per page, filtered to non-COD gateways in code (the
     // gateway test is a regex set, not expressible in the where).
     const payments = await prisma.payment.findMany({
-      where: { orderId: { in: orders.map((o) => o.id) }, status: "captured" },
+      where: { orderId: { in: orders.map((o) => o.id) }, ...capturedStatusFilter() },
       select: { orderId: true, amount: true, method: true },
     });
     const prepaidByOrder = new Map<string, bigint>();
