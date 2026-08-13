@@ -162,9 +162,15 @@ export async function getContributionMargin(
       amount: paiseToRupees(cogs),
       covered: cogsCovered,
       hasSource: costedLines.length > 0,
-      note: cogsCovered
-        ? `All ${costedLines.length} order lines costed`
-        : `${uncostedLines} of ${lineItems.length} order lines have no cost (${cogsValueCoveragePct}% of line value covered)`,
+      note: lineItems.length === 0
+        // An empty period read "0 of 0 order lines have no cost (0% of line
+        // value covered)" — a sentence that parses as a failure when the truth
+        // is that nothing was sold. The first thing a brand sees on day one
+        // should not be a percentage implying its costs are 0% known.
+        ? "No order lines in this period"
+        : cogsCovered
+          ? `All ${costedLines.length} order lines costed`
+          : `${uncostedLines} of ${lineItems.length} order lines have no cost (${cogsValueCoveragePct}% of line value covered)`,
     },
     {
       key: "packaging",
@@ -260,7 +266,13 @@ export async function getContributionMargin(
       // remittance statement covers it, or there was no COD to charge for.
       // A period with COD sales and no statement is a gap, not a zero.
       covered: fees.codCovered,
-      hasSource: fees.hasCodSource,
+      // A brand with no COD sales HAS its source: there is nothing to source.
+      // Without the second clause this layer read `covered: true` in the layer
+      // list and appeared in the "cost layers with no data source, treated as
+      // zero" warning at the same time — two statements about the same number
+      // that contradict each other on the same screen. Same fix as
+      // marketplaceFees; codCovered already drew the distinction correctly.
+      hasSource: fees.hasCodSource || fees.codOrders === 0,
       note: fees.codLines > 0
         ? `${fees.codLines} COD remittance lines in this period`
         : fees.codOrders === 0
@@ -354,12 +366,29 @@ export async function getContributionMargin(
   // weights (Revenue 25, COGS 20, Shipping 15, Gateway 10, Refunds/RTO 10,
   // Ads 20). Revenue and refunds are sourced, so they score; the rest score
   // only when their layer is covered.
+  // AN ORG THAT HAS CONNECTED NOTHING SCORES ZERO, NOT 30.
+  //
+  // "Revenue — always available" was true of every org this ever ran against,
+  // because they all had orders. It is false on day one: a brand that has just
+  // signed up and connected nothing was told its contribution margin was 30%
+  // complete, which reads as "a third of the picture is here" when none of it
+  // is. The refund/RTO points compounded it — refunds of no orders.
+  //
+  // Not the same as a genuinely quiet month. If a store is connected and
+  // truthfully reports no sales in the window, revenue data IS complete — so
+  // this keys off whether any order has EVER been recorded for the org, not
+  // whether this period had any.
+  const everSold = (await prisma.order.findFirst({ where: { organizationId }, select: { id: true } })) !== null;
+  if (!everSold) {
+    warnings.push("No sales data has ever been recorded for this organisation — connect a sales channel to begin.");
+  }
+
   const dataCompleteness =
-    25 + // revenue — always available
+    (everSold ? 25 : 0) + // revenue — scores because a sales source has produced orders
     // Refunds/RTO. The refund side has always been real; the RTO side became
     // measurable once courier invoices supplied return-leg freight (P6.5), so
     // this scores in full only when that source exists.
-    (rto.measurable ? 10 : 5) +
+    (!everSold ? 0 : rto.measurable ? 10 : 5) +
     (cogsCovered ? 20 : Math.round(20 * (cogsValueCoveragePct / 100))) +
     (shippingCovered ? 15 : 0) +
     (gatewayCovered ? 10 : 0) +
