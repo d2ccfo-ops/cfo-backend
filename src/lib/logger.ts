@@ -90,7 +90,11 @@ export function redactUrl(url: string | undefined): string | undefined {
   }
   // Re-encoding a query string that contained nothing sensitive would rewrite
   // it (escaping, ordering) and make logs disagree with what the client sent.
-  return touched ? `${path}?${params.toString()}` : url;
+  if (!touched) return url;
+  // URLSearchParams percent-encodes the brackets, so the marker came out as
+  // %5BREDACTED%5D — correct, and something a human reading a log at 2am has
+  // to decode. Put back the one token we chose ourselves.
+  return `${path}?${params.toString().replaceAll("%5BREDACTED%5D", "[REDACTED]")}`;
 }
 
 export const logger = pino({
