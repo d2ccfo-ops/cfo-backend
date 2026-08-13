@@ -187,6 +187,130 @@ async function pullInsights(ctx: ConnectorContext, sinceDate: string, until: str
   return count;
 }
 
+// §14 campaign grain. Same GAQL search endpoint, FROM campaign instead of FROM
+// customer — Google returns one row per campaign per day. See the schema
+// comment on AdCampaignSpend for why this is a separate table and never summed
+// with the account-day rows.
+interface GoogleAdsCampaignRow extends GoogleAdsRow {
+  campaign?: { id?: string; name?: string };
+  metrics?: GoogleAdsRow["metrics"] & {
+    conversions?: number | string;
+    conversionsValue?: number | string;
+  };
+}
+
+async function pullCampaignInsights(ctx: ConnectorContext, sinceDate: string, until: string): Promise<number> {
+  const creds = decodeCredentials(ctx.credentialsRef);
+  const accessToken = await getAccessToken(creds.refreshToken);
+  const customerId = ctx.externalAccountId ?? "";
+
+  // metrics.conversions is a DOUBLE in Google's model, not an integer: it is
+  // fractionally attributed across touchpoints, so a single sale can arrive as
+  // 0.33. Rounded only at the point of storage, and stored at all only so the
+  // platform's claim can be compared against measured orders.
+  const query =
+    `SELECT customer.currency_code, campaign.id, campaign.name, segments.date, ` +
+    `metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions, metrics.conversions_value ` +
+    `FROM campaign WHERE segments.date BETWEEN '${sinceDate}' AND '${until}'`;
+
+  let count = 0;
+  let pageToken: string | undefined;
+  let pages = 0;
+
+  do {
+    const res = await fetch(`${GOOGLE_ADS_BASE}/customers/${customerId}/googleAds:search`, {
+      method: "POST",
+      headers: authHeaders(accessToken),
+      body: JSON.stringify(pageToken ? { query, pageToken } : { query }),
+    });
+    if (!res.ok) throw new Error(`google_ads_campaign_search_failed_${res.status}_${await res.text()}`);
+    const data = (await res.json()) as { results?: GoogleAdsCampaignRow[]; nextPageToken?: string };
+
+    for (const row of data.results ?? []) {
+      const date = row.segments?.date;
+      const campaignId = row.campaign?.id;
+      if (!date || !campaignId) continue;
+      const externalEventId = `adcampaign_${customerId}_${campaignId}_${date}`;
+      await prisma.rawEvent.upsert({
+        where: { connectionId_externalEventId: { connectionId: ctx.connectionId, externalEventId } },
+        create: {
+          organizationId: ctx.organizationId,
+          connectionId: ctx.connectionId,
+          provider: "GOOGLE_ADS",
+          externalEventId,
+          eventType: "ad_campaign_spend.sync",
+          payload: row as unknown as object,
+          processedAt: new Date(),
+          processingStatus: "PROCESSED",
+        },
+        update: { payload: row as unknown as object, processedAt: new Date(), processingStatus: "PROCESSED" },
+      });
+      await upsertCampaignRow(ctx, row, date, campaignId);
+      count++;
+    }
+
+    pageToken = data.nextPageToken;
+    pages++;
+  } while (pageToken && pages < MAX_PAGES_PER_RUN);
+
+  return count;
+}
+
+async function upsertCampaignRow(
+  ctx: ConnectorContext,
+  row: GoogleAdsCampaignRow,
+  date: string,
+  campaignId: string
+): Promise<void> {
+  const dateObj = new Date(`${date}T00:00:00.000Z`);
+  const costMicros = row.metrics?.costMicros ? Number(row.metrics.costMicros) : 0;
+  const currency = row.customer?.currencyCode ?? "INR";
+  const conversions = row.metrics?.conversions === undefined ? null : Number(row.metrics.conversions);
+  const conversionsValue = row.metrics?.conversionsValue === undefined ? null : Number(row.metrics.conversionsValue);
+
+  const payload = {
+    externalAccountId: ctx.externalAccountId ?? "",
+    campaignName: row.campaign?.name ?? null,
+    // Null for the same reason as Meta's: Google does not state which sales
+    // channel a campaign drove. A Shopping campaign feeding a marketplace
+    // listing and one feeding the D2C store look identical here, so the
+    // attribution is left to an explicit mapping rather than guessed from the
+    // campaign name. calc/channels.ts reports the unattributed spend as a pool.
+    channel: null,
+    spendAmount: majorToMinorUnits(costMicros / 1_000_000),
+    currency,
+    impressions: row.metrics?.impressions ? Number(row.metrics.impressions) : null,
+    clicks: row.metrics?.clicks ? Number(row.metrics.clicks) : null,
+    // Platform-claimed, same caveat as Meta — Google attributes on its own
+    // model and counts view-through and cross-device conversions we cannot see.
+    conversions: conversions === null || !Number.isFinite(conversions) ? null : Math.round(conversions),
+    attributedRevenue:
+      conversionsValue === null || !Number.isFinite(conversionsValue) ? null : majorToMinorUnits(conversionsValue),
+    raw: row as unknown as object,
+  };
+
+  await prisma.adCampaignSpend.upsert({
+    where: {
+      connectionId_externalAccountId_campaignId_date: {
+        connectionId: ctx.connectionId,
+        externalAccountId: ctx.externalAccountId ?? "",
+        campaignId,
+        date: dateObj,
+      },
+    },
+    create: {
+      organizationId: ctx.organizationId,
+      legalEntityId: ctx.legalEntityId,
+      connectionId: ctx.connectionId,
+      provider: "GOOGLE_ADS",
+      campaignId,
+      date: dateObj,
+      ...payload,
+    },
+    update: payload,
+  });
+}
+
 function toUtcDateString(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
@@ -195,7 +319,22 @@ async function pull(ctx: ConnectorContext, sinceDate: string | null): Promise<Sy
   const until = toUtcDateString(new Date());
   const since = sinceDate ?? toUtcDateString(new Date(Date.now() - BACKFILL_DAYS * 24 * 60 * 60 * 1000));
   const count = await pullInsights(ctx, since, until);
-  return { recordsFetched: count, cursor: until };
+
+  // Account-day first, and a campaign-pull failure must not lose it or hold the
+  // cursor back — same reasoning as the Meta connector. The shortfall surfaces
+  // through calc/campaigns.ts's reconciliation against the account-day total
+  // rather than as a silently smaller ad bill.
+  let campaignCount = 0;
+  try {
+    campaignCount = await pullCampaignInsights(ctx, since, until);
+  } catch (err) {
+    console.warn(
+      `[googleAds] campaign-grain pull failed for ${ctx.externalAccountId}; account-day spend is unaffected:`,
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  return { recordsFetched: count + campaignCount, cursor: until };
 }
 
 export const googleAdsConnector: Connector = {

@@ -132,8 +132,16 @@ export async function getContributionMargin(
   // on the same table, split by the provider that produced the payment; COD
   // collection charges come from the remittance statement's fee column.
   const gatewayFees = fees.gatewayMinor;
-  const gatewayCovered = fees.gatewayPayments > 0 && fees.gatewayWithFee === fees.gatewayPayments;
-  const marketplaceCovered = fees.marketplacePayments > 0 && fees.marketplaceWithFee === fees.marketplacePayments;
+  // SETTLEABLE captures, not every capture. A payment taken this morning has no
+  // payout and therefore no stated fee; counting it as missing left this layer
+  // permanently uncovered for any trading org — the same flaw the forward
+  // shipping layer had before billableShipments. See PAYOUT_EXPECTED_AFTER_DAYS.
+  const gatewayCovered =
+    fees.gatewaySettleablePayments > 0 && fees.gatewaySettleableWithFee === fees.gatewaySettleablePayments;
+  // Computed in getTransactionFees, alongside the marketplace order count it
+  // depends on — a brand that sells on no marketplace has a measured ₹0 here,
+  // not an unknown. See TransactionFees.marketplaceCovered.
+  const marketplaceCovered = fees.marketplaceCovered;
 
   // --- Advertising (§31). INR only: mixing a USD-billed ad account into a
   // rupee margin would be off by ~85x, the same trap modules/calc/ads.ts guards.
@@ -183,6 +191,11 @@ export async function getContributionMargin(
         : `${freight.billedBillableShipments} of ${freight.billableShipments} billable shipments carry freight` +
           (freight.awaitingInvoice > 0 ? `; ${freight.awaitingInvoice} dispatched too recently to be invoiced yet` : "") +
           (freight.neverDispatched > 0 ? `; ${freight.neverDispatched} never dispatched, so nothing to bill` : "") +
+          // Named because it is a data-quality finding the founder can act on —
+          // two shipment rows for one waybill — not a courier billing gap.
+          (freight.ambiguousAwb > 0
+            ? `; ${freight.ambiguousAwb} share a waybill with another shipment, so freight cannot be split between them`
+            : "") +
           (freight.reverseMinor > 0n ? ". Excludes return legs, counted below." : ""),
     },
     {
@@ -227,7 +240,15 @@ export async function getContributionMargin(
       hasSource: fees.gatewayWithFee > 0,
       note: fees.gatewayPayments === 0
         ? "No gateway payments in this period"
-        : `${fees.gatewayWithFee} of ${fees.gatewayPayments} gateway payments carry a fee`,
+        : `${fees.gatewaySettleableWithFee} of ${fees.gatewaySettleablePayments} settled gateway payments carry a fee` +
+          // Named, not absorbed. A reader seeing a denominator smaller than the
+          // payment count needs to know where the rest went.
+          (fees.gatewayAwaitingPayout > 0 ? `; ${fees.gatewayAwaitingPayout} captured too recently to have settled` : "") +
+          // Where the figure came from changes how current it is: a fee stated
+          // at capture is known the same day, one read off a payout arrives
+          // days later. A reader deciding whether to trust a recent period
+          // needs that distinction, and it costs one clause to give it.
+          (fees.gatewayFeeFromSettlement > 0 ? ` (${fees.gatewayFeeFromSettlement} from the payout, not the capture)` : ""),
     },
     {
       key: "codFees",
@@ -253,10 +274,15 @@ export async function getContributionMargin(
       amountMinor: fees.marketplaceMinor.toString(),
       amount: paiseToRupees(fees.marketplaceMinor),
       covered: marketplaceCovered,
-      hasSource: fees.marketplaceWithFee > 0,
-      note: fees.marketplacePayments === 0
-        ? "No marketplace settlements in this period"
-        : `${fees.marketplaceWithFee} of ${fees.marketplacePayments} marketplace settlements carry a fee (referral + closing + GST)`,
+      // A brand with no marketplace sales HAS its source: there is nothing to
+      // source. Reporting "no data source" there put Amazon fees on the missing
+      // list of a shop that has only ever sold through its own store.
+      hasSource: fees.marketplaceWithFee > 0 || fees.marketplaceOrders === 0,
+      note: fees.marketplaceOrders === 0
+        ? "No marketplace sales in this period — nothing to charge a referral fee on"
+        : fees.marketplacePayments === 0
+          ? `${fees.marketplaceOrders} marketplace orders and no settlement covering them — the referral fee on those sales is unknown`
+          : `${fees.marketplaceWithFee} of ${fees.marketplacePayments} marketplace settlements carry a fee (referral + closing + GST)`,
     },
     {
       key: "advertising",

@@ -53,6 +53,7 @@ import { applyInvoice, type InvoiceLine, type ParsedInvoice } from "../src/modul
 import { BLUEDART_COD_STATEMENT } from "../src/modules/connectors/bluedart/index.js";
 import { GOKWIK_SETTLEMENT_STATEMENT } from "../src/modules/connectors/gokwik/index.js";
 import { ingestStatement } from "../src/modules/connectors/remittance/statement.js";
+import { stampCogs } from "../src/modules/calc/cogs.js";
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -137,11 +138,46 @@ async function resolveTarget(query: string): Promise<Target> {
 }
 
 async function demoConnection(target: Target, provider: Prisma.ConnectionUncheckedCreateInput["provider"], externalAccountId: string) {
+  // Every account id this script invents is "demo-" prefixed, and the re-stamp
+  // below depends on that being true — it is what makes it impossible to
+  // re-label a real connection as seeded.
+  if (!externalAccountId.startsWith("demo-")) {
+    throw new Error(`demoConnection called with a non-demo account id: "${externalAccountId}"`);
+  }
+
   const existing = await prisma.connection.findFirst({
     where: { organizationId: target.organizationId, provider, credentialsRef: { startsWith: DEMO_CREDENTIALS_PREFIX } },
     select: { id: true },
   });
   if (existing) return existing.id;
+
+  // THE SECOND LOOKUP, ON THE ACTUAL UNIQUE KEY.
+  //
+  // The one above identifies a connection by its credentialsRef marker, which
+  // is what --purge keys off. But the database's unique constraint is
+  // (organizationId, provider, externalAccountId) — a different key entirely.
+  // When a check script rewrote a seeded GOKWIK connection's credentialsRef,
+  // the marker lookup stopped finding it and the create collided instead: the
+  // seeder could not run again in that org at all, and the error named a
+  // constraint rather than the cause.
+  //
+  // Re-stamping the marker is safe here precisely because the account id is
+  // asserted "demo-" prefixed above, so the row being adopted can only be one
+  // this script created.
+  const byUniqueKey = await prisma.connection.findUnique({
+    where: {
+      organizationId_provider_externalAccountId: { organizationId: target.organizationId, provider, externalAccountId },
+    },
+    select: { id: true },
+  });
+  if (byUniqueKey) {
+    await prisma.connection.update({
+      where: { id: byUniqueKey.id },
+      data: { credentialsRef: `${DEMO_CREDENTIALS_PREFIX}${provider.toLowerCase()}` },
+    });
+    return byUniqueKey.id;
+  }
+
   const created = await prisma.connection.create({
     data: {
       organizationId: target.organizationId,
@@ -197,6 +233,20 @@ async function purge(target: Target) {
     where: { organizationId: target.organizationId, externalRefundId: { startsWith: "rfnd_DEMO" } },
   });
   if (refunds.count > 0) console.log(`  · ${refunds.count} refunds`);
+  // Account-day spend only when THIS script created it. An org whose rows came
+  // from a CSV upload or a live pull keeps them — purging those would delete
+  // measured data on the strength of a name prefix.
+  const adConnIds = conns.filter((c) => c.provider === "META_ADS" || c.provider === "GOOGLE_ADS").map((c) => c.id);
+  const adSpend = await prisma.adSpend.deleteMany({
+    where: { organizationId: target.organizationId, connectionId: { in: adConnIds } },
+  });
+  if (adSpend.count > 0) console.log(`  · ${adSpend.count} account-day ad spend rows`);
+  // Estimated costs only. A cost a founder typed in (MANUAL) or uploaded
+  // (CSV_IMPORT) is theirs, and survives.
+  const costs = await prisma.productCost.deleteMany({
+    where: { organizationId: target.organizationId, source: "ESTIMATED" },
+  });
+  if (costs.count > 0) console.log(`  · ${costs.count} estimated product costs`);
 
   console.log(
     `purged: ${invoices.count} freight invoices, ${settlements.count} settlements, ` +
@@ -205,7 +255,206 @@ async function purge(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. COURIER FREIGHT INVOICES (data register D5)
+// 1. PRODUCT COSTS (data register D1)
+// ---------------------------------------------------------------------------
+// Without a landed cost per SKU there is no COGS, and with no COGS every
+// contribution margin below CM0 is undefined — the single largest hole an org
+// can have. Shopify's "Cost per item" is empty for most Indian stores, so this
+// is D1 in the register and the thing founders are slowest to supply.
+//
+// TWO THINGS THIS DELIBERATELY DOES NOT DO.
+//
+// It does not write one blended ratio across every SKU. A uniform 40% would
+// give every product an identical margin, which makes the §40 product margin
+// table sort into arbitrary order and hides exactly the bug it exists to catch
+// — a loss-making SKU. The ratio is derived from a hash of the SKU so it is
+// stable across runs but spread across a realistic 32–52% band.
+//
+// It does not claim to be measured. source is ESTIMATED, which the enum
+// already defines as "derived or assumed — lowest confidence", and §42.8
+// forbids anything estimated from ever being reported as reconciled. A founder
+// looking at this org sees costs that announce themselves as guesses.
+function hashString(s: string) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h / 4294967296;
+}
+
+async function seedProductCosts(target: Target) {
+  // Weighted average selling price per SKU, taken from what actually sold
+  // rather than from the variant's list price — a SKU that only ever sells at
+  // a discount has a real margin nobody would see from the list price.
+  const sold = await prisma.$queryRaw<Array<{ sku: string; units: bigint; revenue: bigint }>>`
+    SELECT li.sku                       AS sku,
+           SUM(li.quantity)::bigint     AS units,
+           SUM(li."totalAmount")::bigint AS revenue
+    FROM order_line_items li
+    JOIN orders o ON o.id = li."orderId"
+    WHERE o."organizationId" = ${target.organizationId}
+      AND li.sku IS NOT NULL AND li.sku <> ''
+      AND li.quantity > 0
+    GROUP BY li.sku
+  `;
+  if (sold.length === 0) {
+    console.log("  no line items carry a SKU — skipping product costs");
+    return;
+  }
+
+  const already = new Set(
+    (await prisma.productCost.findMany({ where: { organizationId: target.organizationId }, select: { sku: true } })).map((r) => r.sku)
+  );
+  const todo = sold.filter((s) => !already.has(s.sku));
+  if (todo.length === 0) {
+    // Still stamp. Costs already present but never stamped is the exact state
+    // that leaves the COGS layer uncovered while the cost table looks full, and
+    // "nothing new to write" is not a reason to leave the lines unstamped.
+    const only = await stampCogs(target.organizationId);
+    console.log(`  all ${sold.length} sold SKUs already have a cost`);
+    console.log(`  stamped ${only.linesStamped} lines across ${only.ordersConsidered} orders, ${only.linesUncosted} still uncosted`);
+    return;
+  }
+
+  // Effective from the start of the month the org's first order landed, so
+  // every historical order resolves against a cost that was already in force.
+  const first = await prisma.order.aggregate({ where: { organizationId: target.organizationId }, _min: { placedAt: true } });
+  const from = first._min.placedAt ?? new Date();
+  const effectiveFrom = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+
+  // Resolve variant ids where the SKU matches, so the §19 cost is joinable
+  // both ways. A cost whose SKU no longer exists in Shopify keeps working.
+  const variants = await prisma.productVariant.findMany({
+    where: { product: { organizationId: target.organizationId }, sku: { not: null } },
+    select: { id: true, sku: true },
+  });
+  const variantBySku = new Map(variants.map((v) => [v.sku!, v.id]));
+
+  const rows: Prisma.ProductCostCreateManyInput[] = todo.map((s) => {
+    const units = Number(s.units);
+    const asp = Number(s.revenue) / Math.max(units, 1); // paise
+    const ratio = 0.32 + hashString(s.sku) * 0.2; // 32–52% of ASP
+    const landed = Math.round(asp * ratio);
+    // Split into the four §19 components rather than dumping the whole figure
+    // into purchaseCost — the UI shows the breakdown, and an all-in-one row
+    // would render as "₹0 freight, ₹0 duty", which reads as measured zeroes.
+    const purchase = Math.round(landed * 0.88);
+    const freight = Math.round(landed * 0.07);
+    const duty = Math.round(landed * 0.03);
+    const other = landed - purchase - freight - duty;
+    return {
+      organizationId: target.organizationId,
+      sku: s.sku,
+      variantId: variantBySku.get(s.sku) ?? null,
+      effectiveFrom,
+      purchaseCost: BigInt(purchase),
+      inboundFreight: BigInt(freight),
+      importDuty: BigInt(duty),
+      otherCost: BigInt(other),
+      landedCost: BigInt(landed),
+      currency: "INR",
+      source: "ESTIMATED" as const,
+      note: "Seeded baseline — derived from realised selling price, not a supplier invoice.",
+    };
+  });
+
+  const res = await prisma.productCost.createMany({ data: rows, skipDuplicates: true });
+  // STAMPING IS NOT OPTIONAL. OrderLineItem.cogsAmount is a stored column, not
+  // a join — contribution margin reads the stamp, never the cost table. Writing
+  // ProductCost rows and stopping leaves them completely inert: 744 costs sat
+  // in the database while 17,888 order lines still reported no cost, and the
+  // COGS layer stayed uncovered with nothing to indicate why. The upload route
+  // (routes/costs.ts) restamps for exactly this reason; so must this.
+  const avgRatio = rows.reduce((a, r) => a + Number(r.landedCost), 0) / Math.max(todo.reduce((a, s) => a + Number(s.revenue) / Math.max(Number(s.units), 1), 0), 1);
+  console.log(`  ${res.count} SKU costs (ESTIMATED), effective ${effectiveFrom.toISOString().slice(0, 10)}, blended ${(avgRatio * 100).toFixed(1)}% of ASP`);
+  console.log(`  ${rows.filter((r) => r.variantId).length} of ${rows.length} resolved to a variant`);
+
+  const stamp = await stampCogs(target.organizationId);
+  console.log(`  stamped ${stamp.linesStamped} lines across ${stamp.ordersConsidered} orders, ${stamp.linesUncosted} still uncosted`);
+}
+
+// ---------------------------------------------------------------------------
+// 2. BASE AD SPEND (data register D4)
+// ---------------------------------------------------------------------------
+// Only runs when an org has NO account-day spend at all. Where a CSV upload or
+// a live pull already put rows in, those are left alone and the campaign split
+// in section 6 works off them — this exists so an org that never connected an
+// ad account still exercises the advertising cost layer.
+//
+// Spend is derived FROM that day's actual revenue at a plausible blended ROAS,
+// never drawn independently. Drawing spend and revenue from separate
+// distributions is how you end up with a ROAS of 24, which is what the first
+// version of the campaign seeder did and why this rule is written down.
+async function seedBaseAdSpend(target: Target) {
+  const existing = await prisma.adSpend.count({ where: { organizationId: target.organizationId } });
+  if (existing > 0) {
+    console.log(`  ${existing} account-day rows already present — leaving them alone`);
+    return;
+  }
+
+  const daily = await prisma.$queryRaw<Array<{ day: Date; revenue: bigint }>>`
+    SELECT date_trunc('day', o."placedAt") AS day,
+           SUM(o."grossAmount")::bigint    AS revenue
+    FROM orders o
+    WHERE o."organizationId" = ${target.organizationId}
+      AND o."cancelledAt" IS NULL
+    GROUP BY 1
+    ORDER BY 1
+  `;
+  if (daily.length === 0) {
+    console.log("  no orders to derive spend from — skipping");
+    return;
+  }
+
+  const metaConn = await demoConnection(target, "META_ADS", "demo-act-4471903355");
+  const googleConn = await demoConnection(target, "GOOGLE_ADS", "demo-882-441-9037");
+
+  const rows: Prisma.AdSpendCreateManyInput[] = [];
+  for (const d of daily) {
+    const revenue = Number(d.revenue);
+    if (revenue <= 0) continue;
+    // Blended ROAS drifts day to day. Weekends convert worse in Indian D2C, so
+    // the same spend buys less — the seasonality is in the ROAS, not bolted on
+    // to spend afterwards, or spend would stop tracking revenue.
+    const weekend = d.day.getUTCDay() === 0 || d.day.getUTCDay() === 6;
+    const roas = between(weekend ? 1.9 : 2.4, weekend ? 3.2 : 4.1);
+    const totalSpend = revenue / roas;
+
+    // Meta carries the majority of Indian D2C prospecting; Google is mostly
+    // branded search and shopping, so it is both smaller and cheaper per click.
+    const metaShare = between(0.62, 0.74);
+    for (const [connectionId, provider, accountId, portion, cpm, ctr] of [
+      [metaConn, "META_ADS" as const, "demo-act-4471903355", metaShare, between(140, 260), between(0.008, 0.021)],
+      [googleConn, "GOOGLE_ADS" as const, "demo-882-441-9037", 1 - metaShare, between(90, 180), between(0.024, 0.061)],
+    ] as const) {
+      const spend = Math.round(totalSpend * portion);
+      if (spend <= 0) continue;
+      const impressions = Math.round((spend / 100 / cpm) * 1000);
+      rows.push({
+        organizationId: target.organizationId,
+        legalEntityId: target.legalEntityId,
+        connectionId,
+        provider,
+        externalAccountId: accountId,
+        date: new Date(Date.UTC(d.day.getUTCFullYear(), d.day.getUTCMonth(), d.day.getUTCDate())),
+        spendAmount: BigInt(spend),
+        impressions,
+        clicks: Math.round(impressions * ctr),
+        currency: "INR",
+      });
+    }
+  }
+
+  const res = await prisma.adSpend.createMany({ data: rows, skipDuplicates: true });
+  const total = rows.reduce((a, r) => a + Number(r.spendAmount), 0);
+  const revenue = daily.reduce((a, d) => a + Number(d.revenue), 0);
+  console.log(`  ${res.count} account-day rows across ${daily.length} days, ₹${(total / 100).toLocaleString("en-IN", { maximumFractionDigits: 0 })}`);
+  console.log(`  blended ROAS ${(revenue / total).toFixed(2)} against ₹${(revenue / 100).toLocaleString("en-IN", { maximumFractionDigits: 0 })} gross`);
+}
+
+// ---------------------------------------------------------------------------
+// 3. COURIER FREIGHT INVOICES (data register D5)
 // ---------------------------------------------------------------------------
 // Bluedart bills monthly, one invoice per product ("Etail Air COD" /
 // "Etail Air Prepaid"), one line per waybill. What makes this worth generating
@@ -362,7 +611,7 @@ async function seedFreightInvoices(target: Target, connectionId: string) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. GATEWAY SETTLEMENT COMPOSITION
+// 4. GATEWAY SETTLEMENT COMPOSITION
 // ---------------------------------------------------------------------------
 // The demo has 361 Razorpay settlements and not one settlement LINE, so the
 // PAYMENT_SETTLEMENT leg has nothing to reconcile and the payout composition is
@@ -425,8 +674,28 @@ async function seedGatewaySettlementLines(target: Target, connectionId: string) 
 
     for (const p of batch) {
       const gross = Number(p.amount) / 100;
-      const feeTotal = Number(p.feeAmount ?? 0n) / 100;
-      const tax = Math.round(feeTotal * 0.18 * 100) / 100;
+      // THE FEE IS DERIVED, NOT READ BACK.
+      //
+      // This used to be `Number(p.feeAmount ?? 0n)`, which was circular: the
+      // section exists to supply the MDR that a Shopify-pulled capture never
+      // states, and it was reading that MDR off the capture. Every payment has
+      // feeAmount NULL, so every line imported with 0.00 in both fee columns
+      // and the gateway layer stayed at ₹0 — the exact hole this fills, filled
+      // with a zero that looked measured.
+      //
+      // 1.6–2.4% is GoKwik's blended prepaid take. Applied to every capture
+      // including UPI, because GoKwik charges a platform fee per transaction
+      // regardless of rail — its deduction is not the interchange MDR, which
+      // genuinely is zero on UPI. A payment stating its own fee keeps it.
+      const stated = p.feeAmount === null ? null : Number(p.feeAmount) / 100;
+      const feeTotal = stated ?? Math.round(gross * between(0.016, 0.024) * 100) / 100;
+      // GST is CONTAINED IN feeTotal, not added to it — SettlementLine.taxAmount
+      // is documented as "a subset of feeAmount, not additional to it". So the
+      // 18% is backed out (f × 18/118), not applied forward. Applying it
+      // forward overstated the tax portion by 18% and understated the
+      // commission by the same, which nothing would have caught because the
+      // two still summed to the right total.
+      const tax = Math.round((feeTotal * 18) / 118 * 100) / 100;
       const net = Math.round((gross - feeTotal) * 100) / 100;
       lines.push([p.order?.externalOrderId ?? p.externalPaymentId ?? "", "payment", gross, Math.round((feeTotal - tax) * 100) / 100, tax, net]);
     }
@@ -482,7 +751,7 @@ async function seedGatewaySettlementLines(target: Target, connectionId: string) 
 }
 
 // ---------------------------------------------------------------------------
-// 3. MARKETPLACE FEES (Amazon / Flipkart)
+// 5. MARKETPLACE FEES (Amazon / Flipkart)
 // ---------------------------------------------------------------------------
 // The demo has 772 Amazon and 564 Flipkart orders and no marketplace connection
 // at all, so those orders look like they cost nothing to sell — which is the
@@ -578,7 +847,7 @@ async function seedMarketplaceFees(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. PACKAGING RATE (§23)
+// 6. PACKAGING RATE (§23)
 // ---------------------------------------------------------------------------
 // The only cost layer with no ingested source at all — no connected system
 // reports what a mailer costs. A founder types it once. Set here so the demo
@@ -605,7 +874,7 @@ async function seedPackagingRate(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. CAMPAIGN-GRAIN AD SPEND (data register D4)
+// 7. CAMPAIGN-GRAIN AD SPEND (data register D4)
 // ---------------------------------------------------------------------------
 // Ad spend arrives at account-day grain, so "which campaign is losing money"
 // has never been answerable. This splits each existing account-day row across
@@ -711,7 +980,7 @@ async function seedCampaignSpend(target: Target) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. COD REMITTANCE STATEMENTS (data register D2)
+// 8. COD REMITTANCE STATEMENTS (data register D2)
 // ---------------------------------------------------------------------------
 // The single largest category of silently lost money in Indian D2C: a parcel
 // is delivered, the courier collects the cash, and weeks later nobody can say
@@ -823,7 +1092,7 @@ async function seedCodRemittance(target: Target, connectionId: string) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. REFUNDS
+// 9. REFUNDS
 // ---------------------------------------------------------------------------
 // Without these the refund-mismatch exception is undetectable and the §15
 // refund leg has nothing to run against — both report "no refund records
@@ -889,25 +1158,31 @@ async function main() {
   const bluedartConn = await demoConnection(target, "BLUEDART", "demo-NDA821166");
   const gokwikConn = await demoConnection(target, "GOKWIK", "demo-gokwik");
 
-  console.log("[1] courier freight invoices (D5)");
+  console.log("[1] product costs (D1)");
+  await seedProductCosts(target);
+
+  console.log("\n[2] base ad spend (D4)");
+  await seedBaseAdSpend(target);
+
+  console.log("\n[3] courier freight invoices (D5)");
   await seedFreightInvoices(target, bluedartConn);
 
-  console.log("\n[2] gateway settlement composition");
+  console.log("\n[4] gateway settlement composition");
   await seedGatewaySettlementLines(target, gokwikConn);
 
-  console.log("\n[3] marketplace fees");
+  console.log("\n[5] marketplace fees");
   await seedMarketplaceFees(target);
 
-  console.log("\n[4] packaging rate");
+  console.log("\n[6] packaging rate");
   await seedPackagingRate(target);
 
-  console.log("\n[5] campaign-grain ad spend (D4)");
+  console.log("\n[7] campaign-grain ad spend (D4)");
   await seedCampaignSpend(target);
 
-  console.log("\n[6] COD remittance statements (D2)");
+  console.log("\n[8] COD remittance statements (D2)");
   await seedCodRemittance(target, bluedartConn);
 
-  console.log("\n[7] refunds");
+  console.log("\n[9] refunds");
   await seedRefunds(target);
 
   console.log("\ndone.\n");

@@ -93,10 +93,45 @@ async function checkOrg(orgId: string, orgName: string) {
     _sum: { feeAmount: true },
     _count: true,
   });
+  // A gateway fee is stated either on the capture (Razorpay) or on the payout
+  // line that settled it (GoKwik) — so the total is the union of both sources
+  // with the payment's own figure winning, never their sum. This asserts
+  // exactly that: everything Payment states, plus the settlement fees for
+  // payments that state nothing.
+  const settlementOnlyFees = await prisma.settlementLine.findMany({
+    where: {
+      organizationId: orgId,
+      type: "PAYMENT",
+      paymentId: { not: null },
+      // > 0 mirrors the calc: feeAmount defaults to 0, so a zero cannot be told
+      // apart from a file that never had a fee column.
+      feeAmount: { gt: 0 },
+      settlement: { settledAt: { gte: range.from, lte: range.to } },
+      payment: { feeAmount: null, capturedAt: { gte: range.from, lte: range.to } },
+    },
+    select: { paymentId: true, feeAmount: true },
+  });
+  const expectedFees =
+    (allPaymentFees._sum.feeAmount ?? 0n) + settlementOnlyFees.reduce((s, l) => s + (l.feeAmount ?? 0n), 0n);
   ok(
-    "gateway + marketplace fees = every payment fee, counted once",
-    fees.gatewayMinor + fees.marketplaceMinor === (allPaymentFees._sum.feeAmount ?? 0n),
-    `${inr(fees.gatewayMinor)} + ${inr(fees.marketplaceMinor)} vs ${inr(allPaymentFees._sum.feeAmount ?? 0n)}`
+    "gateway + marketplace fees = every stated fee, counted once",
+    fees.gatewayMinor + fees.marketplaceMinor === expectedFees,
+    `${inr(fees.gatewayMinor)} + ${inr(fees.marketplaceMinor)} vs ${inr(expectedFees)}`
+  );
+  // The double count this replaced the old assertion to catch: a payment whose
+  // fee is stated in BOTH places must contribute its rupees once.
+  const feeStatedTwice = await prisma.settlementLine.count({
+    where: {
+      organizationId: orgId,
+      type: "PAYMENT",
+      feeAmount: { gt: 0 },
+      payment: { feeAmount: { not: null }, capturedAt: { gte: range.from, lte: range.to } },
+    },
+  });
+  ok(
+    "a fee stated on both the capture and the payout is counted once",
+    fees.gatewayMinor + fees.marketplaceMinor <= expectedFees,
+    `${feeStatedTwice} payments state it twice`
   );
   ok(
     "gateway + marketplace payment counts partition the total",

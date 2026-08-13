@@ -109,6 +109,159 @@ interface MetaInsightRow {
   date_stop: string;
 }
 
+// §14 campaign grain. The SAME insights endpoint with level=campaign, which is
+// why this is a second request rather than a second connector: Meta returns one
+// row per campaign per day instead of one row per day, and nothing else changes.
+//
+// WHY IT IS A SEPARATE REQUEST AND A SEPARATE TABLE. Campaign rows are a finer
+// grain of the same fact. Summing them alongside the account-day rows would
+// double the advertising cost layer with nothing throwing — see the schema
+// comment on AdCampaignSpend. Keeping the two pulls apart also means a campaign
+// pull that fails (permissions, throttling) leaves the account-day total — the
+// figure contribution margin actually reads — completely intact.
+interface MetaAction {
+  action_type: string;
+  value: string;
+}
+
+interface MetaCampaignInsightRow extends MetaInsightRow {
+  campaign_id?: string;
+  campaign_name?: string;
+  actions?: MetaAction[];
+  action_values?: MetaAction[];
+}
+
+// Meta reports dozens of action types per row — link clicks, landing page
+// views, add-to-cart. Only a purchase is a sale, and which key carries it
+// depends on how the advertiser's pixel and CAPI are set up, so all three
+// spellings are accepted and the FIRST match wins rather than being summed:
+// `omni_purchase` deliberately overlaps `offsite_conversion.fb_pixel_purchase`
+// (it is the deduplicated total across web and app), so adding them counts the
+// same sale twice.
+const PURCHASE_ACTION_TYPES = ["omni_purchase", "offsite_conversion.fb_pixel_purchase", "purchase"] as const;
+
+export function firstPurchaseValue(actions: MetaAction[] | undefined): number | null {
+  if (!actions?.length) return null;
+  for (const type of PURCHASE_ACTION_TYPES) {
+    const hit = actions.find((a) => a.action_type === type);
+    if (!hit) continue;
+    // The trimmed-empty check is NOT redundant with Number.isFinite:
+    // `Number("")` is 0, not NaN. Without it, an action Meta reported with an
+    // empty value would be stored as a measured zero — a campaign whose pixel
+    // is misfiring would be indistinguishable from one that genuinely sold
+    // nothing, and the two want opposite responses from whoever reads it.
+    const raw = hit.value?.trim();
+    if (!raw) continue;
+    const n = Number(raw);
+    // An unusable value falls through to the next spelling rather than
+    // abandoning the row — a broken `omni_purchase` should not hide a perfectly
+    // good `offsite_conversion.fb_pixel_purchase` sitting beside it.
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+async function pullCampaignInsights(ctx: ConnectorContext, sinceDate: string, until: string): Promise<number> {
+  const creds = decodeCredentials(ctx.credentialsRef);
+  let url: URL | null = new URL(`${GRAPH_BASE}/${ctx.externalAccountId}/insights`);
+  url.searchParams.set(
+    "fields",
+    "campaign_id,campaign_name,spend,impressions,clicks,actions,action_values,account_currency"
+  );
+  url.searchParams.set("level", "campaign");
+  url.searchParams.set("time_range", JSON.stringify({ since: sinceDate, until }));
+  url.searchParams.set("time_increment", "1");
+  url.searchParams.set("access_token", creds.accessToken);
+
+  let total = 0;
+  let pages = 0;
+
+  while (url && pages < MAX_PAGES_PER_RUN) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`meta_campaign_insights_request_failed_${res.status}`);
+    const data = (await res.json()) as { data: MetaCampaignInsightRow[]; paging?: { next?: string } };
+
+    for (const row of data.data) {
+      if (!row.campaign_id) continue;
+      const externalEventId = `adcampaign_${ctx.externalAccountId}_${row.campaign_id}_${row.date_start}`;
+      await prisma.rawEvent.upsert({
+        where: { connectionId_externalEventId: { connectionId: ctx.connectionId, externalEventId } },
+        create: {
+          organizationId: ctx.organizationId,
+          connectionId: ctx.connectionId,
+          provider: "META_ADS",
+          externalEventId,
+          eventType: "ad_campaign_spend.sync",
+          payload: row as unknown as object,
+          processedAt: new Date(),
+          processingStatus: "PROCESSED",
+        },
+        update: { payload: row as unknown as object, processedAt: new Date(), processingStatus: "PROCESSED" },
+      });
+      await upsertCampaignRow(ctx, row);
+      total++;
+    }
+
+    url = data.paging?.next ? new URL(data.paging.next) : null;
+    pages++;
+  }
+
+  return total;
+}
+
+async function upsertCampaignRow(ctx: ConnectorContext, row: MetaCampaignInsightRow): Promise<void> {
+  const date = new Date(`${row.date_start}T00:00:00.000Z`);
+  const currency = row.account_currency ?? "INR";
+  const spendAmount = row.spend ? majorToMinorUnits(Number(row.spend)) : 0n;
+  const conversions = firstPurchaseValue(row.actions);
+  const attributedRevenue = firstPurchaseValue(row.action_values);
+
+  const payload = {
+    externalAccountId: ctx.externalAccountId ?? "",
+    campaignName: row.campaign_name ?? null,
+    // NULL, ALWAYS. Meta does not state which sales channel a campaign drove,
+    // and the obvious substitute — reading "Amazon" out of the campaign name —
+    // is a guess dressed as a fact: a campaign called "Amazon Prime Day sale"
+    // may well drive the D2C store. Null means "not attributable", and
+    // calc/channels.ts reports that spend as an unallocated pool rather than
+    // spreading it by revenue share. An explicit user-configured mapping is the
+    // right way to fill this in; inferring it here is not.
+    channel: null,
+    spendAmount,
+    currency,
+    impressions: row.impressions ? Number(row.impressions) : null,
+    clicks: row.clicks ? Number(row.clicks) : null,
+    // PLATFORM-CLAIMED, not our order count. Meta attributes on its own
+    // click/view window and will happily claim a sale the customer would have
+    // made anyway. Stored so the claim can be COMPARED against measured
+    // revenue, never used as revenue — see calc/campaigns.ts.
+    conversions: conversions === null ? null : Math.round(conversions),
+    attributedRevenue: attributedRevenue === null ? null : majorToMinorUnits(attributedRevenue),
+    raw: row as unknown as object,
+  };
+
+  await prisma.adCampaignSpend.upsert({
+    where: {
+      connectionId_externalAccountId_campaignId_date: {
+        connectionId: ctx.connectionId,
+        externalAccountId: ctx.externalAccountId ?? "",
+        campaignId: row.campaign_id!,
+        date,
+      },
+    },
+    create: {
+      organizationId: ctx.organizationId,
+      legalEntityId: ctx.legalEntityId,
+      connectionId: ctx.connectionId,
+      provider: "META_ADS",
+      campaignId: row.campaign_id!,
+      date,
+      ...payload,
+    },
+    update: payload,
+  });
+}
+
 function toUtcDateString(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
@@ -160,7 +313,31 @@ async function pull(ctx: ConnectorContext, sinceDate: string | null): Promise<Sy
   const until = toUtcDateString(new Date());
   const since = sinceDate ?? toUtcDateString(new Date(Date.now() - BACKFILL_DAYS * 24 * 60 * 60 * 1000));
   const count = await pullInsights(ctx, since, until);
-  return { recordsFetched: count, cursor: until };
+
+  // ACCOUNT-DAY FIRST, AND THE CAMPAIGN PULL CANNOT FAIL THE SYNC.
+  //
+  // The account-day total is what contribution margin reads; campaign rows only
+  // answer "which campaign". So a campaign pull that throws — an account whose
+  // token lacks campaign-level access, a throttle on a large backfill — must
+  // not lose the spend total that already imported cleanly, and must not stop
+  // the cursor advancing, or the next run re-fetches the same window forever.
+  //
+  // The failure is recorded rather than swallowed: campaign profitability
+  // reconciles its total against the account-day total and reports the shortfall
+  // (calc/campaigns.ts, COVERAGE_TOLERANCE_PCT), so a campaign pull that never
+  // succeeds shows up as incomplete coverage instead of as a smaller-looking
+  // ad bill.
+  let campaignCount = 0;
+  try {
+    campaignCount = await pullCampaignInsights(ctx, since, until);
+  } catch (err) {
+    console.warn(
+      `[metaAds] campaign-grain pull failed for ${ctx.externalAccountId}; account-day spend is unaffected:`,
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  return { recordsFetched: count + campaignCount, cursor: until };
 }
 
 export const metaAdsConnector: Connector = {

@@ -483,6 +483,36 @@ export interface IngestContext {
   legalEntityId: string;
 }
 
+// Postgres refuses a prepared statement carrying more than 32,767 bind
+// variables, and every element of an `in` list is one. The reference lookups
+// below pass two `in` lists built from the same array, so a statement with
+// more than about 5,400 references blew up with "too many bind variables" —
+// after the file had parsed, and after earlier batches had already been
+// written. A monthly courier MIS or a marketplace payout file clears that
+// easily; this was a hard ceiling on statement size, not a rare edge.
+//
+// 4,000 keeps the worst case (two `in` lists of the same chunk, plus the
+// scalar predicates) around 8,000 bind variables — well inside the limit with
+// room for a future third lookup, and few enough round trips that a 35,000-row
+// statement costs nine queries instead of one.
+const LOOKUP_CHUNK = 4_000;
+
+// A NUL separator, not a hyphen: references come from a provider's CSV and can
+// contain anything, so a printable separator could be forged by a reference
+// that happens to contain it and collide two different lines onto one payment.
+function refGrossKey(reference: string, grossPaise: bigint): string {
+  return `${reference} ${grossPaise}`;
+}
+
+async function inChunks<T, R>(items: T[], fn: (chunk: T[]) => Promise<R[]>): Promise<R[]> {
+  if (items.length <= LOOKUP_CHUNK) return fn(items);
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += LOOKUP_CHUNK) {
+    out.push(...(await fn(items.slice(i, i + LOOKUP_CHUNK))));
+  }
+  return out;
+}
+
 export async function ingestStatement(
   ctx: IngestContext,
   csv: string,
@@ -506,6 +536,9 @@ export async function ingestStatement(
   const references = [...new Set(parsed.batches.flatMap((b) => b.lines.map((l) => l.reference)))];
 
   const shipmentByRef = new Map<string, string>();
+  // Keyed by reference, and ALSO by refGrossKey(reference, gross) for orders
+  // whose reference covers more than one capture. The specific key is tried
+  // first at write time so a split payment reaches the right capture.
   const paymentByRef = new Map<string, string>();
 
   // Which lookups to run is decided by what the FILE actually contains, not by
@@ -516,13 +549,15 @@ export async function ingestStatement(
   if (presentTypes.has("SHIPMENT_COD")) {
     // AWB first — it is what a courier statement states. externalShipmentId is
     // the fallback for providers that reference their own shipment id instead.
-    const shipments = await prisma.shipment.findMany({
-      where: {
-        organizationId: ctx.organizationId,
-        OR: [{ awbCode: { in: references } }, { externalShipmentId: { in: references } }],
-      },
-      select: { id: true, awbCode: true, externalShipmentId: true },
-    });
+    const shipments = await inChunks(references, (refs) =>
+      prisma.shipment.findMany({
+        where: {
+          organizationId: ctx.organizationId,
+          OR: [{ awbCode: { in: refs } }, { externalShipmentId: { in: refs } }],
+        },
+        select: { id: true, awbCode: true, externalShipmentId: true },
+      })
+    );
     for (const s of shipments) {
       if (s.awbCode) shipmentByRef.set(s.awbCode, s.id);
       shipmentByRef.set(s.externalShipmentId, s.id);
@@ -551,13 +586,15 @@ export async function ingestStatement(
       // Matching only orderNumber resolved 0 of 200 real references; matching
       // both resolves them regardless of which column the format picked.
       const keys = [...candidates.keys()];
-      const orders = await prisma.order.findMany({
-        where: {
-          organizationId: ctx.organizationId,
-          OR: [{ orderNumber: { in: keys } }, { externalOrderId: { in: keys } }],
-        },
-        select: { orderNumber: true, externalOrderId: true, shipments: { select: { id: true } } },
-      });
+      const orders = await inChunks(keys, (k) =>
+        prisma.order.findMany({
+          where: {
+            organizationId: ctx.organizationId,
+            OR: [{ orderNumber: { in: k } }, { externalOrderId: { in: k } }],
+          },
+          select: { orderNumber: true, externalOrderId: true, shipments: { select: { id: true } } },
+        })
+      );
       for (const o of orders) {
         // A split order has several parcels and the statement says nothing about
         // which one the cash belongs to. Guessing would attribute real money to
@@ -571,10 +608,12 @@ export async function ingestStatement(
   }
 
   if (presentTypes.has("PAYMENT")) {
-    const payments = await prisma.payment.findMany({
-      where: { organizationId: ctx.organizationId, externalPaymentId: { in: references } },
-      select: { id: true, externalPaymentId: true },
-    });
+    const payments = await inChunks(references, (refs) =>
+      prisma.payment.findMany({
+        where: { organizationId: ctx.organizationId, externalPaymentId: { in: refs } },
+        select: { id: true, externalPaymentId: true },
+      })
+    );
     for (const p of payments) paymentByRef.set(p.externalPaymentId, p.id);
 
     // ORDER-NUMBER FALLBACK for prepaid lines, mirroring the COD one above and
@@ -591,19 +630,56 @@ export async function ingestStatement(
         candidates.set(r, r);
       }
       const keys = [...candidates.keys()];
-      const orders = await prisma.order.findMany({
-        where: {
-          organizationId: ctx.organizationId,
-          OR: [{ orderNumber: { in: keys } }, { externalOrderId: { in: keys } }],
-        },
-        select: { orderNumber: true, externalOrderId: true, payments: { select: { id: true } } },
-      });
+      const orders = await inChunks(keys, (k) =>
+        prisma.order.findMany({
+          where: {
+            organizationId: ctx.organizationId,
+            OR: [{ orderNumber: { in: k } }, { externalOrderId: { in: k } }],
+          },
+          select: { orderNumber: true, externalOrderId: true, payments: { select: { id: true, amount: true } } },
+        })
+      );
+      // EVERY gross a reference appears with, not just one.
+      //
+      // A partly-prepaid order produces TWO payout lines under ONE order id
+      // (₹21 taken at checkout, ₹16,307 on delivery — this is how PPCOD lands
+      // from Shopify, and the GoKwik connector notes it is 448 of the live
+      // store's last 60 days). One gross per reference would keep whichever
+      // line was parsed last and leave the other permanently unmatchable.
+      const grossesByRef = new Map<string, bigint[]>();
+      for (const b of parsed.batches) {
+        for (const l of b.lines) {
+          if (l.lineType !== "PAYMENT") continue;
+          const seen = grossesByRef.get(l.reference);
+          if (seen) seen.push(l.grossPaise);
+          else grossesByRef.set(l.reference, [l.grossPaise]);
+        }
+      }
       for (const o of orders) {
-        // Same refusal to guess as the COD path: an order paid in several
-        // captures cannot be pinned to one of them from the payout row alone.
-        if (o.payments.length !== 1) continue;
         const ref = candidates.get(o.orderNumber) ?? candidates.get(o.externalOrderId);
-        if (ref) paymentByRef.set(ref, o.payments[0]!.id);
+        if (!ref) continue;
+        if (o.payments.length === 1) {
+          paymentByRef.set(ref, o.payments[0]!.id);
+          continue;
+        }
+        // MULTI-CAPTURE ORDERS ARE RESOLVABLE WHEN THE AMOUNT IS UNAMBIGUOUS.
+        //
+        // This used to `continue` on any order with more than one payment, on
+        // the grounds that a payout row cannot be pinned to one of several
+        // captures. True in general — but not when the row's gross matches
+        // exactly one of them. Both PPCOD lines went unresolved, so the fee on
+        // real money was attributed to nothing.
+        //
+        // Resolved per (reference, gross) rather than per reference, because
+        // both lines share the order id and must reach DIFFERENT payments.
+        //
+        // Exactly one match required. Two captures of the same amount are
+        // genuinely ambiguous, and this keeps refusing those — the point is to
+        // resolve what is certain, not to lower the bar.
+        for (const gross of grossesByRef.get(ref) ?? []) {
+          const exact = o.payments.filter((p) => p.amount === gross);
+          if (exact.length === 1) paymentByRef.set(refGrossKey(ref, gross), exact[0]!.id);
+        }
       }
     }
   }
@@ -685,7 +761,13 @@ export async function ingestStatement(
       // to a payment. Reading both maps for both types would let an order
       // number that exists on both sides attach a card capture to a parcel.
       const shipmentId = line.lineType === "SHIPMENT_COD" ? (shipmentByRef.get(line.reference) ?? null) : null;
-      const paymentId = line.lineType === "PAYMENT" ? (paymentByRef.get(line.reference) ?? null) : null;
+      // Amount-specific first, then the plain reference. The specific key only
+      // exists for orders with several captures, so for the ordinary one-line
+      // one-payment case this is the same lookup it always was.
+      const paymentId =
+        line.lineType === "PAYMENT"
+          ? (paymentByRef.get(refGrossKey(line.reference, line.grossPaise)) ?? paymentByRef.get(line.reference) ?? null)
+          : null;
       if (line.lineType !== "ADJUSTMENT" && shipmentId === null && paymentId === null) {
         result.linesUnresolved += 1;
       }
@@ -737,7 +819,12 @@ export async function ingestStatement(
       .filter((l) => !seenKeys.has(`${l.type}\u0000${l.externalReference}`))
       .map((l) => l.id);
     if (staleIds.length > 0) {
-      await prisma.settlementLine.deleteMany({ where: { id: { in: staleIds } } });
+      // Chunked for the same bind-variable ceiling as the lookups above. This
+      // one is per-batch rather than per-file so it takes a much larger payout
+      // to reach, but a marketplace's monthly settlement is exactly that.
+      for (let i = 0; i < staleIds.length; i += LOOKUP_CHUNK) {
+        await prisma.settlementLine.deleteMany({ where: { id: { in: staleIds.slice(i, i + LOOKUP_CHUNK) } } });
+      }
       result.linesReplaced += staleIds.length;
     }
 

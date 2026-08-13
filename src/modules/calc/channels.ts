@@ -167,7 +167,22 @@ export async function getChannelProfitability(
 
   const allocatedByChannel = new Map<string, bigint>();
   for (const r of campaignRows) {
-    if (r.channel) allocatedByChannel.set(r.channel, r._sum.spendAmount ?? 0n);
+    if (!r.channel) continue;
+    allocatedByChannel.set(r.channel, r._sum.spendAmount ?? 0n);
+    // A CHANNEL CAN HAVE SPEND AND NO ORDERS, and it must still get a row.
+    //
+    // Buckets are otherwise built from orders alone, so a campaign attributed
+    // to a channel that sold nothing in this period had its spend counted into
+    // allocatedTotal — shrinking the unallocated pool — while appearing in no
+    // channel row at all. The money left the business and then left the report:
+    // allocated + unallocated no longer equalled total ad spend, and nothing
+    // said so.
+    //
+    // This is not a contrived case. It is a brand running Amazon-directed ads
+    // in a month its listing was suspended, or before the marketplace connector
+    // was ever connected. The resulting row reads "0 orders, ₹0 revenue, ₹X of
+    // ads" — which is exactly the finding, not a blank to be hidden.
+    bucket(r.channel);
   }
   const allocatedTotal = [...allocatedByChannel.values()].reduce((s, v) => s + v, 0n);
   const adTotalMinor = adTotal._sum.spendAmount ?? 0n;

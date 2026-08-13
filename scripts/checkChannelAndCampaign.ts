@@ -102,6 +102,27 @@ async function main() {
       `${inr(Number(allocated) / 100)} + ${inr(Number(unallocated) / 100)} vs ${inr(Number(adTotal._sum.spendAmount ?? 0n) / 100)}`
     );
     ok("the unallocated pool is never negative", unallocated >= 0n);
+
+    // THE REGRESSION THIS PINS. Channel rows are built from ORDERS. A campaign
+    // attributed to a channel that sold nothing had its spend counted into the
+    // allocated total — shrinking the unallocated pool — while getting no row,
+    // so the money left the report in both directions at once. The arithmetic
+    // assertion above catches it only while the demo happens to attribute a
+    // campaign to an order-less channel, which is not something to depend on.
+    const campaignChannels = await prisma.adCampaignSpend.groupBy({
+      by: ["channel"],
+      where: { organizationId: org.id, date: { gte: range.from, lte: range.to }, channel: { not: null } },
+      _sum: { spendAmount: true },
+    });
+    const reported = new Set(channel.channels.map((c) => c.channel));
+    const orphaned = campaignChannels.filter((c) => c.channel && (c._sum.spendAmount ?? 0n) > 0n && !reported.has(c.channel));
+    ok(
+      "every channel with attributed ad spend gets a row, even with no orders",
+      orphaned.length === 0,
+      orphaned.length > 0
+        ? `${orphaned.map((o) => `${o.channel} ₹${Number(o._sum.spendAmount ?? 0n) / 100}`).join(", ")} vanished`
+        : `${campaignChannels.length} attributed channel(s), all reported`
+    );
     if (unallocated > 0n) {
       // The single most important assertion in this file. If ad spend were
       // spread by revenue share, every channel would carry some and the pool
