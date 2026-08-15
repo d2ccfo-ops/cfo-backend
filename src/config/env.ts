@@ -8,22 +8,64 @@ const schema = z.object({
   CLERK_SECRET_KEY: z.string().min(1),
   CLERK_PUBLISHABLE_KEY: z.string().min(1),
   CLERK_WEBHOOK_SECRET: z.string().min(1),
-  OPENAI_API_KEY: z.string().optional(),
 
   // Used to encrypt every connector's stored credential (OAuth access token,
   // API key) — foundational for any connector, not Shopify-specific, so it's
   // required even though only Shopify uses it today. 32 bytes as hex.
   CREDENTIALS_ENCRYPTION_KEY: z.string().length(64),
 
+  // The showcase account POST /auth/demo-login signs in, as an email address.
+  //
+  // Its PRESENCE is the feature switch, deliberately — a separate boolean flag
+  // could be left on while the email changed, and "demo login enabled" with no
+  // named account is not a state worth being able to represent. Unset (the
+  // default, and what every real deployment should have) means the route 404s.
+  //
+  // Setting this makes one organisation's books readable by anyone who can
+  // reach the login page. The route re-checks that the account cannot write
+  // before it issues anything — see routes/demoLogin.ts.
+  DEMO_LOGIN_EMAIL: z.string().email().optional(),
+
   // P4 AI CFO. Optional: absent means /ai returns a clear "not configured"
   // rather than a 500, and every other route is unaffected. Same
   // check-at-use pattern as every connector credential below.
   ANTHROPIC_API_KEY: z.string().optional(),
-  // Overridable so a cheaper model can be pinned for eval runs without a
-  // deploy. The default is the strongest model available, because this one
-  // reads financial statements and the cost of a wrong answer is far above
-  // the cost of a token.
-  AI_MODEL: z.string().default("claude-opus-5"),
+  // Overridable without a deploy, so a model can be swapped after an eval run
+  // rather than on a hunch.
+  //
+  // The default was claude-opus-5 on the reasoning that this model "reads
+  // financial statements, and a wrong answer costs more than a token". That
+  // was measured and found to be paying for work this system deliberately does
+  // not ask the model to do: §1 says the LLM never calculates money. Every
+  // figure in an answer is read out of a tool result that calc/ already
+  // computed, and answers.ts verifies each one against those results before
+  // the answer is stored. The model's actual job is picking the right tool
+  // from TOOLS and building a date range from a vague question — which Sonnet
+  // does reliably, at roughly a fifth of the cost. Two real questions cost
+  // $1.12 on Opus against ~$0.22 on Sonnet for the same 59k tokens.
+  //
+  // Going a tier lower (Haiku) is a real option but not a free one: a weaker
+  // tool choice spends EXTRA turns, and each turn resends the whole prompt, so
+  // a cheaper model can bill more than a dearer one. Change it here only with
+  // an eval run behind it — `npm run eval`.
+  AI_MODEL: z.string().default("claude-sonnet-5"),
+
+  // The daily brief is a DIFFERENT job from the agentic loop above and should
+  // not inherit its model. dailyBrief.ts states the difference in its own
+  // header: the model gets the snapshot diff as pre-formatted text, it has no
+  // tools, and every figure it writes is verified against that same text
+  // before the brief is stored. There is no tool to choose and no period to
+  // reason about — it is summarisation of a fixed input, with a verifier
+  // behind it that rejects the narrative outright if a figure does not check
+  // out. That is the cheapest tier's natural work.
+  //
+  // It also runs once per organisation per day forever, so unlike a question
+  // somebody chose to ask, its cost compounds on its own. Separate variable
+  // rather than a shared one, so raising the AI CFO's tier for harder
+  // questions does not silently raise this too.
+  // The alias, not the dated snapshot id: aliases are complete as-is and
+  // track the current build, while a pinned date silently ages.
+  AI_BRIEF_MODEL: z.string().default("claude-haiku-4-5"),
 
   // P3.3 email digests. Optional: absent means the digest feature is OFF, not
   // broken — the sweep skips sending and says so in its result rather than

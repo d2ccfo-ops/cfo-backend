@@ -43,6 +43,32 @@ describe("tool registry", () => {
   it("TOOLS_BY_NAME covers every tool", () => {
     expect(TOOLS_BY_NAME.size).toBe(TOOLS.length);
   });
+
+  it("every tool carries the ticker copy a founder is shown while it runs", () => {
+    // The streaming route reads this per completed tool call. A tool with no
+    // label would leave the ticker with nothing true to say about work that
+    // really happened — and the alternative, a label kept in the client, drifts
+    // silently the first time a tool is renamed.
+    for (const t of TOOLS) {
+      expect(t.label.length, t.name).toBeGreaterThan(3);
+      // Present continuous, because it is read while the work is in progress.
+      expect(t.label, t.name).toMatch(/^[A-Z][a-z-]*ing\b/);
+      // Not the model-facing description: that one is written for tool choice
+      // and is far too long to sit in a progress line.
+      expect(t.label, t.name).not.toBe(t.description);
+      expect(t.label.length, t.name).toBeLessThan(60);
+      // Not the raw tool name dressed up — a founder should not be shown
+      // get_revenue_summary.
+      expect(t.label, t.name).not.toContain("_");
+    }
+  });
+
+  it("no two tools share a label", () => {
+    // Two tools showing the same line makes the ticker unreadable: a founder
+    // cannot tell whether one lookup ran twice or two different ones ran.
+    const labels = TOOLS.map((t) => t.label);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
 });
 
 describe("evidence references", () => {

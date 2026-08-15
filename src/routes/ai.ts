@@ -3,7 +3,8 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
 import { generateDailyBrief, readDailyBrief } from "../modules/ai/dailyBrief.js";
-import { ask, isAiConfigured } from "../modules/ai/orchestrator.js";
+import { logger } from "../lib/logger.js";
+import { ask, isAiConfigured, type AskEvent } from "../modules/ai/orchestrator.js";
 import { TOOLS } from "../modules/ai/tools.js";
 
 // §18/§19 transport. No reasoning lives here — the orchestrator decides, the
@@ -23,7 +24,10 @@ const askSchema = z
 aiRouter.get("/status", ...requireAuth, async (_req, res) => {
   res.json({
     configured: isAiConfigured(),
-    tools: TOOLS.map((t) => ({ name: t.name, description: t.description })),
+    // `label` is the same ticker copy the stream emits, served from the same
+    // place, so a client never has to keep its own copy of what a tool is
+    // called in English.
+    tools: TOOLS.map((t) => ({ name: t.name, label: t.label, description: t.description })),
     note: isAiConfigured()
       ? null
       : "ANTHROPIC_API_KEY is not set on the server, so the AI CFO cannot answer questions yet. Every figure it would quote is still available on the dashboard.",
@@ -58,6 +62,123 @@ aiRouter.post("/ask", ...requireAuth, async (req, res, next) => {
   // the body says what became of it. A 500 here would lose the runId a founder
   // or a support engineer needs to look at what the model actually did.
   res.json(result);
+});
+
+// ---------------------------------------------------------------------------
+// The same question, streamed
+// ---------------------------------------------------------------------------
+// A run takes 20-30 seconds and POST /ai/ask says nothing until it is over.
+// This route runs THE SAME ask() — same guards, same caps, same verification
+// pass, same audit write — and reports what it is doing as it does it.
+//
+// It is not a second implementation, and must never become one: the only thing
+// this handler adds is a callback that turns each event into an SSE frame. If a
+// rule changes in the orchestrator it changes for both routes at once, because
+// there is only one loop.
+//
+// Every frame corresponds to work that already happened (see AskEvent). This
+// endpoint cannot invent a stage, because it does not know what the loop is
+// doing except by being told.
+
+/**
+ * One SSE frame.
+ *
+ * Exported because the framing is the part that can silently corrupt a stream:
+ * an answer containing a newline written raw would end the event early and the
+ * client would parse half an object as the whole answer. JSON.stringify escapes
+ * it, and this is the one place that has to stay true.
+ */
+export function encodeSseFrame(event: AskEvent): string {
+  return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+/** Thrown into the orchestrator when the founder's connection has gone. */
+class ClientDisconnected extends Error {
+  constructor() {
+    super("The client disconnected before the answer was finished.");
+    this.name = "ClientDisconnected";
+  }
+}
+
+aiRouter.post("/ask/stream", ...requireAuth, async (req, res, next) => {
+  let parsed: z.infer<typeof askSchema>;
+  try {
+    // Parsed and rejected BEFORE any header is written: once the response is
+    // an event stream it can no longer become a 400, so validation has to
+    // happen while a normal error response is still possible.
+    parsed = askSchema.parse(req.body ?? {});
+  } catch (err) {
+    next(err);
+    return;
+  }
+
+  if (!isAiConfigured()) {
+    res.status(503).json({
+      error: "ai_not_configured",
+      message: "The AI CFO is not configured on this server (ANTHROPIC_API_KEY is unset).",
+    });
+    return;
+  }
+
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  // no-transform as well as no-store: a proxy that "helpfully" gzips or
+  // rewrites this response buffers it, and a buffered progress stream arrives
+  // in one lump at the end — which is the exact problem this route exists to
+  // fix. X-Accel-Buffering is the nginx-specific instruction for the same
+  // thing.
+  res.setHeader("Cache-Control", "no-store, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  let disconnected = false;
+  // A founder closing the tab must not leave a run charging tokens, and must
+  // not leave an AgentRun row in RUNNING. Flipping this makes the next emit
+  // throw, which lands in the orchestrator's catch, which closes the run out
+  // with a stated reason.
+  req.on("close", () => {
+    disconnected = true;
+  });
+
+  const send = (event: AskEvent): void => {
+    if (disconnected) throw new ClientDisconnected();
+    res.write(encodeSseFrame(event));
+  };
+
+  try {
+    await ask(
+      { organizationId: req.auth!.organizationId, timeZone: req.auth!.timezone, userId: req.auth!.userId },
+      parsed.question,
+      parsed.conversationId,
+      send
+    );
+  } catch (err) {
+    // ask() only reaches here if it threw before a run row existed — there is
+    // no runId and no AskResult to send, which is exactly what `error` is for.
+    // A run that started and then failed comes back as a `done` carrying a
+    // FAILED result instead.
+    //
+    // The real error is logged, not streamed: errorHandler answers an
+    // unexpected failure with "internal_error" and no detail, and an event
+    // stream must not become the one place a stack-shaped message reaches a
+    // browser.
+    logger.error({ err, organizationId: req.auth!.organizationId }, "ai_stream_failed");
+    if (!disconnected) {
+      try {
+        res.write(
+          encodeSseFrame({
+            type: "error",
+            message: "The AI CFO could not start this run. Nothing was answered — every figure it would have quoted is on the dashboard.",
+          })
+        );
+      } catch (writeErr) {
+        logger.warn({ err: writeErr }, "ai_stream_error_write_failed");
+      }
+    }
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
 });
 
 aiRouter.get("/conversations", ...requireAuth, async (req, res) => {

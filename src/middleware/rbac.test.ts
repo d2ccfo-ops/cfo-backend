@@ -241,3 +241,28 @@ describe("every real mutating route in the app has a decided policy", () => {
     }
   });
 });
+
+describe("both AI transports carry the same permission", () => {
+  // /ai/ask/stream is the same orchestrator run with progress events attached.
+  // It once fell through to the catch-all write policy, so an ANALYST could ask
+  // a question on one URL and got a 403 on the other.
+  it("lets an ANALYST ask on either route", () => {
+    expect(decideAccess("ANALYST", "POST", "/ai/ask").allowed).toBe(true);
+    expect(decideAccess("ANALYST", "POST", "/ai/ask/stream").allowed).toBe(true);
+  });
+
+  it("refuses a VIEWER on either route, for the same stated reason", () => {
+    // Asking costs money and writes an audit row; a read-only guest does neither.
+    const plain = decideAccess("VIEWER", "POST", "/ai/ask");
+    const streamed = decideAccess("VIEWER", "POST", "/ai/ask/stream");
+    expect(plain.allowed).toBe(false);
+    expect(streamed.allowed).toBe(false);
+    expect(streamed.reason).toBe(plain.reason);
+  });
+
+  it("does not open anything else under /ai", () => {
+    // The optional group must not become a prefix match.
+    expect(decideAccess("ANALYST", "POST", "/ai/ask/stream/evil").allowed).toBe(false);
+    expect(decideAccess("ANALYST", "DELETE", "/ai/conversations/abc").allowed).toBe(false);
+  });
+});
