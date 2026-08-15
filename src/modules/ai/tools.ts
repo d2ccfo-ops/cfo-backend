@@ -15,6 +15,8 @@ import { getPayablesSummary } from "../calc/payables.js";
 import { getProductProfitability } from "../calc/productProfitability.js";
 import { getCodExposure, readReconciliationLegs } from "../calc/reconciliation.js";
 import { getNetRevenueSummary } from "../calc/revenue.js";
+import { getRevenueTrend } from "../calc/revenueLadder.js";
+import { resolveTrendWindow } from "../../lib/trendWindow.js";
 import { getSalesSummary } from "../calc/sales.js";
 import { getRtoRateSummary } from "../calc/shipments.js";
 import { getBankMovement, getPendingSettlements, getRefundAnalysis, getSettlementSummary } from "../calc/moneyMovement.js";
@@ -119,6 +121,22 @@ export interface ToolResult {
 
 export interface ToolDefinition {
   name: string;
+  /**
+   * What a founder sees while this tool is running, in the present continuous
+   * ("Pulling revenue summaries").
+   *
+   * It lives here, beside the tool it describes, rather than in the client: a
+   * label kept in the UI drifts the moment a tool is renamed or removed, and
+   * the ticker would then narrate work that is not happening — which is the
+   * same defect as a fabricated figure, wearing a progress bar. The streaming
+   * route emits it with each completed tool call, so what the founder reads is
+   * always the label of a tool that actually ran.
+   *
+   * NOT sent to the model. `description` is the prompt surface and is written
+   * for tool CHOICE; this is written for a human watching and says nothing
+   * about when to use it.
+   */
+  label: string;
   description: string;
   schema: z.ZodType;
   /** JSON Schema for the model. Hand-written rather than generated: the
@@ -151,15 +169,17 @@ function envelope(data: unknown, opts: { dataStatus?: unknown; evidenceRef?: str
 
 const tool = (
   name: string,
+  label: string,
   description: string,
   inputSchema: Record<string, unknown>,
   schema: z.ZodType,
   run: ToolDefinition["run"]
-): ToolDefinition => ({ name, description, inputSchema, schema, run });
+): ToolDefinition => ({ name, label, description, inputSchema, schema, run });
 
 export const TOOLS: ToolDefinition[] = [
   tool(
     "get_revenue_summary",
+    "Pulling revenue summaries",
     "Net revenue (§11) for a period, with the prior-period comparison and order count. Use for 'how much did we make'.",
     RANGE_JSON,
     rangeArgs,
@@ -173,8 +193,67 @@ export const TOOLS: ToolDefinition[] = [
     }
   ),
 
+  // The gap the logs kept hitting.
+  //
+  // Founders asked "show me sales day by day", "show the graph" and "which days
+  // were high" repeatedly, and every answer carried the same warning: "No tool
+  // returns a daily/graphical sales series." Two of those runs then quoted
+  // figures that appear in NO tool result — verifyFigures caught them — which is
+  // the predictable outcome of asking a model for a trend and giving it only an
+  // aggregate. Removing the gap is the fix; telling the model to try harder is
+  // not.
+  //
+  // getRevenueTrend is the SAME function the Revenue page's chart already
+  // draws, deliberately: a trend the AI describes must agree with the trend the
+  // founder sees when they click through to check it.
+  tool(
+    "get_revenue_trend",
+    "Plotting the revenue trend",
+    "Net revenue and cash received bucketed over time (§11), day / week / month. USE THIS for any question about a trend, a graph, day-by-day movement, which days or months were high or low, or how something moved WITHIN a period — get_revenue_summary returns one total and cannot answer those.",
+    {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Start date, YYYY-MM-DD. Omit for the trailing 6 months." },
+        to: { type: "string", description: "End date, YYYY-MM-DD. Omit for the trailing 6 months." },
+        granularity: {
+          type: "string",
+          enum: ["auto", "day", "week", "month"],
+          description: "Bucket size. 'day' for within-a-month questions; omit for auto, which picks from the span.",
+        },
+      },
+      additionalProperties: false,
+    },
+    z
+      .object({
+        from: z.string().optional(),
+        to: z.string().optional(),
+        granularity: z.enum(["auto", "day", "week", "month"]).optional(),
+      })
+      .strict(),
+    async (ctx, args) => {
+      const a = args as { from?: string; to?: string; granularity?: "auto" | "day" | "week" | "month" };
+      // from/to must travel together (trendWindowQuerySchema refuses one alone),
+      // so a half-specified window falls back to the default rather than throwing
+      // at the founder.
+      const window = resolveTrendWindow(
+        {
+          ...(a.from && a.to ? { from: a.from, to: a.to } : {}),
+          ...(a.granularity ? { granularity: a.granularity } : {}),
+        },
+        new Date(),
+        ctx.timeZone
+      );
+      const [data, statuses] = await Promise.all([
+        getRevenueTrend(ctx.organizationId, window),
+        getDataStatusMap(ctx.organizationId),
+      ]);
+      return envelope(data, { dataStatus: statuses.revenue, evidenceRef: "/evidence/revenue" });
+    }
+  ),
+
   tool(
     "get_sales_summary",
+    "Reading gross sales, AOV and discounts",
     "Gross sales, order count, AOV, discount rate and refund rate (§5, §12, §64, §66) for a period.",
     RANGE_JSON,
     rangeArgs,
@@ -183,6 +262,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_cash_received",
+    "Checking cash that actually landed",
     "Cash actually credited to the bank in a period (§44). Different from revenue: this is money that arrived.",
     RANGE_JSON,
     rangeArgs,
@@ -191,6 +271,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_available_cash",
+    "Reading current bank balances",
     "Current bank balance across connected accounts (§54). Point-in-time — it ignores any date range.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -206,6 +287,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_contribution_margin",
+    "Walking the contribution ladder",
     "The CM0–CM3 contribution ladder (§37) with per-layer coverage. Use for any margin or profitability question.",
     RANGE_JSON,
     rangeArgs,
@@ -220,6 +302,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_product_profitability",
+    "Ranking products by margin",
     "Per-SKU revenue and margin (§40). Use for 'which products make money' and 'what is losing money'.",
     {
       type: "object",
@@ -252,6 +335,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_cash_forecast",
+    "Projecting the cash balance",
     "Projected daily cash balance over 7, 30 or 90 days (§16), with the lowest point and any cash-shortage date.",
     {
       type: "object",
@@ -272,6 +356,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "run_forecast_scenario",
+    "Re-running the forecast on your assumptions",
     "Re-run the cash forecast under changed assumptions (§16). Deterministic — it changes nothing and saves nothing.",
     {
       type: "object",
@@ -313,6 +398,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_burn_and_runway",
+    "Measuring burn and runway",
     "Monthly net burn and months of runway (§85). Runway is null when the business is not burning — that is a real answer, not a missing one.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -321,6 +407,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_payables",
+    "Listing outstanding vendor bills",
     "Outstanding vendor bills with ageing buckets and what falls due in the next 7 days.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -329,6 +416,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_ad_spend_analysis",
+    "Reading ad spend, ROAS and CAC",
     "Ad spend by platform plus ROAS and blended CAC (§31). INR only — a USD-billed account is excluded and reported.",
     RANGE_JSON,
     rangeArgs,
@@ -344,6 +432,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_rto_analysis",
+    "Measuring RTO on COD orders",
     "RTO rate over a period (§18) — how much COD is coming back undelivered.",
     RANGE_JSON,
     rangeArgs,
@@ -352,6 +441,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_cod_exposure",
+    "Tracing COD cash in flight",
     "COD money in flight, delivered but unremitted, gone dark, and returned (§51). Use for 'where is my COD cash'.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -375,6 +465,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_reconciliation_exceptions",
+    "Opening reconciliation exceptions",
     "The six reconciliation legs (§15): how much of each is matched, how much needs review, and which legs cannot run and why.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -389,6 +480,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_anomalies",
+    "Checking open anomalies",
     "Open anomalies found by the §17 rule engine, with what was observed against what was expected.",
     {
       type: "object",
@@ -413,6 +505,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_settlement_summary",
+    "Adding up gateway payouts",
     "Provider payouts that landed in a period (§15): net settled, fees, GST on fees, split by provider and payout kind. Use for 'what did Razorpay actually pay me'.",
     RANGE_JSON,
     rangeArgs,
@@ -422,6 +515,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_pending_settlements",
+    "Checking settlements not yet paid out",
     "Captured payments the gateway has not yet paid out — the float it is holding, and how old the oldest is. Point-in-time.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -436,6 +530,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_bank_movement",
+    "Reading bank credits and debits",
     "Money in and out of the connected bank accounts over a period (§12.9): credits, debits and the net. This is the statement, not derived cash.",
     RANGE_JSON,
     rangeArgs,
@@ -450,6 +545,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_refund_analysis",
+    "Analysing refunds",
     "Dated refund transactions in a period (§66), split by gateway, plus how many orders claim a refunded amount with no transaction behind it.",
     RANGE_JSON,
     rangeArgs,
@@ -459,6 +555,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_evidence",
+    "Opening the workings behind the figure",
     "The §21 evidence envelope for one material metric: its definition, the exact formula and version, the sources, the reconciliation status and up to 20 underlying rows. Use when asked to show the workings.",
     {
       type: "object",
@@ -503,6 +600,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "draft_vendor_message",
+    "Drafting the vendor message",
     "Draft a message to a supplier or partner about an outstanding amount or a discrepancy. Returns TEXT ONLY — nothing is sent, and the draft must be approved by a person before it can be used.",
     {
       type: "object",
@@ -543,6 +641,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "request_approval",
+    "Raising an approval request",
     "Route an action to a person for sign-off (§22). Use for anything that moves money above the organisation's materiality threshold, or for any message that would leave the company. Creates a PENDING request; it does not perform the action.",
     {
       type: "object",
@@ -611,6 +710,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_data_freshness",
+    "Checking how fresh each source is",
     "When each connected source last synced, and which are stale or erroring. Use this before trusting any other figure.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),
@@ -619,6 +719,7 @@ export const TOOLS: ToolDefinition[] = [
 
   tool(
     "get_data_status",
+    "Checking each metric's reconciliation status",
     "The §28 honesty label (estimated / provisional / reconciled) for every material metric, with the reason.",
     { type: "object", properties: {}, additionalProperties: false },
     z.object({}).strict(),

@@ -1382,8 +1382,17 @@ model AgentRun {
   status         AgentRunStatus @default(RUNNING)
   model          String
   turns          Int            @default(0)
+  // Billed at the full input rate. Excludes cache reads and cache writes,
+  // which the API reports separately — see the note below.
   inputTokens    Int            @default(0)
   outputTokens   Int            @default(0)
+  // Prompt-cache accounting, kept as three separate counters rather than one
+  // input total, because they bill at three different rates (~0.1x, ~1.25x and
+  // 1x of the input rate) and a sum would hide whether caching is working at
+  // all. Rows written before caching was enabled carry 0 in both and are not
+  // comparable to later ones: their whole prompt was billed as inputTokens.
+  cacheReadTokens  Int          @default(0)
+  cacheWriteTokens Int          @default(0)
   error          String?
   // P4.7's verdict on this run's own answer, computed at answer time rather
   // than only in the eval suite. Holds {figures, sources, pii} — which figures

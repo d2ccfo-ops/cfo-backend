@@ -28,6 +28,7 @@ import { shiprocketConnectionRouter } from "./routes/connections/shiprocket.js";
 import { shopifyConnectionRouter } from "./routes/connections/shopify.js";
 import { zohoBooksConnectionRouter } from "./routes/connections/zohoBooks.js";
 import { healthRouter } from "./routes/health.js";
+import { demoLoginRouter } from "./routes/demoLogin.js";
 import { inventoryRouter } from "./routes/inventory.js";
 import { legalEntitiesRouter } from "./routes/legalEntities.js";
 import { organizationRouter } from "./routes/organization.js";
@@ -119,6 +120,12 @@ export function createApp() {
   // Public, no Clerk dependency — a health check must not be able to fail
   // because of a misconfigured or outaged third-party auth provider.
   app.use(healthRouter);
+
+  // Also before clerkMiddleware, and necessarily so: this route's whole job is
+  // to get a visitor who has NO session a way in, so requiring one would be
+  // circular. It authorises itself — see routes/demoLogin.ts — and is inert
+  // unless DEMO_LOGIN_EMAIL names an account.
+  app.use(demoLoginRouter);
 
   // Everything mounted after this point can read Clerk session state via
   // getAuth(req)/requireAuth from middleware/auth.ts.

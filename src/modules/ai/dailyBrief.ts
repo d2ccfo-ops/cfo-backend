@@ -177,6 +177,7 @@ function asAnswer(n: BriefNarrative): StructuredAnswer {
     dataStatus: "estimated",
     warnings: n.caveats,
     recommendedAction: null,
+    followUps: [],
   };
 }
 
@@ -238,18 +239,18 @@ export async function generateDailyBrief(
         narrative: (narrative ?? undefined) as never,
         reason,
         figuresChecked,
-        model: env.AI_MODEL,
+        model: env.AI_BRIEF_MODEL,
         version: DAILY_BRIEF_VERSION,
       },
       update: {
         narrative: (narrative ?? undefined) as never,
         reason,
         figuresChecked,
-        model: env.AI_MODEL,
+        model: env.AI_BRIEF_MODEL,
         version: DAILY_BRIEF_VERSION,
       },
     });
-    return { day, narrative, reason, generatedAt: row.createdAt.toISOString(), figuresChecked, model: env.AI_MODEL };
+    return { day, narrative, reason, generatedAt: row.createdAt.toISOString(), figuresChecked, model: env.AI_BRIEF_MODEL };
   };
 
   if (!env.ANTHROPIC_API_KEY) {
@@ -277,7 +278,7 @@ export async function generateDailyBrief(
   try {
     const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
     const response = await client.messages.create({
-      model: env.AI_MODEL,
+      model: env.AI_BRIEF_MODEL,
       max_tokens: MAX_OUTPUT_TOKENS,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: `Metrics as of ${day} (${timeZone}):\n\n${input}` }],
@@ -314,7 +315,7 @@ export async function generateDailyBrief(
       action: "ai.daily_brief_generated",
       entityType: "AI_DAILY_BRIEF",
       entityId: day,
-      metadata: { day, figuresChecked: figures.checked, metricsMoved: moved.length, model: env.AI_MODEL },
+      metadata: { day, figuresChecked: figures.checked, metricsMoved: moved.length, model: env.AI_BRIEF_MODEL },
     });
 
     return store(narrative, null, figures.checked);

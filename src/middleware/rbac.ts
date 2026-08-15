@@ -84,7 +84,15 @@ const READ_LIKE_WRITES = [
   // A scenario is a what-if. It persists nothing.
   /^\/metrics\/cash-forecast\/scenario$/,
   // Asking a question. The conversation is the asker's own.
-  /^\/ai\/ask$/,
+  //
+  // Both transports, and the optional group is load-bearing. /ai/ask/stream is
+  // the SAME orchestrator run with progress events attached — it reads the same
+  // tools, spends the same tokens and writes the same AgentRun. When it was
+  // added it did not match this exact-anchored pattern, so it fell through to
+  // the catch-all "/" policy and every ANALYST asking a question got a 403,
+  // while the identical question on /ai/ask succeeded. A permission that
+  // depends on which transport the client picked is a bug in both directions.
+  /^\/ai\/ask(\/stream)?$/,
   // Marking one's own notification read.
   /^\/notifications\/[^/]+\/read$/,
   /^\/notifications\/read-all$/,

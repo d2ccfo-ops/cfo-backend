@@ -50,6 +50,11 @@ export interface VerifyResult {
 export function verifyFigures(answer: StructuredAnswer, toolOutputs: string[]): VerifyResult {
   const haystack = toolOutputs.join(" ").replace(/[₹\s,]/g, "");
   const text = [
+    // The headline is prompted to carry no figures at all. It is checked
+    // anyway: a rule that lives only in a prompt is a wish, and a figure
+    // smuggled into the verdict sentence is the most prominent line on the
+    // answer — the last place an unverified number should be able to hide.
+    answer.headline ?? "",
     answer.directAnswer,
     ...answer.keyFigures.map((f) => `${f.label} ${f.value}`),
     ...answer.drivers,

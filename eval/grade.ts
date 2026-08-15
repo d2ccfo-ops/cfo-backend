@@ -85,6 +85,8 @@ const REFUSAL_PATTERNS = [
 
 function answerText(a: StructuredAnswer): string {
   return [
+    // Part of what a founder reads, so part of what the grader reads.
+    a.headline ?? "",
     a.directAnswer,
     ...a.keyFigures.map((f) => `${f.label} ${f.value}`),
     ...a.drivers,
