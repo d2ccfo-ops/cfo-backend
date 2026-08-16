@@ -44,16 +44,33 @@ describe("normaliseCourier", () => {
 });
 
 describe("CARRIER_SQL mirrors normaliseCourier's patterns", () => {
-  // Parses `~ 'regex' THEN 'slug'` pairs out of the generated CASE statement,
-  // in the order they appear, and diffs that list against known JS behaviour
-  // for the same needle strings. A hand-edited CARRIER_SQL that drifts from
-  // the JS patterns fails here without ever touching Postgres.
-  const pairs = [...CARRIER_SQL.matchAll(/~\s*'([^']+)'\s+THEN\s+'([^']+)'/g)].map(
-    (m) => [m[1]!, m[2]!] as const
-  );
+  // Parses the generated CASE statement into (needle, slug) pairs, in the order
+  // they appear, and diffs that against known JS behaviour for the same
+  // needles. A hand-edited CARRIER_SQL that drifts from the JS patterns fails
+  // here without ever touching Postgres.
+  //
+  // Reads position('needle' in …) rather than the old ~ 'a|b' because the SQL
+  // now uses substring search instead of the regex engine — see the timing
+  // table in courier.ts. That splits each alternation into its own needle, so
+  // this checks "bdart" and "xbees" individually where it used to feed the
+  // whole "bluedart|bdart" string through as one.
+  const clauses = CARRIER_SQL.split(/\bWHEN\b/)
+    .slice(1)
+    .map((chunk) => ({
+      slug: chunk.match(/THEN\s+'([^']+)'/)?.[1],
+      needles: [...chunk.matchAll(/position\('([^']+)'\s+in\b/g)].map((m) => m[1]!),
+    }));
+  const pairs = clauses.flatMap((c) => c.needles.map((n) => [n, c.slug!] as const));
+
+  it("parses at all — an unrecognised CASE shape must fail loudly, not vacuously pass", () => {
+    // Without this, a future rewrite that stops matching the parser above
+    // yields zero pairs, and every it.each below silently tests nothing.
+    expect(clauses.length).toBe(8);
+    expect(pairs.length).toBeGreaterThanOrEqual(8);
+  });
 
   it("has one clause per known carrier, ending in an ELSE 'other'", () => {
-    expect(pairs.map(([, slug]) => slug)).toEqual([
+    expect(clauses.map((c) => c.slug)).toEqual([
       "bluedart",
       "delhivery",
       "dtdc",

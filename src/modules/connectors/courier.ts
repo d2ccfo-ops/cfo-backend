@@ -86,14 +86,47 @@ export function carrierLabel(slug: CarrierSlug): string {
  * scripts/checkFreightReconciliation.ts asserts they agree on every spelling
  * present in the database.
  */
+// position() rather than the regex operator, and that is a measured choice
+// rather than a stylistic one. This fragment was the single most expensive
+// query on the deployment by total time — pg_stat_statements had four variants
+// of the freight leg at a 1,849ms mean, against an EXPLAIN ANALYZE of 18-32ms
+// for comparable queries, because the box is CPU-bound and this burns CPU on
+// every row of a 49,000-row table.
+//
+// Timed on the live data, grouping all shipments by slug:
+//
+//   8 x regexp_replace + 8 x ~   (this, before)   229ms
+//   squash once, then 8 x ~                       233ms   <- no better
+//   8 x regexp_replace + 8 x position()           147ms   <- this, now
+//   map the 27 distinct names and join back       363ms   <- worse
+//
+// The second line is the informative one: hoisting the repeated
+// regexp_replace out changed nothing, so Postgres was already folding it. The
+// cost was never the squash, it was starting the regex engine eight times per
+// row. position() is a plain substring search, and alternation is just OR —
+// which is all these patterns ever meant.
+//
+// Writing the squash inline eight times therefore costs nothing and keeps this
+// a self-contained expression, so every call site embeds it unchanged.
+//
+// Equivalence is not assumed: checked against the previous expression across
+// all 49,082 shipments, 0 rows disagree. courier.test.ts holds it to
+// normaliseCourier(), and scripts/checkFreightReconciliation.ts re-checks both
+// against every spelling actually present in the database.
 export const CARRIER_SQL = `CASE
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'bluedart|bdart' THEN 'bluedart'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'delhivery' THEN 'delhivery'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'dtdc|dtdexpress' THEN 'dtdc'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'shadowfax|sfx' THEN 'shadowfax'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'xpressbees|xbees' THEN 'xpressbees'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'ekart' THEN 'ekart'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'indiapost|indianpost|speedpost' THEN 'indiapost'
-  WHEN lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g')) ~ 'amazon' THEN 'amazon'
+  WHEN position('bluedart' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0
+    OR position('bdart' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'bluedart'
+  WHEN position('delhivery' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'delhivery'
+  WHEN position('dtdc' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0
+    OR position('dtdexpress' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'dtdc'
+  WHEN position('shadowfax' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0
+    OR position('sfx' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'shadowfax'
+  WHEN position('xpressbees' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0
+    OR position('xbees' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'xpressbees'
+  WHEN position('ekart' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'ekart'
+  WHEN position('indiapost' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0
+    OR position('indianpost' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0
+    OR position('speedpost' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'indiapost'
+  WHEN position('amazon' in lower(regexp_replace(coalesce("courierName",''), '[^a-zA-Z0-9]', '', 'g'))) > 0 THEN 'amazon'
   ELSE 'other'
 END`;
