@@ -6,6 +6,7 @@ import { prisma } from "../lib/prisma.js";
 import { invalidateOrgReads } from "../lib/orgReadCache.js";
 import { describeRange, withDateRange, type ResolvedRange } from "../lib/dateRange.js";
 import { requireAuth } from "../middleware/auth.js";
+import { calcCache } from "../middleware/calcCache.js";
 import { createApprovalRequest, getMaterialityThreshold, needsApproval } from "../modules/approvals/approvals.js";
 import {
   AMOUNT_TOLERANCE_PAISE,
@@ -280,7 +281,7 @@ function serializeCod(c: Awaited<ReturnType<typeof getCodExposure>>) {
   };
 }
 
-reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, res) => {
+reconciliationRouter.get("/summary", ...requireAuth, withDateRange, calcCache("reconciliation-summary"), async (req, res) => {
   const organizationId = req.auth!.organizationId;
   const range = req.dateRange!;
 

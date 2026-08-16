@@ -30,6 +30,7 @@ import { getRevenueLadder, getRevenueTrend } from "../modules/calc/revenueLadder
 import { getSalesSummary } from "../modules/calc/sales.js";
 import { getRtoRateSummary } from "../modules/calc/shipments.js";
 import { requireAuth } from "../middleware/auth.js";
+import { calcCache } from "../middleware/calcCache.js";
 
 export const metricsRouter = Router();
 
@@ -54,7 +55,7 @@ export const metricsRouter = Router();
 // map is embedded per-metric in the material endpoints below; this endpoint
 // exists so a page can label a figure it derived locally without another
 // metric fetch.
-metricsRouter.get("/status", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/status", ...requireAuth, withDateRange, withEntityScope, calcCache("status"), async (req, res) => {
   const statuses = await getDataStatusMap(req.auth!.organizationId);
   res.json({
     formulaVersion: DATA_STATUS_FORMULA_VERSION,
@@ -67,7 +68,7 @@ metricsRouter.get("/status", ...requireAuth, withDateRange, withEntityScope, asy
   });
 });
 
-metricsRouter.get("/revenue", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/revenue", ...requireAuth, withDateRange, withEntityScope, calcCache("revenue"), async (req, res) => {
   const [summary, statuses] = await Promise.all([
     getNetRevenueSummary(req.auth!.organizationId, req.dateRange!, req.entityScope),
     getDataStatusMap(req.auth!.organizationId),
@@ -75,12 +76,12 @@ metricsRouter.get("/revenue", ...requireAuth, withDateRange, withEntityScope, as
   res.json({ ...summary, dataStatus: statuses.revenue });
 });
 
-metricsRouter.get("/rto-rate", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/rto-rate", ...requireAuth, withDateRange, withEntityScope, calcCache("rto-rate"), async (req, res) => {
   const summary = await getRtoRateSummary(req.auth!.organizationId, req.dateRange!, req.entityScope);
   res.json(summary);
 });
 
-metricsRouter.get("/cash-received", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/cash-received", ...requireAuth, withDateRange, withEntityScope, calcCache("cash-received"), async (req, res) => {
   const [summary, statuses] = await Promise.all([
     getCashReceivedSummary(req.auth!.organizationId, req.dateRange!),
     getDataStatusMap(req.auth!.organizationId),
@@ -90,7 +91,7 @@ metricsRouter.get("/cash-received", ...requireAuth, withDateRange, withEntitySco
 
 // A balance, so the range's END date is what matters — this reports the
 // balance as of `to`, not a sum across the window.
-metricsRouter.get("/available-cash", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/available-cash", ...requireAuth, withDateRange, withEntityScope, calcCache("available-cash"), async (req, res) => {
   const summary = await getAvailableCashSummary(req.auth!.organizationId, req.dateRange!);
   res.json(summary);
 });
@@ -106,7 +107,7 @@ metricsRouter.get("/available-cash", ...requireAuth, withDateRange, withEntitySc
 // carrying ?horizon=45 should show the default forecast, not an error page
 // where a cash line ought to be. The response always states the horizon it
 // actually used, so the caller can tell it was not honoured.
-metricsRouter.get("/cash-forecast", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/cash-forecast", ...requireAuth, withDateRange, withEntityScope, calcCache("cash-forecast"), async (req, res) => {
   const requested = Number.parseInt(String(req.query.horizon ?? ""), 10);
   const horizon = isForecastHorizon(requested) ? requested : DEFAULT_HORIZON;
   const [forecast, statuses] = await Promise.all([
@@ -179,7 +180,7 @@ metricsRouter.post("/cash-forecast/scenario", ...requireAuth, async (req, res, n
 // the scenario endpoint avoids by returning both lines together.
 const DEFAULT_HISTORY_DAYS = 30;
 
-metricsRouter.get("/snapshot-history", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/snapshot-history", ...requireAuth, withDateRange, withEntityScope, calcCache("snapshot-history"), async (req, res) => {
   const requested = Number.parseInt(String(req.query.days ?? ""), 10);
   const days = Number.isFinite(requested) ? requested : DEFAULT_HISTORY_DAYS;
   const [history, diff] = await Promise.all([
@@ -232,7 +233,7 @@ metricsRouter.post("/snapshot-history/run", ...requireAuth, async (req, res) => 
 // Ignores the resolved range on purpose: only current stock levels exist
 // (nothing keeps a history), so this always answers "as of now" and says so
 // via periodFiltered: false.
-metricsRouter.get("/inventory-value", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/inventory-value", ...requireAuth, withDateRange, withEntityScope, calcCache("inventory-value"), async (req, res) => {
   const summary = await getInventoryValueSummary(req.auth!.organizationId);
   res.json(summary);
 });
@@ -242,21 +243,21 @@ metricsRouter.get("/inventory-value", ...requireAuth, withDateRange, withEntityS
 // per-SKU sales-velocity computation (modules/calc/inventory.ts's
 // getVariantCoverInfo), so splitting them would mean three round trips
 // redoing the same joins.
-metricsRouter.get("/inventory-cover", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/inventory-cover", ...requireAuth, withDateRange, withEntityScope, calcCache("inventory-cover"), async (req, res) => {
   const summary = await getInventoryCoverSummary(req.auth!.organizationId);
   res.json(summary);
 });
 
 // Meta Ads + Google Ads combined (the AdSpend table is shared, `provider`
 // separates them), with a per-platform split in `byProvider`.
-metricsRouter.get("/ad-spend", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/ad-spend", ...requireAuth, withDateRange, withEntityScope, calcCache("ad-spend"), async (req, res) => {
   const summary = await getAdSpendSummary(req.auth!.organizationId, req.dateRange!);
   res.json(summary);
 });
 
 // ROAS + blended CAC. Separate from /ad-spend because it additionally reads
 // Order/revenue — a page showing only the spend card shouldn't pay for that.
-metricsRouter.get("/ad-efficiency", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/ad-efficiency", ...requireAuth, withDateRange, withEntityScope, calcCache("ad-efficiency"), async (req, res) => {
   const summary = await getAdEfficiencySummary(req.auth!.organizationId, req.dateRange!);
   res.json(summary);
 });
@@ -265,7 +266,7 @@ metricsRouter.get("/ad-efficiency", ...requireAuth, withDateRange, withEntitySco
 // discount rate, refund rate. Bundled for the same reason /inventory-cover
 // is: they're ratios of each other, so separate endpoints would re-read the
 // identical rows five times to divide them.
-metricsRouter.get("/sales", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/sales", ...requireAuth, withDateRange, withEntityScope, calcCache("sales"), async (req, res) => {
   const summary = await getSalesSummary(req.auth!.organizationId, req.dateRange!, req.entityScope);
   res.json(summary);
 });
@@ -275,7 +276,7 @@ metricsRouter.get("/sales", ...requireAuth, withDateRange, withEntityScope, asyn
 // that page is derived from the same scan of the same orders, and computing
 // them separately is how two numbers on one screen end up disagreeing — the
 // exact failure §1 of the finance-engine spec exists to prevent.
-metricsRouter.get("/revenue-ladder", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/revenue-ladder", ...requireAuth, withDateRange, withEntityScope, calcCache("revenue-ladder"), async (req, res) => {
   const [ladder, trend, statuses] = await Promise.all([
     getRevenueLadder(req.auth!.organizationId, req.dateRange!, req.entityScope),
     // The trend is a trailing-6-month series and ignores the date filter on
@@ -308,7 +309,7 @@ metricsRouter.get("/revenue-ladder", ...requireAuth, withDateRange, withEntitySc
 // The window is the request; the granularity is the response. The client sends
 // from/to and the server says which bucket size it used, so a zoom gesture can
 // never produce labels that disagree with the buckets underneath them.
-metricsRouter.get("/revenue-trend", ...requireAuth, withTrendWindow, async (req, res) => {
+metricsRouter.get("/revenue-trend", ...requireAuth, withTrendWindow, calcCache("revenue-trend"), async (req, res) => {
   const trend = await getRevenueTrend(req.auth!.organizationId, req.trendWindow!);
   res.json({ trend: trend.series, window: trend.window, cashCoverage: trend.cashCoverage });
 });
@@ -317,7 +318,7 @@ metricsRouter.get("/revenue-trend", ...requireAuth, withTrendWindow, async (req,
 // data source at all — a CM3 computed with packaging, RTO, COD and marketplace
 // fees silently absent would read as a healthy margin while being materially
 // wrong, so uncovered layers mark the levels below them `reliable: false`.
-metricsRouter.get("/contribution-margin", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/contribution-margin", ...requireAuth, withDateRange, withEntityScope, calcCache("contribution-margin"), async (req, res) => {
   const [margin, statuses] = await Promise.all([
     getContributionMargin(req.auth!.organizationId, req.dateRange!, req.entityScope),
     getDataStatusMap(req.auth!.organizationId),
@@ -327,7 +328,7 @@ metricsRouter.get("/contribution-margin", ...requireAuth, withDateRange, withEnt
 
 // §40 per-SKU profitability. Stops at CM0 (revenue − product cost) and says so
 // — per-SKU shipping/RTO/ads would need allocation inputs that don't exist.
-metricsRouter.get("/product-profitability", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/product-profitability", ...requireAuth, withDateRange, withEntityScope, calcCache("product-profitability"), async (req, res) => {
   const [products, statuses] = await Promise.all([
     getProductProfitability(req.auth!.organizationId, req.dateRange!, undefined, req.entityScope),
     getDataStatusMap(req.auth!.organizationId),
@@ -338,13 +339,13 @@ metricsRouter.get("/product-profitability", ...requireAuth, withDateRange, withE
 // §55 cash movement + §85 runway. Not date-filtered: burn is a trailing rate by
 // definition, and computing it over an arbitrary picked window would make the
 // runway swing wildly with the date picker.
-metricsRouter.get("/burn-runway", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/burn-runway", ...requireAuth, withDateRange, withEntityScope, calcCache("burn-runway"), async (req, res) => {
   res.json(await getBurnAndRunway(req.auth!.organizationId));
 });
 
 // §57 accounts payable + ageing. Not date-filtered: "what do I owe and when is
 // it due" is a forward-looking position as of now, not a sum over a past window.
-metricsRouter.get("/payables", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/payables", ...requireAuth, withDateRange, withEntityScope, calcCache("payables"), async (req, res) => {
   res.json(await getPayablesSummary(req.auth!.organizationId));
 });
 
@@ -359,14 +360,14 @@ metricsRouter.get("/freshness", ...requireAuth, withDateRange, withEntityScope, 
 // and a state at 6% are different businesses sharing a catalogue, and the
 // aggregate rate hides both. The state is derived at read time from the raw
 // payload and nothing else is: no street, no pincode, no name.
-metricsRouter.get("/state-profitability", ...requireAuth, withDateRange, withEntityScope, async (req, res) => {
+metricsRouter.get("/state-profitability", ...requireAuth, withDateRange, withEntityScope, calcCache("state-profitability"), async (req, res) => {
   res.json(await getStateProfitability(req.auth!.organizationId, req.dateRange!, req.entityScope));
 });
 
 // §14 cash conversion cycle (P6.2). The number that explains why a profitable
 // month can still leave the bank account emptier. Reported as null when any of
 // its three terms cannot be measured — a partial cycle is not a shorter cycle.
-metricsRouter.get("/cash-conversion-cycle", ...requireAuth, withDateRange, async (req, res) => {
+metricsRouter.get("/cash-conversion-cycle", ...requireAuth, withDateRange, calcCache("cash-conversion-cycle"), async (req, res) => {
   res.json(await getCashConversionCycle(req.auth!.organizationId, req.dateRange!));
 });
 
@@ -375,13 +376,13 @@ metricsRouter.get("/cash-conversion-cycle", ...requireAuth, withDateRange, async
 // unallocated pool rather than spread across channels: see modules/calc/
 // channels.ts for why spreading it in proportion to revenue is a fabrication
 // with a formula attached.
-metricsRouter.get("/channel-profitability", ...requireAuth, withDateRange, async (req, res) => {
+metricsRouter.get("/channel-profitability", ...requireAuth, withDateRange, calcCache("channel-profitability"), async (req, res) => {
   res.json(await getChannelProfitability(req.auth!.organizationId, req.dateRange!));
 });
 
 // §14 campaign profitability (P6.6). Spend is measured; the platform's
 // conversion and revenue claims are quoted as the platform's, never summed
 // into anything this product calls revenue.
-metricsRouter.get("/campaign-profitability", ...requireAuth, withDateRange, async (req, res) => {
+metricsRouter.get("/campaign-profitability", ...requireAuth, withDateRange, calcCache("campaign-profitability"), async (req, res) => {
   res.json(await getCampaignProfitability(req.auth!.organizationId, req.dateRange!));
 });

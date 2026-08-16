@@ -135,8 +135,68 @@ export function cachedOrgRead<T>(
   };
 }
 
+// ---------------------------------------------------------------------------
+// WHOLE-RESPONSE CACHE
+//
+// The block above caches org-wide reads, which is deliberately the safest
+// subset: one key per (org, name), nothing that moves when the picker moves.
+// Measured afterwards, that is not where the time goes. Firing the overview's
+// twenty requests together makes each one 4.9-8.9x slower than it is alone,
+// because two vCPUs are shared by Postgres, three Node processes, Caddy and
+// Redis — one test cycle spent 39.1 SECONDS of Postgres execution time across
+// 779 calls. Every endpoint is already fast; the box has nowhere to run them.
+//
+// So the win is not computing faster, it is not computing again. These are
+// GET requests whose answer is a pure function of (organisation, entity,
+// window) over data that changes only when something is written — and every
+// write that matters already calls invalidateOrgReads. That makes the whole
+// serialised body cacheable, not just its org-wide parts.
+//
+// Bodies are stored as the exact JSON string Express was about to send, which
+// is why there is no BigInt codec here: money is already strings by this
+// point (res.json would throw on a BigInt), so a cached body is byte-identical
+// to a computed one rather than merely equivalent to it.
+//
+// Variants cannot be enumerated the way registeredNames enumerates the block
+// above — there is one key per window the reader has looked at. Each written
+// key is therefore recorded in a per-org index set so invalidation deletes
+// exact keys instead of SCANning the keyspace on a shared Redis.
+
+const RESPONSE_PREFIX = "resp";
+const responseKeyFor = (organizationId: string, variant: string) =>
+  `${RESPONSE_PREFIX}:${organizationId}:${variant}`;
+const indexKeyFor = (organizationId: string) => `calcidx:${organizationId}`;
+
+export async function readCachedResponse(organizationId: string, variant: string): Promise<string | null> {
+  try {
+    return await cacheRedis.get(responseKeyFor(organizationId, variant));
+  } catch {
+    // Redis unavailable — the caller computes, exactly as before caching.
+    return null;
+  }
+}
+
+export async function writeCachedResponse(organizationId: string, variant: string, body: string): Promise<void> {
+  const key = responseKeyFor(organizationId, variant);
+  const index = indexKeyFor(organizationId);
+  try {
+    // Pipelined so a page-load burst costs one round trip per response rather
+    // than three. The index outlives its members on purpose: at 2x the body
+    // TTL it is still present to be read when the last body it names expires.
+    await cacheRedis
+      .multi()
+      .set(key, body, "EX", TTL_SECONDS)
+      .sadd(index, key)
+      .expire(index, TTL_SECONDS * 2)
+      .exec();
+  } catch {
+    // Not being able to store is not an error worth failing a request over.
+  }
+}
+
 /**
- * Drop every cached org-wide read for this organisation. Called by the write
+ * Drop every cached read for this organisation — both the org-wide
+ * computations and any whole responses derived from them. Called by the write
  * paths a user can observe cause-and-effect through: sync job completion and
  * failure, reconciliation runs, manual pair/write-off/exception actions,
  * statement/CSV/PDF uploads (direct and via inbound email), and cost edits.
@@ -144,7 +204,15 @@ export function cachedOrgRead<T>(
  * triggered it — the TTL bounds the damage at 60 seconds.
  */
 export function invalidateOrgReads(organizationId: string): void {
-  const keys = [...registeredNames].map((name) => keyFor(name, organizationId));
-  if (keys.length === 0) return;
-  cacheRedis.del(...keys).catch(() => {});
+  const named = [...registeredNames].map((name) => keyFor(name, organizationId));
+  if (named.length > 0) cacheRedis.del(...named).catch(() => {});
+
+  // Responses are read out of the index rather than guessed, because their
+  // keys carry windows nobody here can enumerate. The index is deleted last;
+  // if the process dies between the two, the bodies still expire on their TTL.
+  const index = indexKeyFor(organizationId);
+  cacheRedis
+    .smembers(index)
+    .then((keys) => (keys.length > 0 ? cacheRedis.del(...keys, index) : cacheRedis.del(index)))
+    .catch(() => {});
 }

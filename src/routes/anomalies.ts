@@ -4,6 +4,7 @@ import { z } from "zod";
 import { writeAudit } from "../lib/audit.js";
 import { prisma } from "../lib/prisma.js";
 import { requireAuth } from "../middleware/auth.js";
+import { calcCache } from "../middleware/calcCache.js";
 import { runAnomalyRules } from "../modules/calc/anomalies.js";
 
 // §17 anomaly engine, read/write side. The detection itself lives in
@@ -69,7 +70,7 @@ export function serializeAnomaly(a: {
 // Defaults to OPEN only. A page whose job is "what needs attention" should
 // not open on a list dominated by things already dealt with — resolved and
 // dismissed rows stay queryable, but you have to ask for them.
-anomaliesRouter.get("/", ...requireAuth, async (req, res) => {
+anomaliesRouter.get("/", ...requireAuth, calcCache("anomalies"), async (req, res) => {
   const organizationId = req.auth!.organizationId;
 
   const rawLimit = Number.parseInt(String(req.query.limit ?? ""), 10);
