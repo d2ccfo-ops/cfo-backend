@@ -3,6 +3,7 @@ import { Prisma, MatchType } from "@prisma/client";
 import { z } from "zod";
 import { buildCodDataStatus, buildSettlementDataStatus } from "../modules/calc/dataStatus.js";
 import { prisma } from "../lib/prisma.js";
+import { invalidateOrgReads } from "../lib/orgReadCache.js";
 import { describeRange, withDateRange, type ResolvedRange } from "../lib/dateRange.js";
 import { requireAuth } from "../middleware/auth.js";
 import { createApprovalRequest, getMaterialityThreshold, needsApproval } from "../modules/approvals/approvals.js";
@@ -185,6 +186,31 @@ const BASE_FROM = Prisma.sql`
   ) m ON true
   LEFT JOIN payments p ON p.id = m."targetId"`;
 
+// The AGGREGATE form of BASE_FROM: one DISTINCT ON pass over the org's
+// ORDER_PAYMENT matches instead of one lateral probe per order row — the same
+// rewrite aggregateLeg (calc/reconciliation.ts) got, carrying the same P6.3
+// win rule (MANUAL first, then newest). Used ONLY by the whole-period
+// statusRows aggregate; the paged item queries keep BASE_FROM, where a
+// LIMIT-50 lateral is cheap and one-row-per-order protects the cursor.
+// Deliberately no `status <> 'EXCEPTION'` filter — BASE_FROM has none, and an
+// EXCEPTION-status row must still be able to win (STATUS_CASE classifies it).
+// The added organizationId filter narrows the scan to the org's matches; it
+// changes nothing because order ids are globally unique cuids and matches are
+// written org-scoped — the same assumption aggregateLeg codified.
+function baseFromAgg(organizationId: string): Prisma.Sql {
+  return Prisma.sql`
+    FROM orders o
+    LEFT JOIN (
+      SELECT DISTINCT ON (rm."sourceId")
+             rm."sourceId", rm.id, rm.status, rm.confidence, rm."amountDeltaAbs"
+      FROM reconciliation_matches rm
+      WHERE rm."organizationId" = ${organizationId}
+        AND rm."matchType" = 'ORDER_PAYMENT'
+        AND rm."sourceType" = 'ORDER'
+      ORDER BY rm."sourceId", (rm.confidence = 'MANUAL') DESC, rm."createdAt" DESC
+    ) m ON m."sourceId" = o.id`;
+}
+
 // Did a provider actually pay us for this order, and in which transfer?
 //
 // The status column next to this answers a narrower question than readers
@@ -266,7 +292,7 @@ reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, 
     prisma.$queryRaw<{ status: RowStatus; count: bigint; value: bigint }[]>(Prisma.sql`
       SELECT status, count(*) AS count, sum(expected)::bigint AS value FROM (
         SELECT ${STATUS_CASE} AS status, o."grossAmount" AS expected
-        ${BASE_FROM}
+        ${baseFromAgg(organizationId)}
         WHERE o."organizationId" = ${organizationId} AND ${placedAtCondition(range)}
       ) t
       GROUP BY status`),
@@ -288,10 +314,16 @@ reconciliationRouter.get("/summary", ...requireAuth, withDateRange, async (req, 
     // has ever sold through, and scoping it would make the option a reader had
     // already selected disappear from the dropdown the moment they narrowed
     // the window — leaving a filter active with no visible way to clear it.
-    prisma.order.findMany({
+    //
+    // groupBy, not findMany+distinct: Prisma without the nativeDistinct
+    // preview feature applies `distinct` IN MEMORY — it fetched every order
+    // row in the org (~50k) to return the four channel strings. groupBy emits
+    // GROUP BY server-side and transfers one row per channel. channel is NOT
+    // NULL, so there is no null-group to differ on, and the same asc collation
+    // orders it — verified value-identical on every org before switching.
+    prisma.order.groupBy({
+      by: ["channel"],
       where: { organizationId },
-      distinct: ["channel"],
-      select: { channel: true },
       orderBy: { channel: "asc" },
     }),
     // Read, not run (§ the engine writes; a page load must not). All-time by
@@ -734,6 +766,10 @@ reconciliationRouter.post("/items/:orderId/write-off", ...requireAuth, async (re
       metadata: { note, amountPaise: order.grossAmount.toString() },
     },
   });
+
+  // A write-off changes the legs and status counts; the page the writer lands
+  // on next must show their decision, not a cached copy from before it.
+  invalidateOrgReads(organizationId);
 
   res.json({ id: match.id, status: "written_off" });
 });

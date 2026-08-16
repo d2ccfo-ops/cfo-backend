@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { checkCsv } from "../../lib/uploadGuard.js";
 import type { Provider } from "@prisma/client";
 import { encryptSecret } from "../../lib/crypto.js";
@@ -129,6 +130,7 @@ adSpendCsvRouter.post("/:slug/:connectionId/upload", ...requireAuth, async (req,
     // refused the file must not make the card read "synced just now".
     if (result.daysImported > 0) {
       await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+      invalidateOrgReads(connection.organizationId);
     }
     logger.info(
       { connectionId: connection.id, provider, days: result.daysImported, errors: result.errors.length },

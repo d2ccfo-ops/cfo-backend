@@ -1,4 +1,5 @@
 import { prisma } from "../../lib/prisma.js";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { capturedStatusFilter } from "../calc/paymentStatus.js";
 
 // P6.3 — manual match pairing (§15).
@@ -275,6 +276,10 @@ export async function pairOrderToPayment(
     }
     throw err;
   }
+
+  // A manual pairing changes the legs and status counts immediately — the
+  // cached org-wide reads must not outlive the decision.
+  invalidateOrgReads(organizationId);
 
   return { ok: true, matchId: match.id, differencePaise: delta };
 }

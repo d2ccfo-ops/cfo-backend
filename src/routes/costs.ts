@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
+import { invalidateOrgReads } from "../lib/orgReadCache.js";
 import { landedCostOf, getCostCoverage, stampCogs } from "../modules/calc/cogs.js";
 import { prisma } from "../lib/prisma.js";
 import { writeAudit } from "../lib/audit.js";
@@ -114,6 +115,9 @@ costsRouter.post("/bulk", ...requireAuth, async (req, res, next) => {
   }
 
   const stamp = parsed.restamp === false ? null : await stampCogs(organizationId);
+  // product_costs changed either way, and cogsAmount too when restamped —
+  // both are inputs of the cached data-status map.
+  invalidateOrgReads(organizationId);
 
   await writeAudit({
     organizationId,
@@ -287,6 +291,7 @@ costsRouter.get("/", ...requireAuth, async (req, res) => {
 // orders that arrived before their SKU had a cost.
 costsRouter.post("/restamp", ...requireAuth, async (req, res) => {
   const result = await stampCogs(req.auth!.organizationId);
+  invalidateOrgReads(req.auth!.organizationId);
   await writeAudit({
     organizationId: req.auth!.organizationId,
     actorType: "USER",

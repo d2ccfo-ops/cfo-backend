@@ -1,5 +1,6 @@
 import { MatchConfidence, MatchStatus, MatchType, Prisma, type ShipmentStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
+import { cachedOrgRead, invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { CARRIER_SQL } from "../connectors/courier.js";
 import { isCashAtDoorGateway } from "../connectors/shopify/gateways.js";
 import { capturedStatusSql, capturedStatusFilter } from "./paymentStatus.js";
@@ -938,6 +939,12 @@ export async function runReconciliation(organizationId: string): Promise<Reconci
     created = result.count;
   }
 
+  // The run just rewrote match rows — every cached org-wide read derived from
+  // them must go, so the page a reader lands on after pressing Run shows this
+  // run, not the one before it. This single point covers every caller: the
+  // POST /run route, restore, unpair, and the post-sync run.
+  invalidateOrgReads(organizationId);
+
   return {
     version: RECONCILIATION_VERSION,
     ranAt: new Date(),
@@ -971,6 +978,15 @@ async function aggregateLeg(
   sourceType: string,
   sourceSql: Prisma.Sql
 ): Promise<LegAggregate> {
+  // DISTINCT ON rather than a per-row LATERAL: the lateral form probed the
+  // matches index once per source row (~25k probes per leg on the live org,
+  // measured as the burst's single most expensive query family), where one
+  // ordered pass over the org's matches for this leg produces the same
+  // in-force match per source. The ORDER BY carries the same P6.3 rule the
+  // lateral had — a manual pairing outranks whatever the engine derived
+  // afterwards, so the leg counts and the row a reader sees cannot disagree
+  // about which match is in force. (Ties beyond createdAt were unspecified in
+  // both forms.)
   const rows = await prisma.$queryRaw<LegAggregate[]>(Prisma.sql`
     SELECT count(*)::int                                        AS eligible,
            coalesce(sum(s.value), 0)::bigint                     AS eligible_value,
@@ -978,20 +994,15 @@ async function aggregateLeg(
            coalesce(sum(s.value) FILTER (WHERE m.id IS NOT NULL), 0)::bigint AS matched_value,
            count(*) FILTER (WHERE m."amountDeltaAbs" > ${AMOUNT_TOLERANCE_PAISE})::int AS needs_review
     FROM (${sourceSql}) s
-    LEFT JOIN LATERAL (
-      SELECT rm.id, rm."amountDeltaAbs"
+    LEFT JOIN (
+      SELECT DISTINCT ON (rm."sourceId") rm."sourceId", rm.id, rm."amountDeltaAbs"
       FROM reconciliation_matches rm
       WHERE rm."organizationId" = ${organizationId}
         AND rm."matchType" = ${matchType}::"MatchType"
         AND rm."sourceType" = ${sourceType}
-        AND rm."sourceId" = s.id
         AND rm.status <> 'EXCEPTION'
-      -- P6.3. Same rule as the items query: a manual pairing outranks whatever
-      -- the engine derived afterwards, so the leg counts and the row a reader
-      -- sees cannot disagree about which match is in force.
-      ORDER BY (rm.confidence = 'MANUAL') DESC, rm."createdAt" DESC
-      LIMIT 1
-    ) m ON true`);
+      ORDER BY rm."sourceId", (rm.confidence = 'MANUAL') DESC, rm."createdAt" DESC
+    ) m ON m."sourceId" = s.id`);
   return rows[0]!;
 }
 
@@ -1014,14 +1025,28 @@ function toLeg(matchType: MatchType, a: LegAggregate): LegOutcome {
  * The four legs as they currently stand, read-only. Values and counts follow
  * the same definitions runReconciliation() uses, so the card a reader sees on
  * load and the one they see after pressing Run cannot disagree.
+ *
+ * Cached org-wide (see lib/orgReadCache.ts): the six aggregateLeg scans are
+ * the expensive half of the data-status map, and the overview burst reaches
+ * them through getDataStatusMap from six endpoints (plus /reconciliation/
+ * summary directly) at once. Every write path a reader can observe —
+ * runReconciliation, manual pair/write-off/exception, sync completion,
+ * statement uploads — invalidates the org's keys, so pressing Run always
+ * shows its own effect. Callers already treat the result as read-only
+ * (checkSettlementsView asserts it).
  */
-export async function readReconciliationLegs(organizationId: string): Promise<LegOutcome[]> {
+export const readReconciliationLegs = cachedOrgRead("legs", computeReconciliationLegs);
+
+async function computeReconciliationLegs(organizationId: string): Promise<LegOutcome[]> {
   // Which carriers we hold invoices for scopes the freight leg's denominator,
-  // and it has to be known before the aggregate query is built.
-  const invoiceCarriers = await prisma.freightInvoice.findMany({
+  // and it has to be known before the aggregate query is built. groupBy
+  // rather than findMany+distinct — without the nativeDistinct preview
+  // feature, Prisma dedupes distinct IN MEMORY after fetching every row; the
+  // groupBy at readFreightSummary's carrier breakdown is the same-file
+  // precedent. Served index-only by @@index([organizationId, carrier]).
+  const invoiceCarriers = await prisma.freightInvoice.groupBy({
+    by: ["carrier"],
     where: { organizationId },
-    select: { carrier: true },
-    distinct: ["carrier"],
   });
   const carrierSlugs = invoiceCarriers.map((c) => c.carrier);
 
@@ -1200,7 +1225,15 @@ export interface FreightSummary {
  * leg cannot express — lines billed for parcels that have no shipment at all.
  * That figure has no home anywhere else in the product.
  */
-export async function readFreightSummary(organizationId: string): Promise<FreightSummary> {
+/**
+ * Cached org-wide (see lib/orgReadCache.ts): every figure here is all-time
+ * per-organisation — nothing range- or entity-dependent — and the carrier
+ * breakdown scans the shipment table. Invalidated by the freight-invoice and
+ * remittance upload paths; the 60s TTL covers everything else.
+ */
+export const readFreightSummary = cachedOrgRead("freight", computeFreightSummary);
+
+async function computeFreightSummary(organizationId: string): Promise<FreightSummary> {
   const [invoices, lineAgg, orphanAgg, returnAgg, creditAgg, dates] = await Promise.all([
     prisma.freightInvoice.count({ where: { organizationId } }),
     prisma.freightInvoiceLine.aggregate({
@@ -1236,23 +1269,29 @@ export async function readFreightSummary(organizationId: string): Promise<Freigh
     _count: { _all: true },
   });
 
-  const carriers = await Promise.all(
-    byCarrier.map(async (c) => {
-      const rows = await prisma.$queryRaw<Array<{ total: number; billed: number }>>(Prisma.sql`
-        SELECT count(*)::int AS total,
-               count(*) FILTER (WHERE "freightAmount" IS NOT NULL)::int AS billed
-        FROM shipments
-        WHERE "organizationId" = ${organizationId}
-          AND "awbCode" IS NOT NULL
-          AND ${Prisma.raw(CARRIER_SQL)} = ${c.carrier}`);
-      return {
-        carrier: c.carrier,
-        invoices: c._count._all,
-        shipments: rows[0]?.total ?? 0,
-        billedShipments: rows[0]?.billed ?? 0,
-      };
-    })
-  );
+  // ONE grouped scan instead of one scan per carrier: CARRIER_SQL is an
+  // 8-branch regex CASE evaluated per row, and the per-carrier form re-ran it
+  // over every awb-bearing shipment for each invoice carrier. GROUP BY
+  // partitions the identical row set by the identical expression, so each
+  // carrier's counts are exactly what its own query returned; carriers with
+  // invoices but no shipments are absent from the result and default to 0/0
+  // just as an empty per-carrier query did. Groups for carriers we hold no
+  // invoice for are computed and discarded — cost, not correctness.
+  const carrierRows = await prisma.$queryRaw<Array<{ carrier: string; total: number; billed: number }>>(Prisma.sql`
+    SELECT ${Prisma.raw(CARRIER_SQL)} AS carrier,
+           count(*)::int AS total,
+           count(*) FILTER (WHERE "freightAmount" IS NOT NULL)::int AS billed
+    FROM shipments
+    WHERE "organizationId" = ${organizationId}
+      AND "awbCode" IS NOT NULL
+    GROUP BY 1`);
+  const bySlug = new Map(carrierRows.map((r) => [r.carrier, r]));
+  const carriers = byCarrier.map((c) => ({
+    carrier: c.carrier,
+    invoices: c._count._all,
+    shipments: bySlug.get(c.carrier)?.total ?? 0,
+    billedShipments: bySlug.get(c.carrier)?.billed ?? 0,
+  }));
 
   return {
     invoices,
@@ -1325,7 +1364,21 @@ export interface CodExposure {
 // delivered inside the window from an order placed before it would subtract a
 // value that was never added to `totalCodValue`, and in-flight would go
 // negative. One period definition, applied to the one entity the page lists.
+// The UNRANGED call is a position ("where is the money right now"), asked
+// identically by the summary route, the daily snapshot and the AI tools — and
+// it aggregates the org's whole COD book, so it is the second-heaviest read on
+// the summary path. Ranged calls depend on the picker and are never cached.
+const codExposureUnranged = cachedOrgRead("codUnranged", (organizationId: string) => computeCodExposure(organizationId));
+
 export async function getCodExposure(
+  organizationId: string,
+  range?: { from: Date; to: Date }
+): Promise<CodExposure> {
+  if (!range) return codExposureUnranged(organizationId);
+  return computeCodExposure(organizationId, range);
+}
+
+async function computeCodExposure(
   organizationId: string,
   range?: { from: Date; to: Date }
 ): Promise<CodExposure> {
@@ -1351,12 +1404,17 @@ export async function getCodExposure(
       _sum: { grossAmount: true },
     }),
     // Captured payments on COD orders — PPCOD deposits, plus the occasional
-    // marked-as-paid door collection. Filtered in code because telling those
+    // marked-as-paid door collection. Classified in code because telling those
     // two apart is a gateway-name test (see connectors/shopify/gateways.ts)
-    // that SQL can't share.
-    prisma.payment.findMany({
+    // that SQL can't share — but the SUMMING is pushed to SQL: grouped by the
+    // gateway-name string, this returns one row per distinct gateway (a
+    // handful) instead of one per payment (up to tens of thousands), and the
+    // JS below still applies isCashAtDoorGateway to each group. Exact BigInt
+    // sums are associative, so per-group-then-total equals per-row.
+    prisma.payment.groupBy({
+      by: ["method"],
       where: { organizationId, ...capturedStatusFilter(), order: orderScope },
-      select: { amount: true, method: true },
+      _sum: { amount: true },
     }),
     prisma.shipment.aggregate({
       where: {
@@ -1393,24 +1451,36 @@ export async function getCodExposure(
     // nothing about it has gone silent — otherwise a parcel picked up eight
     // months ago would be counted here and in `unknown` at once, and the two
     // buckets would sum to more than the order book.
-    prisma.order.count({
-      where: {
-        organizationId,
-        ...orderScope,
-        shipments: {
-          none: { status: { in: ["DELIVERED", "RTO_INITIATED", "RTO_DELIVERED"] } },
-        },
-        NOT: {
-          shipments: {
-            some: {
-              status: { in: NON_TERMINAL_STATUSES },
-              codAmount: { gt: 0n },
-              pickedUpAt: { lt: staleBefore },
-            },
-          },
-        },
-      },
-    }),
+    //
+    // One pass over shipments instead of two correlated anti-joins: the
+    // Prisma `none`/`NOT some` form compiled to two NOT EXISTS probes per
+    // candidate order, each a scan (shipments has no orderId index). The
+    // per-order bool_or flags answer the identical questions — an order with
+    // NO shipments gets no row, and coalesce(..., false) reproduces the
+    // vacuous-truth `none` semantics exactly. NULL codAmount/pickedUpAt rows
+    // are non-stale under SQL's NULL-rejecting comparisons, matching
+    // Prisma's gt/lt. The shipment subquery carries no order-org check, same
+    // as the relation filter it replaces — order ids are globally unique
+    // cuids and shipments are written org-scoped.
+    prisma.$queryRaw<Array<{ count: number }>>(Prisma.sql`
+      SELECT count(*)::int AS count
+      FROM orders o
+      LEFT JOIN (
+        SELECT s."orderId",
+               bool_or(s.status IN ('DELIVERED', 'RTO_INITIATED', 'RTO_DELIVERED')) AS has_terminal,
+               bool_or(s.status IN ('NEW', 'PICKED_UP', 'IN_TRANSIT', 'OUT_FOR_DELIVERY', 'UNKNOWN')
+                       AND s."codAmount" > 0
+                       AND s."pickedUpAt" < ${staleBefore}) AS has_stale
+        FROM shipments s
+        WHERE s."organizationId" = ${organizationId} AND s."orderId" IS NOT NULL
+        GROUP BY s."orderId"
+      ) sh ON sh."orderId" = o.id
+      WHERE o."organizationId" = ${organizationId}
+        AND o."paymentMode" = 'COD'
+        AND o."cancelledAt" IS NULL
+        ${placedAt ? Prisma.sql`AND o."placedAt" >= ${placedAt.gte} AND o."placedAt" <= ${placedAt.lte}` : Prisma.empty}
+        AND NOT coalesce(sh.has_terminal, false)
+        AND NOT coalesce(sh.has_stale, false)`).then((rows) => rows[0]!.count),
     prisma.shipment.aggregate({
       where: staleShipmentWhere,
       _count: { _all: true },
@@ -1432,7 +1502,7 @@ export async function getCodExposure(
   // cash at the door. isCashAtDoorGateway is the same test the per-shipment
   // codAmount uses, so the aggregate and the rows can't disagree.
   const onlineDeposits = codPayments.reduce(
-    (sum, p) => (isCashAtDoorGateway(p.method) ? sum : sum + p.amount),
+    (sum, g) => (isCashAtDoorGateway(g.method) ? sum : sum + (g._sum.amount ?? 0n)),
     0n
   );
 

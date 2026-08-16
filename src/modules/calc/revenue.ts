@@ -52,11 +52,41 @@ function refundExGst(o: RevenueOrder): bigint {
   return (o.refundedAmount * (o.grossAmount - o.taxAmount)) / o.grossAmount;
 }
 
-function netRevenueOf(orders: RevenueOrder[]) {
-  // §16: a cancelled order recognises no revenue at all, rather than
-  // recognising revenue and then reversing it.
-  const recognised = orders.filter((o) => o.cancelledAt === null);
-  return sumPaise(recognised.map((o) => o.grossAmount - o.taxAmount - refundExGst(o)));
+// One window's net revenue and recognised-order count, computed as two
+// database aggregates plus a narrow residual query instead of loading every
+// order row into Node:
+//
+//   SUM(grossAmount) − SUM(taxAmount)  — .aggregate, exact BigInt sums
+//   − Σ refundExGst(order)            — findMany restricted to
+//                                       refundedAmount ≠ 0, the only rows
+//                                       whose refund term is nonzero
+//
+// refundExGst returns 0n for refundedAmount === 0n, so excluding those rows
+// from the residual query removes ~95%+ of the transfer without touching the
+// arithmetic — the SAME JS function runs on the same remaining rows, and
+// BigInt addition is associative, so the total is bit-for-bit what the old
+// per-row loop produced. The §16 cancelled filter moves INTO the where (both
+// queries), selecting the identical row set the JS filter selected.
+async function netRevenueForWindow(
+  where: { organizationId: string; legalEntityId?: string },
+  from: Date,
+  to: Date
+) {
+  const windowWhere = { ...where, placedAt: { gte: from, lte: to }, cancelledAt: null };
+  const [agg, refundRows] = await Promise.all([
+    prisma.order.aggregate({
+      where: windowWhere,
+      _count: { _all: true },
+      _sum: { grossAmount: true, taxAmount: true },
+    }),
+    prisma.order.findMany({
+      where: { ...windowWhere, refundedAmount: { not: 0n } },
+      select: { grossAmount: true, taxAmount: true, refundedAmount: true, cancelledAt: true },
+    }),
+  ]);
+  const base = (agg._sum.grossAmount ?? 0n) - (agg._sum.taxAmount ?? 0n);
+  const refunds = sumPaise(refundRows.map((o) => refundExGst(o)));
+  return { netRevenue: base - refunds, orderCount: agg._count._all };
 }
 
 export async function getNetRevenueSummary(
@@ -70,19 +100,13 @@ export async function getNetRevenueSummary(
   const periodStart = range.from;
   const periodEnd = range.to;
 
-  const [currentOrders, priorOrders] = await Promise.all([
-    prisma.order.findMany({
-      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: periodStart, lte: periodEnd } },
-      select: { grossAmount: true, taxAmount: true, refundedAmount: true, cancelledAt: true },
-    }),
-    prisma.order.findMany({
-      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.priorFrom, lte: range.priorTo } },
-      select: { grossAmount: true, taxAmount: true, refundedAmount: true, cancelledAt: true },
-    }),
+  const [currentWindow, priorWindow] = await Promise.all([
+    netRevenueForWindow(scopeWhere(organizationId, scope), periodStart, periodEnd),
+    netRevenueForWindow(scopeWhere(organizationId, scope), range.priorFrom, range.priorTo),
   ]);
 
-  const current = netRevenueOf(currentOrders);
-  const prior = netRevenueOf(priorOrders);
+  const current = currentWindow.netRevenue;
+  const prior = priorWindow.netRevenue;
   const changePct = prior === 0n ? null : Math.round((Number(current - prior) / Number(prior)) * 1000) / 10;
 
   // Persisted so the number is reproducible and versioned, not just computed
@@ -135,7 +159,7 @@ export async function getNetRevenueSummary(
     priorValueMinor: prior.toString(),
     priorValue: paiseToRupees(prior),
     changePct,
-    orderCount: currentOrders.filter((o) => o.cancelledAt === null).length,
+    orderCount: currentWindow.orderCount,
     periodStart: periodStart.toISOString(),
     periodEnd: periodEnd.toISOString(),
     periodFiltered: true,

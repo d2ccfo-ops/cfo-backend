@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { checkCsv } from "../../lib/uploadGuard.js";
 import { encryptSecret } from "../../lib/crypto.js";
 import { logger } from "../../lib/logger.js";
@@ -89,6 +90,7 @@ bankConnectionRouter.post("/:connectionId/upload", ...requireAuth, async (req, r
   try {
     const result = await ingestStatement(toConnectorContext(connection), csv);
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+    invalidateOrgReads(connection.organizationId);
     logger.info(
       { connectionId: connection.id, recordsFetched: result.recordsFetched, skipped: result.skipped },
       "bank_statement_ingested"

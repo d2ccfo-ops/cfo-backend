@@ -1,6 +1,7 @@
 import { Worker, type Job } from "bullmq";
 import { env } from "../../config/env.js";
 import { logger } from "../../lib/logger.js";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { prisma } from "../../lib/prisma.js";
 import { redisConnection } from "../../lib/redis.js";
 import { amazonConnector } from "../connectors/amazon/index.js";
@@ -175,6 +176,11 @@ async function processSyncJob(job: Job<SyncJobData>) {
     logger.error({ err, connectionId, organizationId: connection.organizationId }, "post_sync_reconciliation_failed");
   }
 
+  // runReconciliation invalidates the org's cached reads itself, but only when
+  // it succeeds — and the sync landed data either way. Idempotent, so the
+  // double invalidation on the happy path costs one extra Redis DEL.
+  invalidateOrgReads(connection.organizationId);
+
   return result;
 }
 
@@ -228,7 +234,7 @@ export function startSyncWorker() {
     const attemptsAllowed = job.opts.attempts ?? 1;
     const isUnrecoverable = err.name === "UnrecoverableError";
     if (isUnrecoverable || job.attemptsMade >= attemptsAllowed) {
-      await prisma.connection.update({
+      const failed = await prisma.connection.update({
         where: { id: job.data.connectionId },
         data: {
           syncStatus: "FAILED",
@@ -238,6 +244,9 @@ export function startSyncWorker() {
           syncStartedAt: null,
         },
       });
+      // syncStatus feeds the freshness half of the data-status map — a reader
+      // watching a sync fail should see the status flip, not a cached IDLE.
+      invalidateOrgReads(failed.organizationId);
     }
   });
 

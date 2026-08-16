@@ -1,5 +1,6 @@
 import type { ApprovalActionType } from "@prisma/client";
 import { writeAudit } from "../../lib/audit.js";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { prisma } from "../../lib/prisma.js";
 
 // What an APPROVED request actually does.
@@ -105,6 +106,8 @@ async function writeOff(
         ...data,
       },
     });
+  // The approved write-off just changed the legs and status counts.
+  invalidateOrgReads(organizationId);
 
   await writeAudit({
     organizationId,

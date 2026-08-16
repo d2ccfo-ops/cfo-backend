@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { logger } from "../../lib/logger.js";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { prisma } from "../../lib/prisma.js";
 import { readSyncHealth } from "../../modules/sync/health.js";
 import { readDeadLetters } from "../../modules/sync/deadLetters.js";
@@ -105,6 +106,7 @@ connectionsRouter.patch("/:connectionId/opening-balance", ...requireAuth, async 
     where: { id: connection.id },
     data: { openingBalanceMinor: BigInt(Math.round(balanceRupees * 100)), openingBalanceDate: parsedDate },
   });
+  invalidateOrgReads(connection.organizationId);
 
   await writeAudit({
     organizationId: connection.organizationId,

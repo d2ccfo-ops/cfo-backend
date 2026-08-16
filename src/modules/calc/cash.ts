@@ -21,19 +21,27 @@ export async function getCashReceivedSummary(
   const periodStart = range.from;
   const periodEnd = range.to;
 
-  const [currentCredits, priorCredits] = await Promise.all([
-    prisma.bankTransaction.findMany({
+  // Summed in Postgres, not in Node — the findMany version deserialized every
+  // CREDIT row in the window (unbounded for a real bank feed) to add them up.
+  // SUM over a BigInt column is exact (numeric, no rounding) and addition is
+  // associative, so the total is bit-for-bit what the JS loop produced; ?? 0n
+  // reproduces sumPaise([]) === 0n for an empty window. _count rides in the
+  // SAME aggregate as the sum so the two can never describe different row
+  // sets — a separate .count() could race a row landing in between.
+  const [currentAgg, priorAgg] = await Promise.all([
+    prisma.bankTransaction.aggregate({
       where: { organizationId, direction: "CREDIT", valueDate: { gte: periodStart, lte: periodEnd } },
-      select: { amount: true },
+      _sum: { amount: true },
+      _count: { _all: true },
     }),
-    prisma.bankTransaction.findMany({
+    prisma.bankTransaction.aggregate({
       where: { organizationId, direction: "CREDIT", valueDate: { gte: range.priorFrom, lte: range.priorTo } },
-      select: { amount: true },
+      _sum: { amount: true },
     }),
   ]);
 
-  const current = sumPaise(currentCredits.map((t) => t.amount));
-  const prior = sumPaise(priorCredits.map((t) => t.amount));
+  const current = currentAgg._sum.amount ?? 0n;
+  const prior = priorAgg._sum.amount ?? 0n;
   const changePct = prior === 0n ? null : Math.round((Number(current - prior) / Number(prior)) * 1000) / 10;
 
   // Same manual findFirst+create/update as revenue.ts/shipments.ts — Prisma
@@ -80,7 +88,7 @@ export async function getCashReceivedSummary(
     priorValueMinor: prior.toString(),
     priorValue: paiseToRupees(prior),
     changePct,
-    transactionCount: currentCredits.length,
+    transactionCount: currentAgg._count._all,
     periodStart: periodStart.toISOString(),
     periodEnd: periodEnd.toISOString(),
     periodFiltered: true,

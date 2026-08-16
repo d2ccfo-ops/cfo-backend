@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { env } from "../../../config/env.js";
 import { decryptSecret } from "../../../lib/crypto.js";
+import { invalidateOrgReads } from "../../../lib/orgReadCache.js";
 import { prisma } from "../../../lib/prisma.js";
 import { rupeesToPaise } from "../../calc/money.js";
 import { toConnectorContext, type Connector, type ConnectorContext, type SyncResult, type WebhookVerificationResult } from "../types.js";
@@ -357,6 +358,8 @@ export async function processDataSession(
 
   await syncOpeningBalanceFromSummaries(connection.id, accounts);
   await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+  // Bank rows just landed — the cached cash/status reads must reflect them.
+  invalidateOrgReads(connection.organizationId);
 
   return { processed: true, status: fiData.status, accounts: accounts.length, transactions };
 }

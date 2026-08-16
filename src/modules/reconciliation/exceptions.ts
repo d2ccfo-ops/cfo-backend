@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import type { ResolvedRange } from "../../lib/dateRange.js";
 import { prisma } from "../../lib/prisma.js";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { AMOUNT_TOLERANCE_PAISE } from "../calc/reconciliation.js";
 import { capturedStatusSql } from "../calc/paymentStatus.js";
 
@@ -682,6 +683,8 @@ export async function flagMatchAsException(
       },
     });
   });
+  // An exception flag removes the row from every leg's matched set at once.
+  invalidateOrgReads(organizationId);
   return { flagged: true };
 }
 
@@ -701,5 +704,6 @@ export async function unflagMatch(organizationId: string, matchId: string, userI
       entityId: matchId,
     },
   });
+  invalidateOrgReads(organizationId);
   return { unflagged: true };
 }

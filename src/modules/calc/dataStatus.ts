@@ -1,5 +1,6 @@
 import { MatchType } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
+import { cachedOrgRead } from "../../lib/orgReadCache.js";
 import { readReconciliationLegs } from "./reconciliation.js";
 import { getDataFreshness } from "./freshness.js";
 
@@ -261,8 +262,18 @@ const legMatchedPct = (leg: { state: string; matchedValue: bigint; unmatchedValu
  * The statuses for all material metrics, from live data. Deliberately built on
  * cheap aggregates (not getCostCoverage's full line scan) so embedding it in
  * every material endpoint doesn't double their cost.
+ *
+ * Cached org-wide (see lib/orgReadCache.ts): the overview burst embeds this
+ * map in six endpoints at once, and each copy is ~15 aggregate queries
+ * (~600ms of DB CPU measured on the production box) answering the identical
+ * org-wide question. Nothing here is range- or entity-dependent; every write
+ * path a reader can observe invalidates it, and the 60s TTL bounds the rest.
+ * Callers treat the shared result as read-only — which they already did,
+ * since it is JSON-serialized straight into responses.
  */
-export async function getDataStatusMap(organizationId: string): Promise<Record<MaterialMetricKey, MetricDataStatus>> {
+export const getDataStatusMap = cachedOrgRead("dataStatus", computeDataStatusMap);
+
+async function computeDataStatusMap(organizationId: string): Promise<Record<MaterialMetricKey, MetricDataStatus>> {
   const [sourceRows, totalAgg, costedAgg, bankCreditCount, legs, freshness] = await Promise.all([
     // Latest cost row per SKU, grouped by source — the same DISTINCT ON the
     // Costs page's source split uses, so the two can't disagree.

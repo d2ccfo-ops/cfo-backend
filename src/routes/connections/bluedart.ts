@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { checkBase64 } from "../../lib/uploadGuard.js";
 import { env } from "../../config/env.js";
 import { encryptSecret } from "../../lib/crypto.js";
@@ -249,6 +250,7 @@ bluedartConnectionRouter.post("/:connectionId/invoice", ...requireAuth, async (r
       res.status(422).json(outcome);
       return;
     }
+    invalidateOrgReads(connection.organizationId);
     logger.info(
       { connectionId: connection.id, invoiceNo: outcome.invoiceNo, linesParsed: outcome.linesParsed },
       "bluedart_invoice_ingested"
@@ -319,6 +321,9 @@ bluedartConnectionRouter.post("/:connectionId/invoices", ...requireAuth, async (
   }
 
   const imported = results.filter((r): r is Extract<Outcome, { ok: true }> => r.ok);
+  // Once for the whole batch, not per file — any imported invoice changed the
+  // freight summary and legs.
+  if (imported.length > 0) invalidateOrgReads(connection.organizationId);
 
   // Totals are computed over DISTINCT INVOICES, not over files.
   //
@@ -396,6 +401,7 @@ bluedartConnectionRouter.post("/:connectionId/remittance", ...requireAuth, async
   try {
     const result = await ingestCodRemittance(toConnectorContext(connection), csv);
     await prisma.connection.update({ where: { id: connection.id }, data: { lastSyncedAt: new Date() } });
+    invalidateOrgReads(connection.organizationId);
     logger.info(
       {
         connectionId: connection.id,

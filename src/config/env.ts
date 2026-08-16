@@ -5,6 +5,22 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1),
   PORT: z.coerce.number().default(4000),
+
+  // How many API processes to fork. Unset means one per core, which is what a
+  // dedicated box wants; set it lower when the machine is shared with the
+  // worker and Postgres, as it is on the single-VM deployment.
+  //
+  // This is the knob that decides whether the metric endpoints can use more
+  // than one core. Node runs JS on a single thread, so an unclustered API
+  // serves seventeen parallel metric requests by interleaving them on one core
+  // no matter how many the machine has — see the header of src/index.ts for the
+  // measurement. Raising it past the core count does nothing but add context
+  // switches and Prisma pools; index.ts clamps it for that reason.
+  //
+  // Each child opens its own pool, so total DB connections are
+  // API_CLUSTER_WORKERS x the connection_limit in DATABASE_URL, plus the
+  // worker's. Keep that product under Postgres's max_connections.
+  API_CLUSTER_WORKERS: z.coerce.number().int().positive().optional(),
   CLERK_SECRET_KEY: z.string().min(1),
   CLERK_PUBLISHABLE_KEY: z.string().min(1),
   CLERK_WEBHOOK_SECRET: z.string().min(1),

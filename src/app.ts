@@ -73,7 +73,22 @@ export function createApp() {
   // OAuth `?code=` and the Setu webhook's `?key=<secret>` were written in
   // plaintext on every request. See lib/logger.ts.
   app.use(pinoHttp({ logger, serializers: httpSerializers }));
-  app.use(cors());
+  // maxAge, because the dashboard is on a DIFFERENT origin from this API and
+  // every call carries an Authorization header — which makes each one a
+  // "non-simple" request the browser must ask permission for first. Without a
+  // cached answer it re-asks constantly: measured on the live deployment, 115
+  // preflights served 78 real requests, each one a wasted round trip before the
+  // request that mattered could even start.
+  //
+  // 24h is the ceiling Chrome honours (Firefox caps at 24h too; Safari is
+  // lower). Nothing here is a security trade — a preflight answer says which
+  // methods and headers are allowed, and those change only when this file does.
+  //
+  // origin is still open. That is deliberate for now and wrong for later: it
+  // should be env.FRONTEND_URL once the marketing site and dashboard origins
+  // settle. Bearer tokens mean this is not the session-hijack risk it would be
+  // with cookies, but there is no reason to allow the whole internet either.
+  app.use(cors({ maxAge: 86400 }));
 
   // Needs the raw body for svix signature verification, so it's mounted with
   // its own raw parser and BEFORE the global express.json() below — once

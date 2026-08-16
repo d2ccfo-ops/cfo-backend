@@ -78,19 +78,43 @@ export async function getContributionMargin(
   // which run their own queries in this same Promise.all. Two full range scans
   // (~20k shipment rows and ~25k payment rows on a real org) were being loaded
   // and discarded on every dashboard render, report and nightly snapshot.
-  const [ladder, lineItems, adSpend, settings, freight, fees, orderCount] = await Promise.all([
+  // Every figure this function took from the line items is an AGGREGATE — six
+  // of them: a row count, a costed-row count, and four sums. It used to fetch
+  // all ~63,000 matching rows and reduce them in JS, which is what made this
+  // the slowest endpoint on the dashboard. Measured on the live deployment:
+  // 9.4s per request, while Postgres counts the same table in 10ms. The cost
+  // was never the query — it was serialising 63,000 rows out of Postgres and
+  // rebuilding them as JS objects with BigInt fields, to produce six numbers.
+  //
+  // SUM over a bigint column returns numeric in Postgres, which is arbitrary
+  // precision — so paise stay exact and this is the same arithmetic sumPaise
+  // was doing, done where the rows already are. §1 is unaffected: no model is
+  // involved either way.
+  //
+  // Two aggregates rather than one because the coverage figures need the
+  // costed subset, and a conditional aggregate would mean raw SQL. Both are
+  // single-row and hit the same index.
+  const lineWhere = {
+    order: {
+      ...scopeWhere(organizationId, scope),
+      placedAt: { gte: range.from, lte: range.to },
+      // §16: a cancelled order recognises neither revenue nor COGS, so its
+      // lines must not appear in the cost side either.
+      cancelledAt: null,
+    },
+  };
+
+  const [ladder, lineTotals, costedTotals, adSpend, settings, freight, fees, orderCount] = await Promise.all([
     getRevenueLadder(organizationId, range, scope),
-    prisma.orderLineItem.findMany({
-      where: {
-        order: {
-          ...scopeWhere(organizationId, scope),
-          placedAt: { gte: range.from, lte: range.to },
-          // §16: a cancelled order recognises neither revenue nor COGS, so its
-          // lines must not appear in the cost side either.
-          cancelledAt: null,
-        },
-      },
-      select: { cogsAmount: true, totalAmount: true, quantity: true },
+    prisma.orderLineItem.aggregate({
+      where: lineWhere,
+      _count: { _all: true },
+      _sum: { totalAmount: true, quantity: true },
+    }),
+    prisma.orderLineItem.aggregate({
+      where: { ...lineWhere, cogsAmount: { not: null } },
+      _count: { _all: true },
+      _sum: { cogsAmount: true, totalAmount: true },
     }),
     // Scoped like every other cost query below. Org-wide here meant an
     // entity-scoped request divided one entity's revenue by the whole
@@ -111,13 +135,18 @@ export async function getContributionMargin(
 
   // --- COGS (§19). Only lines with a stamped cost count. The uncosted count is
   // what makes this layer's coverage honest.
-  const costedLines = lineItems.filter((l) => l.cogsAmount !== null);
-  const cogs = sumPaise(costedLines.map((l) => l.cogsAmount as bigint));
-  const uncostedLines = lineItems.length - costedLines.length;
-  const cogsCovered = lineItems.length > 0 && uncostedLines === 0;
+  // `?? 0n` / `?? 0` throughout: SUM over an empty set is NULL in SQL, which
+  // Prisma surfaces as null. An org with no orders in range must read as zero,
+  // not crash — and `totalLines === 0` is what the notes below key off to say
+  // "nothing to cost" rather than "everything uncosted".
+  const totalLines = lineTotals._count._all;
+  const costedCount = costedTotals._count._all;
+  const cogs = costedTotals._sum.cogsAmount ?? 0n;
+  const uncostedLines = totalLines - costedCount;
+  const cogsCovered = totalLines > 0 && uncostedLines === 0;
   // Value coverage, not line coverage — see §53's reasoning.
-  const costedValue = sumPaise(costedLines.map((l) => l.totalAmount));
-  const totalLineValue = sumPaise(lineItems.map((l) => l.totalAmount));
+  const costedValue = costedTotals._sum.totalAmount ?? 0n;
+  const totalLineValue = lineTotals._sum.totalAmount ?? 0n;
   const cogsValueCoveragePct =
     totalLineValue === 0n ? 0 : Math.round((Number(costedValue) / Number(totalLineValue)) * 1000) / 10;
 
@@ -136,11 +165,11 @@ export async function getContributionMargin(
 
   // --- Packaging (§23). The one layer whose source is a typed rate rather than
   // an ingested record: nothing a brand connects reports what a mailer costs.
-  // UNITS, not lines. This passed `lineItems.length`, so an order line for
+  // UNITS, not lines. This passed `totalLines`, so an order line for
   // three of the same SKU paid for one item's packaging instead of three — the
   // layer understated by exactly the multi-quantity share of the basket, which
   // is large for any brand selling bundles or refills.
-  const itemUnits = lineItems.reduce((sum, l) => sum + (l.quantity ?? 0), 0);
+  const itemUnits = lineTotals._sum.quantity ?? 0;
   const packaging = computePackaging(settings, orderCount, itemUnits);
 
   // --- Transaction fees (§27–§30). Gateway and marketplace are the same column
@@ -176,16 +205,16 @@ export async function getContributionMargin(
       amountMinor: cogs.toString(),
       amount: paiseToRupees(cogs),
       covered: cogsCovered,
-      hasSource: costedLines.length > 0,
-      note: lineItems.length === 0
+      hasSource: costedCount > 0,
+      note: totalLines === 0
         // An empty period read "0 of 0 order lines have no cost (0% of line
         // value covered)" — a sentence that parses as a failure when the truth
         // is that nothing was sold. The first thing a brand sees on day one
         // should not be a percentage implying its costs are 0% known.
         ? "No order lines in this period"
         : cogsCovered
-          ? `All ${costedLines.length} order lines costed`
-          : `${uncostedLines} of ${lineItems.length} order lines have no cost (${cogsValueCoveragePct}% of line value covered)`,
+          ? `All ${costedCount} order lines costed`
+          : `${uncostedLines} of ${totalLines} order lines have no cost (${cogsValueCoveragePct}% of line value covered)`,
     },
     {
       key: "packaging",
@@ -374,9 +403,9 @@ export async function getContributionMargin(
   const warnings: string[] = [];
   if (!cogsCovered) {
     warnings.push(
-      lineItems.length === 0
+      totalLines === 0
         ? "No order lines in this period."
-        : `${uncostedLines} of ${lineItems.length} order lines have no product cost — CM0 and everything below it understate cost and therefore overstate margin.`
+        : `${uncostedLines} of ${totalLines} order lines have no product cost — CM0 and everything below it understate cost and therefore overstate margin.`
     );
   }
   if (missingLayers.length > 0) {
@@ -430,7 +459,7 @@ export async function getContributionMargin(
     // INCOMPLETE whenever COGS — the single largest cost line — covers less
     // than nearly all of line value. A margin computed over 31% of costs is not
     // an estimate of the margin, it's a different number wearing its name.
-    status: lineItems.length > 0 && cogsValueCoveragePct < 95 ? "INCOMPLETE" : "ESTIMATED",
+    status: totalLines > 0 && cogsValueCoveragePct < 95 ? "INCOMPLETE" : "ESTIMATED",
     dataCompleteness: Math.min(100, dataCompleteness),
     warnings,
 
@@ -449,8 +478,8 @@ export async function getContributionMargin(
 
     layers,
     cogsCoverage: {
-      costedLines: costedLines.length,
-      totalLines: lineItems.length,
+      costedLines: costedCount,
+      totalLines: totalLines,
       valueCoveragePct: cogsValueCoveragePct,
     },
   };

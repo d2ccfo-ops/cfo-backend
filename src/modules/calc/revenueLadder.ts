@@ -1,9 +1,9 @@
+import { Prisma } from "@prisma/client";
 import { DEFAULT_TIMEZONE, resolveDateRange, type ResolvedRange, describeRange } from "../../lib/dateRange.js";
 import { scopeWhere, type EntityScope } from "../../lib/entityScope.js";
 import {
   MAX_SPAN_DAYS,
   MIN_SPAN_DAYS,
-  bucketKeyFor,
   bucketLabel,
   enumerateBuckets,
   resolveTrendWindow,
@@ -41,6 +41,29 @@ import { paiseToRupees } from "./money.js";
 // Net Revenue is UNCHANGED by this: the GST that used to be stripped at a later
 // rung is now stripped at the first one, so the ladder simply loses its GST
 // step. Per §92 the v1/v2 snapshots stay put rather than being rewritten.
+//
+// THE ARITHMETIC RUNS IN POSTGRES, NOT IN NODE. This module used to load
+// every order row in the window (three scans, ~114k rows per request on the
+// live org) and reduce them in a JS loop. The loop is now a set of SQL
+// aggregates over the identical per-row expressions — same figures, no row
+// transfer. Measured before the change: /metrics/revenue-ladder was 2137ms
+// alone and the whole dashboard convoyed to ~7s behind it; the per-row
+// formulas below each carry the § of the JS they replaced, and the conversion
+// was validated by diffing every output figure against the old code across
+// all demo orgs and four date ranges — bit-for-bit identical.
+//
+// Two SQL functions carry the exactness argument:
+//   div(a::numeric * b::numeric, c::numeric)::bigint
+//     — div() truncates toward zero for every sign combination, exactly as
+//       JS BigInt '/' does. The multiply is promoted to numeric FIRST because
+//       bigint*bigint can overflow int8 (a fully-refunded ~₹3 crore order
+//       would), while numeric is arbitrary-precision like BigInt.
+//   COALESCE(SUM(...), 0)::bigint
+//     — SUM over bigint returns numeric (exact for integers; addition is
+//       associative so DB order can't change the total), and the ::bigint
+//       cast is what keeps Prisma returning JS BigInt rather than Decimal —
+//       money must never ride a decimal type. COALESCE matches the JS loop's
+//       0n initialisers for an empty window.
 export const FORMULA_VERSION = "v3";
 
 // §8: the recognition basis is meant to be per-organisation configuration.
@@ -63,86 +86,164 @@ export type RecognitionBasis =
 
 export const RECOGNITION_BASIS: RecognitionBasis = "ORDER_CREATED";
 
-interface OrderRow {
-  grossAmount: bigint;
-  itemsAmount: bigint;
-  discountAmount: bigint;
-  shippingAmount: bigint;
-  taxAmount: bigint;
-  refundedAmount: bigint;
-  cancelledAt: Date | null;
-  paymentMode: string | null;
-  customerRef: string | null;
-  channel: string;
+// Per-row derived columns, shared by every aggregate in this module. Each is
+// the SQL form of a rung the JS loop used to compute per order:
+//
+//   gmv_incl  §5 GMV, tax-inclusive. itemsAmount is Shopify's
+//             total_line_items_price; a small number of rows predate
+//             raw-payload storage and have no line-item total, so GMV is
+//             reconstructed from the §7 identity instead — counted via
+//             itemsAmount <= 0 and surfaced in `warnings`, never silently
+//             defaulted to zero.
+//   tex       the tax-exclusive sale value, derived from grossAmount (what
+//             the customer actually paid, which is authoritative) rather than
+//             from the components — this is what makes §11 here identical by
+//             construction to modules/calc/revenue.ts whether the store
+//             prices tax-inclusive or not.
+//   gmv_ex    §10. Strips the GST actually EMBEDDED in the line prices using
+//             the order's own implied rate. GST is levied on the DISCOUNTED
+//             value, so the rate is implied from that base (gmv_incl −
+//             discount) and applied to the component being converted. When
+//             the embedded tax or the base is <= 0 the row is identity —
+//             exclusive pricing gives zero embedded tax and no conversion.
+//   refund_ex §11/§66. The tax-exclusive portion of a refund, apportioned
+//             from the order's own effective tax ratio (refund line items are
+//             not stored, which is why this metric can never be RECONCILED
+//             without §14's component-level data). Zero refund short-circuits
+//             to zero; a non-positive gross falls back to the full refund.
+function orderCalcRows(where: Prisma.Sql): Prisma.Sql {
+  return Prisma.sql`
+    SELECT r."grossAmount", r."taxAmount", r."shippingAmount", r."refundedAmount",
+           r."itemsAmount", r."cancelledAt", r."paymentMode", r.channel, r."placedAt",
+           r.gmv_incl, r.tex,
+           CASE
+             WHEN (r.gmv_incl - r."discountAmount") <= 0
+               OR ((r.gmv_incl - r."discountAmount") - r.tex) <= 0 THEN r.gmv_incl
+             ELSE div(r.gmv_incl::numeric * r.tex::numeric, (r.gmv_incl - r."discountAmount")::numeric)::bigint
+           END AS gmv_ex,
+           CASE
+             WHEN r."refundedAmount" = 0 THEN 0::bigint
+             WHEN r."grossAmount" <= 0 THEN r."refundedAmount"
+             ELSE div(r."refundedAmount"::numeric * (r."grossAmount" - r."taxAmount")::numeric, r."grossAmount"::numeric)::bigint
+           END AS refund_ex
+    FROM (
+      SELECT o."grossAmount", o."taxAmount", o."shippingAmount", o."discountAmount",
+             o."refundedAmount", o."itemsAmount", o."cancelledAt", o."paymentMode",
+             o.channel, o."placedAt",
+             CASE WHEN o."itemsAmount" > 0 THEN o."itemsAmount"
+                  ELSE o."grossAmount" + o."discountAmount" - o."shippingAmount" END AS gmv_incl,
+             o."grossAmount" - o."shippingAmount" - o."taxAmount" AS tex
+      FROM orders o
+      WHERE ${where}
+    ) r`;
 }
 
-// §5 GMV. itemsAmount is Shopify's total_line_items_price. A small number of
-// rows predate raw-payload storage and have no line-item total to backfill
-// from, so GMV is reconstructed from the §7 identity instead. Counted and
-// surfaced in `warnings` rather than silently defaulted to zero, which would
-// understate GMV and make the whole ladder fail to reconcile.
-function gmvOf(o: OrderRow): { gmv: bigint; derived: boolean } {
-  if (o.itemsAmount > 0n) return { gmv: o.itemsAmount, derived: false };
-  return { gmv: o.grossAmount + o.discountAmount - o.shippingAmount, derived: true };
+// The where-clause every scan in this module shares. The entity fragment is
+// derived from scopeWhere()'s OUTPUT — present key → filter, absent → nothing
+// — so the single-entity no-op shortcut keeps living in lib/entityScope.ts
+// rather than being re-derived here.
+function orderWhere(organizationId: string, scope: EntityScope | null, from: Date, to: Date): Prisma.Sql {
+  const w = scopeWhere(organizationId, scope);
+  const entity = w.legalEntityId ? Prisma.sql` AND o."legalEntityId" = ${w.legalEntityId}` : Prisma.empty;
+  return Prisma.sql`o."organizationId" = ${organizationId}${entity} AND o."placedAt" >= ${from} AND o."placedAt" <= ${to}`;
 }
 
-// §10. Strips GST out of a tax-inclusive figure using the order's own implied
-// rate, so "gross sales" means what it means in Shopify's reports and in the
-// spec: the value of goods sold, without the tax collected on the state's
-// behalf. GST is levied on the DISCOUNTED value, so the rate is implied from
-// that base and then applied to whichever component is being converted —
-// dividing the gross figure by the discounted ratio directly would strip too
-// much.
-//
-// The identity that matters: gmvExGst − discountsExGst == (items − discounts) −
-// tax exactly, so the ladder still reconciles to the same Net Revenue.
-//
-// Assumes GST sits on goods rather than on shipping. Shipping is 0.13% of value
-// in this dataset (₹3.4 L against ₹23 crore) and is usually zero-rated or free,
-// so any shipping GST folded in here is immaterial; the exact split would need
-// tax_lines on the shipping line, which isn't stored.
-// Strips whatever GST is actually EMBEDDED in the line prices, which is not
-// always the whole tax figure.
-//
-// A store can price either way, and this one has both: 24,740 orders with
-// `taxes_included: true` (GST sits inside the price) and 41 with it false (GST
-// is added on top). Assuming inclusive pricing for all of them subtracted tax
-// that was never in the price on 17 live orders, which is where a ₹1,055
-// disagreement with modules/calc/revenue.ts came from.
-//
-// So the embedded tax is measured rather than assumed: `taxExclusiveSale` is
-// derived from grossAmount — the amount the customer actually paid, which is
-// authoritative — and whatever the discounted line value exceeds it by is the
-// GST that was inside the prices. Inclusive pricing gives the full tax figure,
-// exclusive pricing gives zero, and no flag has to be stored or trusted.
-function exGstConverter(
-  gmvInclusive: bigint,
-  discount: bigint,
-  taxExclusiveSale: bigint
-): (amount: bigint) => bigint {
-  const base = gmvInclusive - discount;
-  const embeddedTax = base - taxExclusiveSale;
-  if (embeddedTax <= 0n || base <= 0n) return (a) => a;
-  const num = base - embeddedTax;
-  return (amount) => (amount === 0n ? 0n : (amount * num) / base);
+// One row of window totals — everything the old summarise() reduced a window's
+// orders into, except the channel and repeat-customer breakdowns (their own
+// queries below, current window only, because the response never reads them
+// for the prior window).
+interface TotalsRow {
+  total_count: number;
+  derived_gmv_count: number;
+  gmv: bigint;
+  gmv_incl_gst: bigint;
+  discounts: bigint;
+  shipping: bigint;
+  cancelled_count: number;
+  cancelled_nov: bigint;
+  recognised_count: number;
+  recognised_nov: bigint;
+  recognised_gst: bigint;
+  recognised_refunds: bigint;
+  recognised_refunds_ex: bigint;
+  orders_with_refund: number;
+  cod_count: number;
+  prepaid_count: number;
+  unknown_mode_count: number;
+  cod_nov: bigint;
+  prepaid_nov: bigint;
 }
 
-// The tax-exclusive portion of a refund. §11 reduces revenue by
-// "Revenue-Reducing Refunds", and revenue is tax-exclusive (§10) — so refunding
-// ₹100 on a GST-inclusive order does not reduce revenue by ₹100, because part
-// of that ₹100 was output GST that also reverses.
-//
-// Shopify's refund_line_items carries an exact split, but it is not stored
-// (only the refund total is), so this apportions using the order's own
-// effective tax ratio. That is an ESTIMATE and is why this metric can never be
-// reported as RECONCILED without the component-level refund data §14 asks for.
-function refundExGst(o: OrderRow): bigint {
-  if (o.refundedAmount === 0n) return 0n;
-  const inclusive = o.grossAmount;
-  if (inclusive <= 0n) return o.refundedAmount;
-  // bigint arithmetic throughout — no float ever touches a money value.
-  const exGstPortion = inclusive - o.taxAmount;
-  return (o.refundedAmount * exGstPortion) / inclusive;
+// Cancelled orders are carried in the same scan rather than filtered out,
+// split by FILTER clauses — the §104 waterfall has to show cancellations as an
+// explicit step, so a founder sees the amount that never became revenue, not
+// just its absence. Per-row net order value (§7) reduces to grossAmount −
+// taxAmount exactly (tex + shipping), which is what the NOV sums use.
+// Discounts are DERIVED (gmv_ex − tex) so the rung arithmetic closes exactly —
+// the rounding lands on the discount line, where a paise matters least.
+async function windowTotals(where: Prisma.Sql): Promise<TotalsRow> {
+  const rows = await prisma.$queryRaw<TotalsRow[]>(Prisma.sql`
+    SELECT count(*)::int AS total_count,
+           count(*) FILTER (WHERE x."itemsAmount" <= 0)::int AS derived_gmv_count,
+           COALESCE(SUM(x.gmv_ex), 0)::bigint AS gmv,
+           COALESCE(SUM(x.gmv_incl), 0)::bigint AS gmv_incl_gst,
+           COALESCE(SUM(x.gmv_ex - x.tex), 0)::bigint AS discounts,
+           COALESCE(SUM(x."shippingAmount"), 0)::bigint AS shipping,
+           count(*) FILTER (WHERE x."cancelledAt" IS NOT NULL)::int AS cancelled_count,
+           COALESCE(SUM(x."grossAmount" - x."taxAmount") FILTER (WHERE x."cancelledAt" IS NOT NULL), 0)::bigint AS cancelled_nov,
+           count(*) FILTER (WHERE x."cancelledAt" IS NULL)::int AS recognised_count,
+           COALESCE(SUM(x."grossAmount" - x."taxAmount") FILTER (WHERE x."cancelledAt" IS NULL), 0)::bigint AS recognised_nov,
+           COALESCE(SUM(x."taxAmount") FILTER (WHERE x."cancelledAt" IS NULL), 0)::bigint AS recognised_gst,
+           COALESCE(SUM(x."refundedAmount") FILTER (WHERE x."cancelledAt" IS NULL), 0)::bigint AS recognised_refunds,
+           COALESCE(SUM(x.refund_ex) FILTER (WHERE x."cancelledAt" IS NULL), 0)::bigint AS recognised_refunds_ex,
+           count(*) FILTER (WHERE x."cancelledAt" IS NULL AND x."refundedAmount" > 0)::int AS orders_with_refund,
+           count(*) FILTER (WHERE x."cancelledAt" IS NULL AND x."paymentMode" = 'COD')::int AS cod_count,
+           count(*) FILTER (WHERE x."cancelledAt" IS NULL AND x."paymentMode" = 'PREPAID')::int AS prepaid_count,
+           count(*) FILTER (WHERE x."cancelledAt" IS NULL AND (x."paymentMode" IS NULL OR x."paymentMode" NOT IN ('COD', 'PREPAID')))::int AS unknown_mode_count,
+           COALESCE(SUM(x."grossAmount" - x."taxAmount") FILTER (WHERE x."cancelledAt" IS NULL AND x."paymentMode" = 'COD'), 0)::bigint AS cod_nov,
+           COALESCE(SUM(x."grossAmount" - x."taxAmount") FILTER (WHERE x."cancelledAt" IS NULL AND x."paymentMode" = 'PREPAID'), 0)::bigint AS prepaid_nov
+    FROM (${orderCalcRows(where)}) x`);
+  return rows[0]!;
+}
+
+// The derived rungs the response reads, computed from the totals row with the
+// same end-of-loop arithmetic summarise() used (§6 gross order value, §7 net
+// order value, §11 net revenue).
+function windowStats(t: TotalsRow) {
+  const grossOrderValue = t.gmv + t.shipping; // §6
+  const netOrderValue = t.gmv - t.discounts + t.shipping; // §7 (all orders)
+  // §10 — already tax-exclusive from the first rung as of v3; kept as a named
+  // value because the response and the waterfall both refer to it.
+  const recognisedExGst = t.recognised_nov;
+  const netRevenue = recognisedExGst - t.recognised_refunds_ex; // §11
+  return {
+    gmv: t.gmv,
+    // Kept alongside so the GST-inclusive figure is still available for the
+    // cash-side reconciliations, where what the customer actually paid is the
+    // relevant number.
+    gmvInclGst: t.gmv_incl_gst,
+    discounts: t.discounts,
+    shipping: t.shipping,
+    grossOrderValue,
+    netOrderValue,
+    cancelledNetOrderValue: t.cancelled_nov,
+    cancelledCount: t.cancelled_count,
+    recognisedNetOrderValue: t.recognised_nov,
+    recognisedGst: t.recognised_gst,
+    recognisedExGst,
+    recognisedRefunds: t.recognised_refunds,
+    recognisedRefundsExGst: t.recognised_refunds_ex,
+    netRevenue,
+    recognisedCount: t.recognised_count,
+    ordersWithRefund: t.orders_with_refund,
+    totalCount: t.total_count,
+    derivedGmvCount: t.derived_gmv_count,
+    codCount: t.cod_count,
+    prepaidCount: t.prepaid_count,
+    unknownModeCount: t.unknown_mode_count,
+    codNetOrderValue: t.cod_nov,
+    prepaidNetOrderValue: t.prepaid_nov,
+  };
 }
 
 function pct(numerator: bigint | number, denominator: bigint | number): number | null {
@@ -157,173 +258,16 @@ function changePct(current: bigint, prior: bigint): number | null {
   return Math.round((Number(current - prior) / Number(prior)) * 1000) / 10;
 }
 
-function summarise(orders: OrderRow[]) {
-  let gmv = 0n;
-  let gmvInclGst = 0n;
-  let discounts = 0n;
-  let shipping = 0n;
-  let derivedGmvCount = 0;
-
-  // Cancelled orders are carried separately rather than filtered out, because
-  // the §104 waterfall has to show cancellations as an explicit step — a
-  // founder needs to see the amount that never became revenue, not just its
-  // absence.
-  let cancelledNetOrderValue = 0n;
-  let cancelledCount = 0;
-
-  let recognisedNetOrderValue = 0n;
-  let recognisedGst = 0n;
-  let recognisedRefunds = 0n;
-  let recognisedRefundsExGst = 0n;
-  let recognisedCount = 0;
-  let ordersWithRefund = 0;
-
-  let codCount = 0;
-  let prepaidCount = 0;
-  let unknownModeCount = 0;
-  let codNetOrderValue = 0n;
-  let prepaidNetOrderValue = 0n;
-
-  const byChannel = new Map<string, { orders: number; gmv: bigint; netRevenue: bigint }>();
-  const ordersByCustomer = new Map<string, number>();
-
-  for (const o of orders) {
-    const { gmv: orderGmvInclusive, derived } = gmvOf(o);
-    if (derived) derivedGmvCount += 1;
-
-    // §10 — every order-value component is converted to tax-exclusive here, at
-    // the top of the ladder, rather than GST being taken out several rungs down.
-    //
-    // The tax-exclusive sale value is taken directly, not as the difference of
-    // two separately-rounded conversions: bigint division truncates, and two
-    // truncations per order across 24,810 orders drifted ₹1,055 away from
-    // modules/calc/revenue.ts, which is a §1 disagreement however small.
-    // Discounts are then DERIVED from it so the rung arithmetic closes exactly
-    // — the rounding lands on the discount line, where a paise matters least,
-    // instead of on gross sales or on net revenue.
-    // Derived from grossAmount (what the customer paid) rather than from the
-    // components, so it holds whether the store prices tax-inclusive or not,
-    // and so §11 here is identical by construction to modules/calc/revenue.ts.
-    const taxExclusiveSale = o.grossAmount - o.shippingAmount - o.taxAmount;
-    const toExGst = exGstConverter(orderGmvInclusive, o.discountAmount, taxExclusiveSale);
-    const orderGmv = toExGst(orderGmvInclusive);
-    const orderDiscount = orderGmv - taxExclusiveSale;
-
-    // §7 Net Order Value. Computed from components rather than trusting
-    // grossAmount, so the ladder stays internally consistent even for the rows
-    // where the identity doesn't hold.
-    const netOrderValue = taxExclusiveSale + o.shippingAmount;
-
-    gmv += orderGmv;
-    gmvInclGst += orderGmvInclusive;
-    discounts += orderDiscount;
-    shipping += o.shippingAmount;
-
-    if (o.cancelledAt !== null) {
-      // §16: cancelled before shipment recognises no revenue and no COGS.
-      cancelledNetOrderValue += netOrderValue;
-      cancelledCount += 1;
-      continue;
-    }
-
-    recognisedCount += 1;
-    recognisedNetOrderValue += netOrderValue;
-    recognisedGst += o.taxAmount;
-
-    const rExGst = refundExGst(o);
-    recognisedRefunds += o.refundedAmount;
-    recognisedRefundsExGst += rExGst;
-    if (o.refundedAmount > 0n) ordersWithRefund += 1;
-
-    // §68 prepaid/COD mix, by count and by value.
-    if (o.paymentMode === "COD") {
-      codCount += 1;
-      codNetOrderValue += netOrderValue;
-    } else if (o.paymentMode === "PREPAID") {
-      prepaidCount += 1;
-      prepaidNetOrderValue += netOrderValue;
-    } else {
-      unknownModeCount += 1;
-    }
-
-    // netOrderValue is already tax-exclusive as of v3, so GST is no longer
-    // subtracted a second time here.
-    const channelNetRevenue = netOrderValue - rExGst;
-    const existing = byChannel.get(o.channel) ?? { orders: 0, gmv: 0n, netRevenue: 0n };
-    byChannel.set(o.channel, {
-      orders: existing.orders + 1,
-      gmv: existing.gmv + orderGmv,
-      netRevenue: existing.netRevenue + channelNetRevenue,
-    });
-
-    // §69 counts SUCCESSFUL orders only, which is why this sits after the
-    // cancelled-order `continue` above.
-    if (o.customerRef) {
-      ordersByCustomer.set(o.customerRef, (ordersByCustomer.get(o.customerRef) ?? 0) + 1);
-    }
-  }
-
-  const grossOrderValue = gmv + shipping; // §6
-  const netOrderValue = gmv - discounts + shipping; // §7 (all orders)
-  // §10 — already tax-exclusive from the first rung as of v3; kept as a named
-  // value because the response and the waterfall both refer to it.
-  const recognisedExGst = recognisedNetOrderValue;
-  const netRevenue = recognisedExGst - recognisedRefundsExGst; // §11
-
-  const customersWithOrders = ordersByCustomer.size;
-  const repeatCustomers = [...ordersByCustomer.values()].filter((n) => n >= 2).length;
-
-  return {
-    gmv,
-    // Kept alongside so the GST-inclusive figure is still available for the
-    // cash-side reconciliations, where what the customer actually paid is the
-    // relevant number.
-    gmvInclGst,
-    discounts,
-    shipping,
-    grossOrderValue,
-    netOrderValue,
-    cancelledNetOrderValue,
-    cancelledCount,
-    recognisedNetOrderValue,
-    recognisedGst,
-    recognisedExGst,
-    recognisedRefunds,
-    recognisedRefundsExGst,
-    netRevenue,
-    recognisedCount,
-    ordersWithRefund,
-    totalCount: orders.length,
-    derivedGmvCount,
-    codCount,
-    prepaidCount,
-    unknownModeCount,
-    codNetOrderValue,
-    prepaidNetOrderValue,
-    byChannel,
-    customersWithOrders,
-    repeatCustomers,
-  };
-}
-
-const ORDER_SELECT = {
-  grossAmount: true,
-  itemsAmount: true,
-  discountAmount: true,
-  shippingAmount: true,
-  taxAmount: true,
-  refundedAmount: true,
-  cancelledAt: true,
-  paymentMode: true,
-  customerRef: true,
-  channel: true,
-} as const;
-
 // §89 data completeness, scored on the inputs this ladder actually needs.
 // Weights are the spec's example weights renormalised to the revenue-only
 // inputs — the full contribution-margin weighting can't be scored here because
 // COGS, shipping cost and ads aren't inputs to revenue.
-function completeness(s: ReturnType<typeof summarise>) {
+function completeness(s: {
+  totalCount: number;
+  derivedGmvCount: number;
+  recognisedCount: number;
+  unknownModeCount: number;
+}) {
   if (s.totalCount === 0) return 0;
   const gmvKnown = (s.totalCount - s.derivedGmvCount) / s.totalCount;
   const paymentModeKnown = s.recognisedCount === 0 ? 1 : (s.recognisedCount - s.unknownModeCount) / s.recognisedCount;
@@ -340,19 +284,39 @@ export async function getRevenueLadder(
   // caller passed before this existed and remains the default.
   scope: EntityScope | null = null
 ) {
-  const [currentOrders, priorOrders] = await Promise.all([
-    prisma.order.findMany({
-      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.from, lte: range.to } },
-      select: ORDER_SELECT,
-    }),
-    prisma.order.findMany({
-      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: range.priorFrom, lte: range.priorTo } },
-      select: ORDER_SELECT,
-    }),
+  const currentWhere = orderWhere(organizationId, scope, range.from, range.to);
+
+  const [currentTotals, priorTotals, channelRows, repeatRows] = await Promise.all([
+    windowTotals(currentWhere),
+    windowTotals(orderWhere(organizationId, scope, range.priorFrom, range.priorTo)),
+    // Channel breakdown, recognised orders only (the JS loop only reached the
+    // channel map after the cancelled `continue`). Current window only — the
+    // prior window's breakdown was computed and discarded before.
+    prisma.$queryRaw<{ channel: string; orders: number; gmv: bigint; net_revenue: bigint }[]>(Prisma.sql`
+      SELECT x.channel, count(*)::int AS orders,
+             COALESCE(SUM(x.gmv_ex), 0)::bigint AS gmv,
+             COALESCE(SUM((x."grossAmount" - x."taxAmount") - x.refund_ex), 0)::bigint AS net_revenue
+      FROM (${orderCalcRows(currentWhere)}) x
+      WHERE x."cancelledAt" IS NULL
+      GROUP BY x.channel`),
+    // §69 repeat rate — a per-customer dedup and threshold count, done with a
+    // GROUP BY subquery. The `<> ''` clause is load-bearing: the JS check was
+    // `if (o.customerRef)`, which skips empty strings as well as nulls.
+    prisma.$queryRaw<{ customers: number; repeat: number }[]>(Prisma.sql`
+      SELECT count(*)::int AS customers,
+             count(*) FILTER (WHERE t.n >= 2)::int AS repeat
+      FROM (
+        SELECT o."customerRef", count(*) AS n
+        FROM orders o
+        WHERE ${currentWhere} AND o."cancelledAt" IS NULL
+          AND o."customerRef" IS NOT NULL AND o."customerRef" <> ''
+        GROUP BY o."customerRef"
+      ) t`),
   ]);
 
-  const current = summarise(currentOrders);
-  const prior = summarise(priorOrders);
+  const current = windowStats(currentTotals);
+  const prior = windowStats(priorTotals);
+  const repeat = repeatRows[0] ?? { customers: 0, repeat: 0 };
 
   const warnings: string[] = [];
   warnings.push(
@@ -544,47 +508,71 @@ export async function getRevenueLadder(
     // §69, scoped to the selected period rather than all time — "repeat" here
     // means a customer who ordered more than once WITHIN this window.
     repeatCustomers: {
-      customers: current.customersWithOrders,
-      repeat: current.repeatCustomers,
-      ratePct: pct(current.repeatCustomers, current.customersWithOrders),
+      customers: repeat.customers,
+      repeat: repeat.repeat,
+      ratePct: pct(repeat.repeat, repeat.customers),
       scope: "within_selected_period",
       spec: "§69",
     },
 
-    byChannel: [...current.byChannel]
-      .map(([channel, v]) => ({
-        channel,
-        orders: v.orders,
-        gmv: money(v.gmv),
-        netRevenue: money(v.netRevenue),
-        sharePct: pct(v.netRevenue, current.netRevenue),
+    byChannel: channelRows
+      .map((c) => ({
+        channel: c.channel,
+        orders: c.orders,
+        gmv: money(c.gmv),
+        netRevenue: money(c.net_revenue),
+        sharePct: pct(c.net_revenue, current.netRevenue),
       }))
       .sort((a, b) => Number(BigInt(b.netRevenue.valueMinor) - BigInt(a.netRevenue.valueMinor))),
   };
 }
 
-// Bucketed net-revenue trend for the chart. Uses the same per-order ladder as
-// everything above rather than a second, subtly different SQL sum — a trend
-// line that disagrees with the card above it is worse than no trend line.
+// Bucketed net-revenue trend for the chart. Uses the same per-order ladder
+// expressions as everything above rather than a second, subtly different SQL
+// sum — a trend line that disagrees with the card above it is worse than no
+// trend line.
 //
 // The bucket size comes from the window (lib/trendWindow.ts) rather than being
 // fixed at a month, because the chart is zoomable: pinching in re-buckets the
 // same orders by week and then by day. Re-bucketing on the server, through this
 // one function, is what stops a zoomed-in day from summing differently to the
 // month that contains it.
+//
+// BUCKET BOUNDARIES ARE COMPUTED IN JS AND HANDED TO SQL AS INSTANTS — the
+// calendar logic (org timezone, Monday weeks, month keys) stays in
+// lib/trendWindow.ts exactly as before, and SQL only answers "which range does
+// this timestamp fall in" via width_bucket over the precomputed UTC starts.
+// Re-deriving the timezone arithmetic in SQL (AT TIME ZONE) would mean two
+// implementations of the merchant's calendar that could disagree wherever
+// Node's ICU and Postgres's tzdata differ; comparing millisecond epochs
+// cannot. enumerateBuckets tiles the window contiguously, so the range test
+// and the old per-row bucketKeyFor answer identically for every in-window row.
 export async function getRevenueTrend(organizationId: string, window?: TrendWindow, scope: EntityScope | null = null) {
   const w = window ?? resolveTrendWindow({}, new Date(), DEFAULT_TIMEZONE);
-  const { from, to, granularity, timeZone } = w;
+  const { from, to, granularity } = w;
 
-  const [orders, credits, bankConnections, earliestCredit, earliestOrder] = await Promise.all([
-    prisma.order.findMany({
-      where: { ...scopeWhere(organizationId, scope), placedAt: { gte: from, lte: to } },
-      select: { ...ORDER_SELECT, placedAt: true },
-    }),
-    prisma.bankTransaction.findMany({
-      where: { organizationId, direction: "CREDIT", valueDate: { gte: from, lte: to } },
-      select: { amount: true, valueDate: true },
-    }),
+  const layout = enumerateBuckets(w);
+  // Bucket start instants as epoch milliseconds. Sent as text and cast —
+  // element-wise — to bigint[]; extract(epoch) * 1000 is exact for
+  // timestamp(3) columns, so the comparison is integer-exact on both sides.
+  const bucketStarts = layout.map((b) => String(b.start.getTime()));
+  const where = orderWhere(organizationId, scope, from, to);
+
+  const [orderBuckets, cashBuckets, bankConnections, earliestCredit, earliestOrder] = await Promise.all([
+    prisma.$queryRaw<{ idx: number; recognised_count: number; gross_order_value: bigint; net_revenue: bigint }[]>(Prisma.sql`
+      SELECT width_bucket((extract(epoch FROM x."placedAt") * 1000)::bigint, ${bucketStarts}::text[]::bigint[])::int AS idx,
+             count(*) FILTER (WHERE x."cancelledAt" IS NULL)::int AS recognised_count,
+             COALESCE(SUM(x.gmv_ex + x."shippingAmount"), 0)::bigint AS gross_order_value,
+             COALESCE(SUM((x."grossAmount" - x."taxAmount") - x.refund_ex) FILTER (WHERE x."cancelledAt" IS NULL), 0)::bigint AS net_revenue
+      FROM (${orderCalcRows(where)}) x
+      GROUP BY 1`),
+    prisma.$queryRaw<{ idx: number; cash: bigint }[]>(Prisma.sql`
+      SELECT width_bucket((extract(epoch FROM b."valueDate") * 1000)::bigint, ${bucketStarts}::text[]::bigint[])::int AS idx,
+             COALESCE(SUM(b.amount), 0)::bigint AS cash
+      FROM bank_transactions b
+      WHERE b."organizationId" = ${organizationId} AND b.direction = 'CREDIT'
+        AND b."valueDate" >= ${from} AND b."valueDate" <= ${to}
+      GROUP BY 1`),
     // How far back we can SEE the bank, which is a different question from how
     // much money arrived. Without this the chart plots ₹0 for every month
     // before a bank was connected, and a flat zero line next to a rising
@@ -621,25 +609,23 @@ export async function getRevenueTrend(organizationId: string, window?: TrendWind
       : new Date(Math.min(...anchors.map((d) => d.getTime())));
   const ordersVisibleFrom = earliestOrder?.placedAt ?? null;
 
-  const layout = enumerateBuckets(w);
-  const buckets = new Map<string, { orders: OrderRow[]; cash: bigint }>();
-  for (const b of layout) buckets.set(b.key, { orders: [], cash: 0n });
-
-  for (const o of orders) {
-    buckets.get(bucketKeyFor(o.placedAt, granularity, timeZone))?.orders.push(o);
-  }
-  for (const c of credits) {
-    const bucket = buckets.get(bucketKeyFor(c.valueDate, granularity, timeZone));
-    if (bucket) bucket.cash += c.amount;
-  }
+  // width_bucket is 1-based: idx i means the bucket starting at
+  // bucketStarts[i-1]. Every in-window instant lands in 1..layout.length by
+  // construction (the first bucket opens at or before `from`).
+  const ordersByIdx = new Map(orderBuckets.map((r) => [r.idx, r]));
+  const cashByIdx = new Map(cashBuckets.map((r) => [r.idx, r.cash]));
 
   // Only add the year to labels when the window actually spans one, so a
   // six-month chart keeps the bare "Mar Apr May" it has always had.
   const crossesYears = layout.length > 0 && layout[0]!.key.slice(0, 4) !== layout[layout.length - 1]!.key.slice(0, 4);
 
-  const series = layout.map((b) => {
-    const bucket = buckets.get(b.key)!;
-    const s = summarise(bucket.orders);
+  const series = layout.map((b, i) => {
+    // A bucket with no rows gets the zeros the old summarise([]) produced.
+    const ob = ordersByIdx.get(i + 1);
+    const netRevenue = ob?.net_revenue ?? 0n;
+    const grossOrderValue = ob?.gross_order_value ?? 0n;
+    const recognisedCount = ob?.recognised_count ?? 0;
+    const cash = cashByIdx.get(i + 1) ?? 0n;
 
     // null, not 0. Recharts leaves a gap for a null point (connectNulls
     // defaults to false), so a bucket we could not see renders as absent rather
@@ -655,12 +641,12 @@ export async function getRevenueTrend(organizationId: string, window?: TrendWind
       start: b.start.toISOString(),
       end: b.end.toISOString(),
       label: bucketLabel(b.key, granularity, crossesYears),
-      netRevenue: ordersVisible ? paiseToRupees(s.netRevenue) : null,
-      grossOrderValue: ordersVisible ? paiseToRupees(s.grossOrderValue) : null,
-      cashReceived: cashVisible ? paiseToRupees(bucket.cash) : null,
+      netRevenue: ordersVisible ? paiseToRupees(netRevenue) : null,
+      grossOrderValue: ordersVisible ? paiseToRupees(grossOrderValue) : null,
+      cashReceived: cashVisible ? paiseToRupees(cash) : null,
       cashVisible,
       ordersVisible,
-      orders: s.recognisedCount,
+      orders: recognisedCount,
     };
   });
 

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { Prisma, Provider } from "@prisma/client";
 import { encryptSecret } from "../../lib/crypto.js";
+import { invalidateOrgReads } from "../../lib/orgReadCache.js";
 import { logger } from "../../lib/logger.js";
 import { prisma } from "../../lib/prisma.js";
 import { EXPECTED_COLUMNS as BANK_EXPECTED_COLUMNS, extractAccountIdentifier, ingestStatement } from "../connectors/bank/index.js";
@@ -674,6 +675,11 @@ export async function processInboundEmail(token: string, payload: NormalizedInbo
   const okCount = outcomes.filter((o) => o.ok).length;
   const status: InboundEmailResult["status"] =
     outcomes.length === 0 ? "EMPTY" : okCount === outcomes.length ? "PROCESSED" : okCount > 0 ? "PARTIAL" : "FAILED";
+
+  // Any successfully-imported attachment changed statements/invoices/bank
+  // rows — one invalidation for the whole email, covering every ingestor it
+  // dispatched to.
+  if (okCount > 0) invalidateOrgReads(address.organizationId);
 
   try {
     await prisma.inboundEmail.create({

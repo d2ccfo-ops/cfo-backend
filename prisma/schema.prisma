@@ -334,6 +334,14 @@ model Order {
   // Repeat-customer rate (§69) groups by customer within an org; without this
   // it's a full scan of every order the org has ever placed.
   @@index([organizationId, customerRef])
+  // Every metric endpoint scans "this org's orders in this window" — the
+  // revenue ladder alone does it three times per request. Without this
+  // composite the planner used the [organizationId, legalEntityId] prefix and
+  // heap-filtered placedAt across the org's entire order history.
+  @@index([organizationId, placedAt])
+  // The reconciliation summary's channel dropdown groups by channel org-wide;
+  // this makes it an index-only scan.
+  @@index([organizationId, channel])
   @@map("orders")
 }
 
@@ -450,6 +458,10 @@ model Payment {
   // lateral aggregate on this FK; without the index that is a sequential
   // scan of payments per order row.
   @@index([orderId])
+  // paymentStatus.ts's captured-status filter reasons about "an indexed
+  // read" — this is the index that claim needs. Serves the COD-exposure
+  // deposits groupBy and the payment reconciliation leg.
+  @@index([organizationId, status])
   @@map("payments")
 }
 
@@ -577,6 +589,11 @@ model BankTransaction {
 
   @@unique([connectionId, externalTxnId])
   @@index([organizationId, legalEntityId])
+  // Cash-received sums CREDIT rows per window on every dashboard render, and
+  // the trend buckets six months of them — both were org-wide heap filters
+  // without this. The [organizationId, direction] prefix also serves the
+  // data-status bankCreditCount.
+  @@index([organizationId, direction, valueDate])
   @@map("bank_transactions")
 }
 
