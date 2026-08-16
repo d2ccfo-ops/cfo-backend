@@ -88,7 +88,14 @@ export function createApp() {
   // should be env.FRONTEND_URL once the marketing site and dashboard origins
   // settle. Bearer tokens mean this is not the session-hijack risk it would be
   // with cookies, but there is no reason to allow the whole internet either.
-  app.use(cors({ maxAge: 86400 }));
+  //
+  // exposedHeaders because the dashboard is cross-origin, and a browser can
+  // only read the handful of CORS-safelisted response headers unless the
+  // server names the others. X-Calc-Cache says whether a metric response was
+  // computed or replayed (middleware/calcCache.ts), and without this line it
+  // is invisible to anything but the server's own logs — which is how a cache
+  // sitting in front of money figures ends up unverifiable from the outside.
+  app.use(cors({ maxAge: 86400, exposedHeaders: ["X-Calc-Cache"] }));
 
   // Needs the raw body for svix signature verification, so it's mounted with
   // its own raw parser and BEFORE the global express.json() below — once
