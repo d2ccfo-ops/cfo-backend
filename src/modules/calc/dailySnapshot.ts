@@ -457,7 +457,39 @@ export function lastCompleteDay(now: Date, timeZone: string): string {
  * yesterday — which is how "never updated after that day" is enforced, rather
  * than by a flag someone can forget to check.
  */
-export async function captureDailySnapshot(organizationId: string, now: Date = new Date()): Promise<DailySnapshotCapture> {
+/**
+ * Whether this metric can honestly be computed for a day that has already
+ * passed.
+ *
+ * `asOfCaptureTime` metrics read CURRENT-state tables — inventory on hand,
+ * outstanding payables, COD parcels in flight — which hold no history. Asking
+ * them for a past day returns today's reading, and writing that under an
+ * earlier date invents a number that was never true. Everything else is
+ * derived from dated rows (orders, payments, bank credits) and recomputing it
+ * for a past day is a measurement, not a guess.
+ *
+ * The sweep deliberately reports gaps rather than filling them, for exactly
+ * this reason. This predicate is what lets a backfill fill the half that can
+ * be filled without touching the half that cannot.
+ */
+export function isReconstructable(spec: DailyMetricSpec): boolean {
+  return spec.asOfCaptureTime !== true;
+}
+
+export interface CaptureOptions {
+  /**
+   * Skip every metric that cannot be honestly recomputed for a past day. Set
+   * by the backfill script; never by the nightly sweep, which runs against
+   * today and wants the full set.
+   */
+  onlyReconstructable?: boolean;
+}
+
+export async function captureDailySnapshot(
+  organizationId: string,
+  now: Date = new Date(),
+  opts: CaptureOptions = {}
+): Promise<DailySnapshotCapture> {
   const org = await prisma.organization.findUnique({
     where: { id: organizationId },
     select: { timezone: true },
@@ -473,7 +505,16 @@ export async function captureDailySnapshot(organizationId: string, now: Date = n
   const periodEnd = new Date(startOfZonedDay(addZonedDays(day, 1), timeZone).getTime() - 1);
 
   const sources = await gather(organizationId, timeZone, day, periodEnd, now);
-  const { rows, omitted } = decideDailyRows(sources);
+  const decision = decideDailyRows(sources);
+  const omitted = decision.omitted;
+  // Filtered AFTER the decision, not by narrowing the spec list before it, so
+  // a backfilled day's omissions read the same as a live capture's.
+  const rows = opts.onlyReconstructable
+    ? decision.rows.filter((r) => {
+        const spec = DAILY_SNAPSHOT_METRICS.find((s) => s.key === r.metricKey);
+        return spec ? isReconstructable(spec) : false;
+      })
+    : decision.rows;
 
   for (const row of rows) {
     // find-then-update rather than .upsert(): the compound unique includes the
