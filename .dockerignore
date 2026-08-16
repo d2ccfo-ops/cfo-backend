@@ -1,0 +1,25 @@
+# Everything here is either rebuilt inside the image, useless to it, or must
+# never reach it. The .env lines are the ones that matter: `gcloud builds
+# submit` uploads this directory as a tarball, so anything not excluded here
+# lands in a Cloud Storage bucket and then in an image layer. Real connector
+# credentials live in .env and .env.bak-*; they belong in Secret Manager and
+# nowhere else.
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+.next
+
+.git
+.gitignore
+
+# Test and eval code is not run in production and pulls in fixtures.
+**/*.test.ts
+eval
+
+# Local noise
+.DS_Store
+*.log
+npm-debug.log*

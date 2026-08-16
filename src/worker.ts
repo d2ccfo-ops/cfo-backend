@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { logger } from "./lib/logger.js";
 import { prisma } from "./lib/prisma.js";
 import { redisConnection } from "./lib/redis.js";
@@ -46,6 +47,28 @@ const aiBriefScheduler = startAiBriefScheduler();
 // about yesterday, not the one repair exists to fix.
 const repairScheduler = startRepairScheduler();
 
+// A liveness socket, and nothing more. This process does no HTTP work — every
+// line above talks to Postgres and Redis — but a container platform decides
+// whether a revision started by connecting to $PORT, and kills the revision if
+// nothing answers. Without these few lines the worker deploys and is then
+// terminated as failed, while its logs show the schedulers registering
+// perfectly, which is a confusing way to spend an evening.
+//
+// Only when PORT is set, so running `npm run worker` locally alongside the API
+// does not race it for a port. Cloud Run always sets it; a laptop does not.
+//
+// It reports process liveness, deliberately — NOT queue health. A worker whose
+// Redis connection has dropped should keep failing this check silently rather
+// than be restarted in a loop, because the restart does not fix Redis and the
+// loop erases the logs that would say what is wrong.
+const healthPort = process.env.PORT ? Number(process.env.PORT) : null;
+const healthServer = healthPort
+  ? createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", process: "worker" }));
+    }).listen(healthPort, () => logger.info({ port: healthPort }, "worker_health_listening"))
+  : null;
+
 // Re-entrancy guard. Without it a second signal — or the same signal delivered
 // to both the `tsx watch` wrapper and this child, which is what happens on
 // every dev restart — runs the whole teardown twice: the second pass calls
@@ -59,6 +82,9 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   logger.info({ signal }, "sync_worker_shutting_down");
   try {
+    // First, so the platform stops counting this instance as healthy while the
+    // queues below are still draining.
+    healthServer?.close();
     // Closed before the connections they use. The schedulers go first so no
     // new sweep can enqueue work into a queue that is about to disappear.
     await scheduler.close();
