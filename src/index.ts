@@ -33,7 +33,28 @@ import { logger } from "./lib/logger.js";
 // the same image, and it must stay a single process: it owns the five nightly
 // schedules and SYNC_WORKER_CONCURRENCY, so a second copy would double sync
 // concurrency and race the sweeps.
-const requested = env.API_CLUSTER_WORKERS ?? availableParallelism();
+// ONE CHILD ON A LAPTOP, ONE PER CORE IN PRODUCTION.
+//
+// Defaulting to availableParallelism() everywhere was wrong for development
+// and it broke real work: on a 10-core Mac `npm run dev` forked TEN children,
+// and because a development DATABASE_URL carries no connection_limit, Prisma
+// sizes each child's pool at cores*2+1 = 21. Ten pools then wanted 210
+// connections against Postgres's default max_connections=100. Measured on this
+// machine before the fix: 88 of 100 slots held by the API's own children, and
+// psql refused with "sorry, too many clients already" — as a SUPERUSER, because
+// the app connects as one and had eaten the reserved slots too.
+//
+// A laptop gains nothing from the fork. The whole point of clustering is to use
+// more than one core under concurrent load, and one developer clicking around
+// is not that. Production still gets one child per core, and the single-VM
+// deployment overrides it explicitly (API_CLUSTER_WORKERS=4) because it shares
+// those cores with Postgres and the sync worker.
+//
+// An explicit API_CLUSTER_WORKERS always wins, so a developer who wants to
+// reproduce the clustered shape locally still can — after raising
+// max_connections or setting connection_limit to match.
+const defaultWorkers = env.NODE_ENV === "production" ? availableParallelism() : 1;
+const requested = env.API_CLUSTER_WORKERS ?? defaultWorkers;
 // Never more children than cores. Over-forking costs context switches and
 // memory (each child carries its own Prisma pool) and buys nothing.
 const workers = Math.max(1, Math.min(requested, availableParallelism()));

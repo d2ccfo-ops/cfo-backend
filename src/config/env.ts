@@ -6,9 +6,17 @@ const schema = z.object({
   REDIS_URL: z.string().min(1),
   PORT: z.coerce.number().default(4000),
 
-  // How many API processes to fork. Unset means one per core, which is what a
-  // dedicated box wants; set it lower when the machine is shared with the
-  // worker and Postgres, as it is on the single-VM deployment.
+  // Read through the schema rather than process.env so the one place that
+  // decides "is this production" is validated like everything else. index.ts
+  // uses it to pick a default cluster size, which is the difference between
+  // one Node process and one per core.
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+
+  // How many API processes to fork. Unset means one per core IN PRODUCTION and
+  // exactly one in development — see the note in src/index.ts for why the
+  // development default is not the core count. Set it lower than the core count
+  // when the machine is shared with the worker and Postgres, as it is on the
+  // single-VM deployment.
   //
   // This is the knob that decides whether the metric endpoints can use more
   // than one core. Node runs JS on a single thread, so an unclustered API
