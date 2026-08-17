@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../../lib/prisma.js";
 import { measureCpuBusy, sampleSystem } from "../../modules/observability/systemSampler.js";
+import { readHostReport } from "../../modules/observability/hostFacts.js";
 import { readRedisStats } from "../../modules/observability/redisInfo.js";
 import { computeCloudCost } from "../../modules/observability/cloudCost.js";
 import {
@@ -360,4 +361,21 @@ internalInfraRouter.get("/database", async (_req, res) => {
  */
 internalInfraRouter.get("/redis", async (_req, res) => {
   res.json(await readRedisStats());
+});
+
+/**
+ * WHAT ONLY THE HOST CAN SEE.
+ *
+ * Per-container CPU and memory, kernel OOM kills, the nightly backup, egress and
+ * TLS expiry — none of it reachable from inside this container, all of it
+ * collected by the root-owned deploy agent and posted on its heartbeat.
+ *
+ * The previous answer to per-container metrics was "mount the Docker socket into
+ * the API", which is root on the host behind an internet-facing Express app.
+ * The agent removed the need: it was already root, already polling, already
+ * reporting. Nothing here required a new privilege.
+ */
+internalInfraRouter.get("/host", async (_req, res) => {
+  const report = await readHostReport();
+  res.json(report);
 });

@@ -22,15 +22,41 @@ import { prisma } from "../../lib/prisma.js";
 
 const RETENTION_DAYS = 30;
 
-export async function pruneObservability(now = new Date()): Promise<{ requestMetrics: number; systemSamples: number }> {
+export interface Pruned {
+  requestMetrics: number;
+  systemSamples: number;
+  syntheticChecks: number;
+  queueDepthSamples: number;
+  clientMetrics: number;
+}
+
+export async function pruneObservability(now = new Date()): Promise<Pruned> {
   const cutoff = new Date(now.getTime() - RETENTION_DAYS * 24 * 60 * 60_000);
 
-  const [requestMetrics, systemSamples] = await Promise.all([
+  // Same window for all five, same argument as above: one number is one thing
+  // to be surprised by. synthetic_checks is the fastest-growing of them — five
+  // targets a minute is 7,200 rows a day — and is also the one most likely to
+  // be read for "was it down last week", which thirty days covers comfortably.
+  //
+  // restore_drills is deliberately NOT pruned. It is twelve rows a year and it
+  // is the record of whether the data has ever been proven recoverable; a
+  // retention sweep that erases the last successful drill would turn a fact
+  // into "never rehearsed".
+  const [requestMetrics, systemSamples, syntheticChecks, queueDepthSamples, clientMetrics] = await Promise.all([
     prisma.requestMetric.deleteMany({ where: { bucketStart: { lt: cutoff } } }),
     prisma.systemSample.deleteMany({ where: { takenAt: { lt: cutoff } } }),
+    prisma.syntheticCheck.deleteMany({ where: { at: { lt: cutoff } } }),
+    prisma.queueDepthSample.deleteMany({ where: { bucketStart: { lt: cutoff } } }),
+    prisma.clientMetric.deleteMany({ where: { bucketStart: { lt: cutoff } } }),
   ]);
 
-  return { requestMetrics: requestMetrics.count, systemSamples: systemSamples.count };
+  return {
+    requestMetrics: requestMetrics.count,
+    systemSamples: systemSamples.count,
+    syntheticChecks: syntheticChecks.count,
+    queueDepthSamples: queueDepthSamples.count,
+    clientMetrics: clientMetrics.count,
+  };
 }
 
 let timer: NodeJS.Timeout | null = null;
@@ -41,7 +67,7 @@ export function startObservabilityRetention(intervalMs = 24 * 60 * 60_000): void
   const run = () => {
     pruneObservability()
       .then((deleted) => {
-        if (deleted.requestMetrics > 0 || deleted.systemSamples > 0) {
+        if (Object.values(deleted).some((n) => n > 0)) {
           logger.info({ ...deleted, retentionDays: RETENTION_DAYS }, "observability_pruned");
         }
       })

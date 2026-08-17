@@ -42,6 +42,23 @@ RUN npm run build
 
 ENV NODE_ENV=production
 
+# WHICH COMMIT IS THIS.
+#
+# A tag says v23. It does not say which source produced v23, and after a
+# rebuild-and-retag — or the mis-build on 2026-08-17 where the console image was
+# accidentally built from this directory — the tag is actively misleading. The
+# sha is baked in at build time and surfaced by /health, so the running
+# container answers the question itself instead of anyone inferring it from
+# whatever the working tree happens to say now.
+#
+# Deliberately LAST, after every COPY. An ARG that changes on every commit
+# invalidates every layer beneath it, so putting it near the top would turn
+# each build into a full npm ci.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV GIT_SHA=$GIT_SHA
+ENV BUILD_TIME=$BUILD_TIME
+
 # Not EXPOSE-d on a fixed port deliberately. Cloud Run injects PORT (8080) and
 # config/env.ts coerces it, so the container binds whatever the platform asks
 # for rather than a number hard-coded here.

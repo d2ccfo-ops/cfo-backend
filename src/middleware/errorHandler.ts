@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { ZodError } from "zod";
 import { logger } from "../lib/logger.js";
+import { recordError } from "../modules/observability/errorGroups.js";
 
 export function notFoundHandler(req: Request, res: Response) {
   res.status(404).json({ error: "not_found", path: req.path });
@@ -33,5 +34,21 @@ export function errorHandler(err: unknown, req: Request, res: Response, next: Ne
   }
 
   logger.error({ err, path: req.path }, "unhandled_error");
+
+  // Grouped and counted, so the errors page can answer "what is breaking"
+  // rather than only "how many fives". Fire-and-forget and non-throwing: the
+  // response must not wait on it, and a failure recording an error must never
+  // become a second error.
+  //
+  // req.route?.path is the ROUTE PATTERN, never the resolved URL — same rule as
+  // request_metrics, and the reason the table cannot grow a group per id.
+  void recordError({
+    error: err,
+    route: (req.route as { path?: string } | undefined)?.path ?? req.path,
+    method: req.method,
+    source: "api",
+    organizationId: req.auth?.organizationId ?? null,
+  });
+
   res.status(500).json({ error: "internal_error" });
 }

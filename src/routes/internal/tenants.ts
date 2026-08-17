@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { costOf } from "../../lib/aiPricing.js";
 import { prisma } from "../../lib/prisma.js";
+import { scoreTenants } from "../../modules/observability/tenantHealth.js";
 import { daysParam, since } from "./shared.js";
 
 export const internalTenantsRouter = Router();
@@ -126,6 +127,135 @@ internalTenantsRouter.get("/", async (req, res) => {
   });
 
   res.json({ windowDays: days, organizations: rows });
+});
+
+/**
+ * EVERY TENANT, SCORED.
+ *
+ * REGISTERED BEFORE /:id ON PURPOSE. Express matches in declaration order, so
+ * putting this after the parameterised route would send every request here to
+ * the detail handler looking for an organisation whose id is the literal string
+ * "health" — a 404 that looks like a missing tenant rather than a routing bug.
+ *
+ * The scoring, and why absence is a state rather than a low number, is in
+ * modules/observability/tenantHealth.ts.
+ */
+internalTenantsRouter.get("/health", async (_req, res) => {
+  const tenants = await scoreTenants();
+  const counted = (s: string) => tenants.filter((t) => t.state === s).length;
+  res.json({
+    tenants,
+    counts: {
+      total: tenants.length,
+      healthy: counted("healthy"),
+      degraded: counted("degraded"),
+      atRisk: counted("at_risk"),
+      dormant: counted("dormant"),
+      notOnboarded: counted("not_onboarded"),
+    },
+  });
+});
+
+/**
+ * THE VIEW FOR WHEN A CUSTOMER EMAILS.
+ *
+ * Everything needed to answer "why does my dashboard look wrong" without
+ * logging in as them: how healthy they are and why, how fresh each kind of
+ * their data is, which connectors are failing and with what message, and what
+ * exceptions are open.
+ *
+ * WHAT IS DELIBERATELY ABSENT: their numbers. No revenue, no margins, no
+ * anomaly narratives, no AI conversation text. This console is cross-tenant and
+ * the rule at the top of index.ts is that it does not touch tenant data — the
+ * exception carved here is METADATA about their data (how much, how fresh, what
+ * broke), which is what a support question actually needs. Whoever needs the
+ * figures themselves opens the customer's own view, where the access is scoped
+ * and audited like any other read.
+ */
+internalTenantsRouter.get("/:id/support", async (req, res) => {
+  const organizationId = req.params.id;
+  const org = await prisma.organization.findUnique({
+    where: { id: organizationId },
+    select: { id: true, name: true, timezone: true, createdAt: true },
+  });
+  if (!org) {
+    res.status(404).json({ error: "No organisation with that id." });
+    return;
+  }
+
+  const [health, connections, failures, anomalies, freshness, members] = await Promise.all([
+    scoreTenants().then((all) => all.find((t) => t.organizationId === organizationId) ?? null),
+    prisma.connection.findMany({
+      where: { organizationId },
+      select: { id: true, provider: true, status: true, syncStatus: true, lastSyncedAt: true, lastSyncError: true, createdAt: true },
+      orderBy: { createdAt: "asc" },
+    }),
+    // Verbatim, most recent first. The message is the whole point — "sync
+    // failed" is not actionable and "Invalid authentication tag length: 0" is.
+    prisma.syncRun.findMany({
+      where: { organizationId, status: "FAILED" },
+      orderBy: { startedAt: "desc" },
+      take: 20,
+      select: { provider: true, error: true, startedAt: true, trigger: true },
+    }),
+    // ACKNOWLEDGED is included: somebody having seen an exception does not make
+    // the customer's numbers right again.
+    prisma.anomaly.findMany({
+      where: { organizationId, status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+      orderBy: [{ severity: "asc" }, { createdAt: "desc" }],
+      take: 50,
+      // Type, severity and timing only. The narrative and the amounts are the
+      // customer's figures, not ours to page through.
+      select: { id: true, type: true, severity: true, status: true, createdAt: true, periodStart: true, periodEnd: true },
+    }),
+    // The single most common support question is "why is my dashboard behind",
+    // and the answer is always the newest row of some particular kind.
+    Promise.all([
+      prisma.order.aggregate({ where: { organizationId }, _max: { placedAt: true }, _count: { _all: true } }),
+      prisma.payment.aggregate({ where: { organizationId }, _max: { createdAt: true }, _count: { _all: true } }),
+      prisma.settlement.aggregate({ where: { organizationId }, _max: { createdAt: true }, _count: { _all: true } }),
+      prisma.shipment.aggregate({ where: { organizationId }, _max: { createdAt: true }, _count: { _all: true } }),
+      prisma.bankTransaction.aggregate({ where: { organizationId }, _max: { createdAt: true }, _count: { _all: true } }),
+      prisma.adSpend.aggregate({ where: { organizationId }, _max: { createdAt: true }, _count: { _all: true } }),
+    ]),
+    prisma.membership.findMany({
+      where: { organizationId },
+      select: { email: true, role: true, lastSeenAt: true, createdAt: true },
+      orderBy: { lastSeenAt: "desc" },
+    }),
+  ]);
+
+  const [orders, payments, settlements, shipments, bank, ads] = freshness;
+  const fresh = (label: string, newest: Date | null, count: number) => ({
+    kind: label,
+    rows: count,
+    // Null newest with rows > 0 means the column is null across the board, not
+    // that the data is old. Kept apart so a page can say which.
+    newestAt: newest?.toISOString() ?? null,
+    ageHours: newest === null ? null : Math.round(((Date.now() - newest.getTime()) / 3_600_000) * 10) / 10,
+  });
+
+  res.json({
+    organization: { ...org, createdAt: org.createdAt.toISOString() },
+    health,
+    connections: connections.map((c) => ({
+      ...c,
+      lastSyncedAt: c.lastSyncedAt?.toISOString() ?? null,
+      createdAt: c.createdAt.toISOString(),
+    })),
+    recentFailures: failures.map((f) => ({ ...f, startedAt: f.startedAt.toISOString() })),
+    openAnomalies: anomalies.map((a) => ({ ...a, createdAt: a.createdAt.toISOString(), periodStart: a.periodStart.toISOString(), periodEnd: a.periodEnd.toISOString() })),
+    freshness: [
+      fresh("Orders", orders._max.placedAt, orders._count._all),
+      fresh("Payments", payments._max.createdAt, payments._count._all),
+      fresh("Settlements", settlements._max.createdAt, settlements._count._all),
+      fresh("Shipments", shipments._max.createdAt, shipments._count._all),
+      fresh("Bank transactions", bank._max.createdAt, bank._count._all),
+      fresh("Ad spend", ads._max.createdAt, ads._count._all),
+    ],
+    members: members.map((m) => ({ ...m, lastSeenAt: m.lastSeenAt?.toISOString() ?? null, createdAt: m.createdAt.toISOString() })),
+    withheld: "Revenue, margins, anomaly narratives and AI conversations are deliberately not returned here. Open the customer's own view for those.",
+  });
 });
 
 /** One organisation, in depth. */

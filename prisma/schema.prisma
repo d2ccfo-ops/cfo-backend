@@ -1883,3 +1883,548 @@ model UserActivityDay {
   @@index([day])
   @@map("user_activity_days")
 }
+
+// ---------------------------------------------------------------------------
+// Internal console: operators, and deployments
+// ---------------------------------------------------------------------------
+
+// WHO MAY USE THE CONSOLE, beyond the environment allowlist.
+//
+// THIS AMENDS A DELIBERATE DECISION AND THE ORIGINAL REASONING IS WORTH
+// ANSWERING RATHER THAN QUIETLY REVERSING. middleware/requireSuperAdmin.ts
+// argued for an env-only list because "a row anybody with database access can
+// flip is not a boundary". That is true and it is also not the boundary this
+// protects: anybody with database access on this box can already read every
+// tenant's rows directly, which is strictly more than the console grants. The
+// DB row does not cross a line that DB access had not already crossed.
+//
+// What the env list really provided, and what is kept, is two things:
+//
+//   1. A ROOT OF TRUST THAT NEEDS SHELL ACCESS. INTERNAL_ADMIN_USER_IDS remains
+//      the feature switch — empty means /internal does not exist — and remains
+//      unrevokable from the console. No sequence of clicks can lock everyone
+//      out, and no compromised console session can remove the accounts that
+//      were granted by deploy.
+//   2. VISIBILITY. That was previously "it changes in a diff". Here it is
+//      stronger: every grant and revoke records who did it, to whom, and when,
+//      and rows are never deleted — a revoke sets revokedAt, so the history of
+//      who could see cross-tenant data at any past moment stays reconstructable.
+//      A deleted row would erase exactly the fact worth keeping.
+model InternalOperator {
+  id          String  @id @default(cuid())
+  clerkUserId String  @unique
+  // Denormalised from Clerk at grant time so the audit trail still reads
+  // sensibly after an account is deleted upstream and the id resolves to
+  // nothing.
+  email       String
+  /**
+   * Free text: why this person has it. Optional, and worth filling in.
+   */
+  note        String?
+
+  grantedAt       DateTime @default(now())
+  grantedByUserId String
+  grantedByEmail  String
+
+  // Revocation is a timestamp, not a deletion. See the note above.
+  revokedAt       DateTime?
+  revokedByUserId String?
+  revokedByEmail  String?
+
+  @@index([revokedAt])
+  @@map("internal_operators")
+}
+
+enum DeploymentStatus {
+  PENDING
+  APPLYING
+  APPLIED
+  FAILED
+  /**
+   * A newer request for the same service overtook this one before it ran.
+   */
+  SUPERSEDED
+}
+
+// A REQUEST to run a different image tag. Never the act itself.
+//
+// The console cannot deploy. It writes one of these rows and stops; a
+// root-owned agent on the VM polls, validates and applies. That inversion is
+// the entire security design: the privileged process pulls from the
+// unprivileged one, so the internet-facing API never needs the Docker socket,
+// and an RCE in it can at worst select a tag among images this project already
+// published — not run arbitrary code as root.
+//
+// `toTag` is a TAG, never an image reference. The agent hard-codes the repo for
+// each service and refuses anything that is not /^v\d+$/, so this column cannot
+// name someone else's registry.
+model DeploymentRequest {
+  id      String  @id @default(cuid())
+  /**
+   * "backend" | "frontend" | "marketing" | "internal" — validated by the agent.
+   */
+  service String
+  /**
+   * What the console believed was running when the button was pressed. Recorded
+   * for the history, and never used to decide anything: the agent reads the
+   * host's own .env rather than trusting a client's idea of current state.
+   */
+  fromTag String?
+  toTag   String
+
+  status DeploymentStatus @default(PENDING)
+
+  requestedAt       DateTime @default(now())
+  requestedByUserId String
+  requestedByEmail  String
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+  /**
+   * Which machine applied it. Meaningful the day there is more than one.
+   */
+  agentHost  String?
+  error      String?
+
+  /**
+   * WHAT THE HEALTH GATE SAW, on the success path.
+   * Separate from `error` deliberately. "Applied and verified: HTTP 200" and
+   * "applied; health gate skipped because the service was already failing" are
+   * both successful deploys with very different amounts of assurance behind
+   * them, and putting either in `error` would make a green row look red.
+   */
+  note String?
+
+  @@index([service, requestedAt])
+  @@index([status])
+  @@map("deployment_requests")
+}
+
+// The agent's heartbeat, and the host's own account of what it is running.
+//
+// EXISTS BECAUSE A BUTTON WITH A DEAD AGENT IS WORSE THAN NO BUTTON. Without
+// this, pressing rollback writes a PENDING row that nothing will ever pick up,
+// and the console would sit there looking like it worked. The console reads
+// seenAt and refuses to offer the button at all once it goes stale.
+//
+// `tags` carries three distinct facts, and keeping them apart is the point:
+//
+//   configured — the image tags in /opt/cfoos/deploy/.env
+//   running    — the image each container is ACTUALLY running, from docker ps
+//   available  — the tags that exist in the registry, per service
+//
+// configured and running are not the same fact. A difference between them means
+// a container did not restart, which is a real and otherwise invisible failure:
+// the .env says v19, the box is still serving v20, and every other signal looks
+// like the rollback worked. `available` is collected here rather than by the API
+// so that reading the registry stays a host-side privilege the internet-facing
+// process never needs.
+model DeploymentState {
+  /**
+   * Single row. The id is a constant so upsert cannot race into two.
+   */
+  id           String   @id @default("singleton")
+  host         String
+  tags         Json
+  seenAt       DateTime
+  agentVersion String?
+
+  /**
+   * EVERYTHING ELSE THE HOST KNOWS ABOUT ITSELF: per-container CPU and memory,
+   * kernel OOM kills, the nightly backup, egress bytes, disk trend, TLS expiry.
+   * Carried on the deployment heartbeat rather than in a second table, so there
+   * is exactly ONE staleness question to ask about the agent. Two heartbeats
+   * means two ways to be half-dead, and a page that has to explain which half.
+   * Nullable because rows written by agent v1 predate it — absent is "this agent
+   * does not report facts", which is not the same as "the host has none".
+   */
+  facts Json?
+
+  @@map("deployment_state")
+}
+
+// ---------------------------------------------------------------------------
+// Alerting, and the host facts most of it is evaluated against
+// ---------------------------------------------------------------------------
+
+// A CONDITION THAT IS TRUE AND SHOULD NOT BE.
+//
+// THE CONSOLE'S ONE STRUCTURAL GAP WAS THAT IT ONLY EVER ANSWERED QUESTIONS.
+// Overdue schedules, version drift, a full Redis, a dead agent, a stale backup,
+// three OOM kills in one afternoon — every one of those was visible on a page
+// nobody had open. On 2026-08-17 the worker was OOM-killed three times and every
+// panel stayed green, because being green is what a panel does when no one looks
+// at it.
+//
+// KEYED, NOT APPENDED. `key` is a stable identity for the condition — one row
+// per (rule, subject), updated in place — so a queue that has been backing up
+// for an hour is one alert seen 60 times, not 60 alerts. An append-only table
+// produces a feed that is unreadable exactly when it matters most.
+//
+// RESOLUTION IS AUTOMATIC AND ACKNOWLEDGEMENT IS NOT. A rule that stops firing
+// clears its own alert, because an alert nobody can clear is one people learn to
+// scroll past. Acknowledgement is separate and manual: it means "a human has
+// seen this and it is not news", which suppresses re-notification while leaving
+// the condition visibly true.
+model Alert {
+  id       String        @id @default(cuid())
+  /**
+   * Stable identity, e.g. "backup.stale" or "queue.backlog:connection-sync".
+   */
+  key      String        @unique
+  rule     String
+  severity AlertSeverity
+  title    String
+  detail   String
+
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  /**
+   * How many evaluations have found it true. A rough age, in ticks.
+   */
+  seenCount   Int      @default(1)
+
+  /**
+   * Set when the rule stopped firing. Rows are kept: the history is the point.
+   */
+  resolvedAt DateTime?
+
+  acknowledgedAt     DateTime?
+  acknowledgedBy     String?
+  acknowledgedReason String?
+
+  /**
+   * Last time this was delivered somewhere, so a flapping rule cannot spam.
+   */
+  notifiedAt DateTime?
+
+  @@index([resolvedAt, severity])
+  @@index([lastSeenAt])
+  @@map("alerts")
+}
+
+enum AlertSeverity {
+  /**
+   * Wake someone. Data loss, or an outage a customer can see.
+   */
+  PAGE
+  /**
+   * Should be looked at today.
+   */
+  WARN
+  /**
+   * Worth knowing in the morning digest.
+   */
+  INFO
+}
+
+// ---------------------------------------------------------------------------
+// Application errors, and a cost history that can only start now
+// ---------------------------------------------------------------------------
+
+// AN APPLICATION ERROR, GROUPED.
+//
+// request_metrics counts 5xx per route and stores no message, no stack and no
+// fingerprint — so a 500 has been a number in a latency table with nothing
+// attached to it, and "what actually went wrong" has had no answer at all.
+//
+// FINGERPRINTED, NOT LOGGED. One row per distinct fault, with a count, rather
+// than one row per occurrence: an errors page that lists ten thousand copies of
+// the same broken query is a log file with worse ergonomics. The fingerprint is
+// derived from the error's shape (name + normalised message + top frame), never
+// its text verbatim, because the text usually carries an id or a timestamp that
+// would make every occurrence unique and defeat the grouping entirely.
+//
+// The connector error classifier already proved the value of this shape, and
+// proved how it goes wrong: it originally matched on words a person expects
+// ("decrypt", "auth_tag") and left 3,513 of 4,342 real failures in "other",
+// because Node's actual message contains neither.
+model ErrorGroup {
+  id          String @id @default(cuid())
+  /**
+   * Stable hash of the fault's shape.
+   */
+  fingerprint String @unique
+
+  name        String
+  /**
+   * The message with ids, uuids, numbers and timestamps masked out.
+   */
+  message     String
+  /**
+   * Verbatim text of the most recent occurrence — the masked one loses detail.
+   */
+  lastMessage String?
+  route       String?
+  method      String?
+  /**
+   * "api" | "worker" — the same fault means different things in each.
+   */
+  source      String  @default("api")
+  /**
+   * Top of the stack, kept for the drawer. Truncated on write.
+   */
+  lastStack   String?
+
+  count       Int      @default(1)
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  /**
+   * How many DISTINCT organisations have hit it. Stored as a count rather than
+   * a list: which tenants is a support question, how many is a severity
+   * question, and only the second belongs in a cross-tenant table.
+   */
+  affectedOrgs Int @default(0)
+
+  status     ErrorGroupStatus @default(NEW)
+  resolvedAt DateTime?
+  notes      String?
+
+  @@index([status, lastSeenAt])
+  @@index([lastSeenAt])
+  @@map("error_groups")
+}
+
+enum ErrorGroupStatus {
+  NEW
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+// WHAT THE MONTH COST, captured once so a trend can exist.
+//
+// REAL GOING FORWARD ONLY, AND THAT IS THE WHOLE POINT. The GCP figure is priced
+// from live inventory and the AI figure is measured from token counts, so both
+// are knowable today and neither is knowable for last March. Back-filling would
+// mean pricing a machine nobody can prove existed at rates nobody recorded —
+// which is fabrication wearing a chart's clothes. The panel says "collecting
+// since" and shows one point until there are two.
+model CostSnapshot {
+  id    String @id @default(cuid())
+  /**
+   * YYYY-MM, UTC. One row per month, upserted as the month progresses.
+   */
+  month String @unique
+
+  /**
+   * Microdollars, as bigint — same rule as paise. Serialised as strings.
+   */
+  gcpUsdMicro BigInt
+  aiUsdMicro  BigInt
+
+  /**
+   * Denominators, so cost per order and per org stay reconstructable later.
+   */
+  orders      Int
+  activeOrgs  Int
+  machineType String?
+
+  capturedAt DateTime @default(now())
+
+  @@map("cost_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// THE OUTSIDE VIEW.
+//
+// Every other observability table in this file is written from inside the
+// system: the API times its own handlers, the worker counts its own jobs, the
+// agent reads its own host. All of it goes quiet in exactly the same way at
+// exactly the same moment — if the box is unreachable, nothing is recording
+// that it is unreachable, and the console's last known state is "healthy".
+//
+// This table is written by a prober that treats the product as a stranger
+// would: resolve DNS, complete the TLS handshake, fetch the URL, read the
+// status. It is the only measurement here that can be true when everything
+// else has stopped.
+// ---------------------------------------------------------------------------
+model SyntheticCheck {
+  id String @id @default(cuid())
+
+  /**
+   * Stable name for the thing being probed, e.g. "dashboard" — the alert key.
+   */
+  target String
+  url    String
+  at     DateTime @default(now())
+
+  /**
+   * Whether this probe met its expectation, which is NOT "status < 400".
+   * dashboard.d2ccfo.xyz answers 307 to an anonymous request because it
+   * redirects to sign-in, and that 307 IS the healthy response. Each target
+   * carries its own expected statuses in the prober; this column records the
+   * verdict so a later reading does not have to re-derive it.
+   */
+  ok         Boolean
+  statusCode Int?
+  /**
+   * Wall clock for the whole request, from an unauthenticated caller's side.
+   */
+  ms         Int?
+  /**
+   * Verbatim. A DNS failure and a 502 are different outages.
+   */
+  error      String?
+
+  /**
+   * Days until the served certificate expires, measured from the handshake
+   * rather than from the host's filesystem. Caddy renewing correctly on disk
+   * and serving a stale certificate is a real state and only this sees it.
+   */
+  tlsDaysRemaining Int?
+
+  @@index([target, at])
+  @@index([at])
+  @@map("synthetic_checks")
+}
+
+// ---------------------------------------------------------------------------
+// WHAT THE BROWSER MEASURED, which is the only latency a customer experiences.
+//
+// request_metrics records how long Express took to produce a response. That
+// number can be excellent while the product is unusable: it does not include
+// DNS, TLS, the network, React hydration, or the four sequential fetches a page
+// makes before it renders anything. A p95 of 8ms server-side and a 6-second
+// largest-contentful-paint are perfectly compatible, and only one of them is
+// the customer's opinion.
+//
+// AGGREGATED ON WRITE, same grain and same reasoning as request_metrics: one
+// row per (minute, route), never one row per page view. A per-event table grows
+// with traffic and is the standard way an analytics table becomes the largest
+// thing in the database.
+//
+// Web Vitals bands are Google's published thresholds, not invented cut points —
+// LCP good <=2500ms, poor >4000ms. Storing the bands rather than only a sum
+// means the panel can report the share of visits that were bad, which is the
+// question, instead of a mean that one 30-second outlier ruins.
+// ---------------------------------------------------------------------------
+model ClientMetric {
+  id          String   @id @default(cuid())
+  bucketStart DateTime
+  /**
+   * The Next.js route PATTERN as the app knows it ("/inventory"), never the
+   * URL. Same cardinality rule as request_metrics, enforced server-side by an
+   * allowlist — a beacon is client-controlled input and must not be able to
+   * mint rows.
+   */
+  route       String
+
+  /**
+   * Page views that reported at least one metric.
+   */
+  samples Int @default(0)
+
+  lcpSum       Int @default(0)
+  lcpCount     Int @default(0)
+  lcpGood      Int @default(0)
+  lcpNeedsWork Int @default(0)
+  lcpPoor      Int @default(0)
+
+  inpSum   Int @default(0)
+  inpCount Int @default(0)
+
+  /**
+   * Unitless, stored x1000 so the column stays an integer.
+   */
+  clsSumMilli Int @default(0)
+  clsCount    Int @default(0)
+
+  ttfbSum   Int @default(0)
+  ttfbCount Int @default(0)
+
+  fcpSum   Int @default(0)
+  fcpCount Int @default(0)
+
+  @@unique([bucketStart, route])
+  @@index([bucketStart])
+  @@map("client_metrics")
+}
+
+// ---------------------------------------------------------------------------
+// QUEUE DEPTH OVER TIME.
+//
+// BullMQ knows only NOW. `getJobCounts` answers what is waiting this instant
+// and keeps no history, so the console could say "141 waiting" and never say
+// whether that is a queue draining after a backlog or a queue that has been
+// stuck at 141 since Tuesday. Those need opposite responses and look identical
+// in a single reading.
+//
+// One row per (minute, queue), written by the same worker process that runs the
+// alert evaluator, for the same reason: it must not depend on the queue.
+// ---------------------------------------------------------------------------
+model QueueDepthSample {
+  id          String   @id @default(cuid())
+  bucketStart DateTime
+  queue       String
+
+  waiting   Int     @default(0)
+  active    Int     @default(0)
+  delayed   Int     @default(0)
+  failed    Int     @default(0)
+  completed Int     @default(0)
+  paused    Boolean @default(false)
+
+  @@unique([bucketStart, queue])
+  @@index([bucketStart])
+  @@map("queue_depth_samples")
+}
+
+// ---------------------------------------------------------------------------
+// PROOF THAT THE BACKUP RESTORES.
+//
+// A nightly dump that has never been restored is not a backup; it is a file
+// with a reassuring name. The agent already watches that the dump ran, that it
+// is recent and that it did not shrink — and every one of those checks passes
+// for a dump that cannot be loaded.
+//
+// So once a month the agent pulls the newest object, restores it into a
+// throwaway Postgres container on the host, counts what came back, and destroys
+// the container. The row below is the receipt. If this table is empty, nobody
+// has ever proven the data can be recovered.
+// ---------------------------------------------------------------------------
+model RestoreDrill {
+  id String   @id @default(cuid())
+  at DateTime @default(now())
+
+  ok            Boolean
+  /**
+   * The exact object restored, so the run can be repeated by hand.
+   */
+  backupObject  String?
+  backupBytes   BigInt?
+  /**
+   * Restored into a scratch database, so these are counts of what survived.
+   */
+  tables        Int?
+  orders        Int?
+  organizations Int?
+  durationMs    Int?
+  error         String?
+  agentVersion  String?
+
+  @@index([at])
+  @@map("restore_drills")
+}
+
+// ---------------------------------------------------------------------------
+// BOOKKEEPING FOR THE CONSOLE'S OWN PERIODIC WORK.
+//
+// Deliberately a key/value table and deliberately tiny. The alternative was
+// four one-row tables — last digest sent, last cost snapshot written, last
+// billing export read — each with its own migration and its own name to
+// remember. This holds the sort of state whose only job is to stop a restart
+// from re-sending yesterday's digest.
+//
+// THE RULE, since a key/value table is otherwise a junk drawer: nothing tenant
+// scoped, nothing anybody reads to make a decision, nothing that would be
+// missed if the table were truncated. If a value fails that test it needs a
+// real table with real columns.
+// ---------------------------------------------------------------------------
+model InternalOpsState {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("internal_ops_state")
+}

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../../lib/prisma.js";
+import { lookupUsers } from "../../lib/clerkDirectory.js";
 import { daysParam, since } from "./shared.js";
 
 export const internalUsersRouter = Router();
@@ -97,6 +98,80 @@ internalUsersRouter.get("/members", async (req, res) => {
       daysSinceSeen: m.lastSeenAt === null ? null : Math.floor((now - m.lastSeenAt.getTime()) / DAY_MS),
       daysActiveInWindow: daysActive.get(`${m.organizationId}|${m.clerkUserId}`) ?? 0,
     })),
+  });
+});
+
+/**
+ * WHO IS USING THE DASHBOARD RIGHT NOW.
+ *
+ * THE GRANULARITY IS FIVE MINUTES AND THE PAGE SAYS SO. `lastSeenAt` is written
+ * at most once per five minutes per user per process (see middleware/
+ * userActivity.ts and the note on UserActivityDay) — a deliberate trade that
+ * keeps an authenticated read from becoming an authenticated read plus a write.
+ * The consequence is that this cannot tell you someone is on the page this
+ * second, only that they were within the last few minutes. Presenting it as
+ * live would be inventing precision the write path does not have.
+ *
+ * Names come from Clerk, not from here: `memberships` stores an email and no
+ * name at all. A missing name is rendered as the email rather than as a blank —
+ * see lib/clerkDirectory.ts for why identity is read rather than copied.
+ *
+ * WHAT THIS CANNOT ANSWER, and is not made to look like it can: which page
+ * anyone is on. `request_metrics` is keyed by route and NOT by user, which is
+ * exactly what stops it growing a row per person; joining the two would need
+ * per-user request logging that does not exist.
+ */
+internalUsersRouter.get("/live", async (req, res) => {
+  const minutes = Number(req.query.minutes) > 0 ? Math.min(Math.trunc(Number(req.query.minutes)), 1440) : 60;
+  const cutoff = new Date(Date.now() - minutes * 60_000);
+
+  const rows = await prisma.membership.findMany({
+    where: { lastSeenAt: { gte: cutoff } },
+    select: { clerkUserId: true, email: true, role: true, lastSeenAt: true, organizationId: true },
+    orderBy: { lastSeenAt: "desc" },
+    take: 200,
+  });
+
+  // Two queries rather than an include: Membership carries organizationId as a
+  // plain column with no Prisma relation to Organization, which is what keeps
+  // the tenant boundary explicit everywhere else in this codebase. Resolving
+  // names separately preserves that rather than adding a relation for one panel.
+  const [organizations, directory] = await Promise.all([
+    prisma.organization.findMany({
+      where: { id: { in: [...new Set(rows.map((r) => r.organizationId))] } },
+      select: { id: true, name: true },
+    }),
+    lookupUsers(rows.map((r) => r.clerkUserId)),
+  ]);
+  const orgName = new Map(organizations.map((o) => [o.id, o.name]));
+  const now = Date.now();
+
+  res.json({
+    windowMinutes: minutes,
+    // Stated in the response, not only in the UI, so any other consumer of this
+    // endpoint inherits the caveat rather than having to know it.
+    granularitySeconds: 300,
+    // One person in two organisations is two rows here and one human. Both
+    // numbers are returned because "how many people" and "how many sessions
+    // across tenants" are different questions and only one of them is people.
+    activePeople: new Set(rows.map((r) => r.clerkUserId)).size,
+    activeMemberships: rows.length,
+    activeOrganizations: new Set(rows.map((r) => r.organizationId)).size,
+    members: rows.map((r) => {
+      const d = directory.get(r.clerkUserId);
+      const seen = r.lastSeenAt?.getTime() ?? null;
+      return {
+        clerkUserId: r.clerkUserId,
+        name: d?.name ?? null,
+        email: d?.email ?? r.email,
+        imageUrl: d?.imageUrl ?? null,
+        organizationId: r.organizationId,
+        organizationName: orgName.get(r.organizationId) ?? null,
+        role: r.role,
+        lastSeenAt: r.lastSeenAt?.toISOString() ?? null,
+        secondsSinceSeen: seen === null ? null : Math.round((now - seen) / 1000),
+      };
+    }),
   });
 });
 

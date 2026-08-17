@@ -1,7 +1,7 @@
 import { getAuth } from "@clerk/express";
 import type { NextFunction, Request, Response } from "express";
-import { env } from "../config/env.js";
 import { logger } from "../lib/logger.js";
+import { internalConsoleEnabled, isOperator } from "../lib/internalOperators.js";
 
 // THE ONE SURFACE IN THIS API THAT IS NOT SCOPED TO AN ORGANISATION.
 //
@@ -21,25 +21,31 @@ import { logger } from "../lib/logger.js";
 //      sequence of ordinary membership edits can produce cross-tenant access.
 //   2. NOT requireAuth. That chain resolves an org, applies org RBAC and keys
 //      the rate limiter on the tenant. None of those mean anything here.
-//   3. AN EXPLICIT ALLOWLIST OF CLERK USER IDS, from the environment. Not a
-//      database flag: a row anybody with database access can flip is not a
-//      boundary, and this list should change by deploy, visibly.
+//   3. AN EXPLICIT ALLOWLIST OF CLERK USER IDS.
 //
-// Absence of the variable is the feature switch — same pattern as
-// DEMO_LOGIN_EMAIL. Unset means /internal does not exist at all, which is what
-// every deployment should look like until somebody deliberately turns it on.
+// POINT 3 USED TO SAY "FROM THE ENVIRONMENT, NOT A DATABASE FLAG", on the
+// grounds that "a row anybody with database access can flip is not a boundary".
+// That argument is answered rather than ignored, and it is worth writing down
+// which half of it survived:
+//
+//   The half that does not hold. Anybody with database access on this box can
+//   already read every tenant's rows directly — strictly more than this console
+//   grants. A row they could flip does not cross a line their access had not
+//   already crossed, so "not a boundary against DB access" was true of the
+//   whole system, not an argument for env-only.
+//
+//   The half that does, and is kept intact. The environment list is the FEATURE
+//   SWITCH and the BREAK GLASS. Empty still means /internal does not exist, so
+//   nobody can grant their way into a console nobody turned on; and those
+//   entries are NOT REVOKABLE from the console, so no compromised session and no
+//   sequence of clicks can lock everyone out. Database grants are additive on
+//   top of that floor, and each one records who made it — which is stronger
+//   visibility than "it changed in a diff", not weaker.
+//
+// See lib/internalOperators.ts for the resolution order and why a database
+// failure denies rather than admits.
 
-/** Parsed once at module load: the list changes by deploy, not by request. */
-const ALLOWLIST: ReadonlySet<string> = new Set(
-  (env.INTERNAL_ADMIN_USER_IDS ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0),
-);
-
-export function internalConsoleEnabled(): boolean {
-  return ALLOWLIST.size > 0;
-}
+export { internalConsoleEnabled };
 
 /**
  * 404, NOT 403, ON EVERY REFUSAL.
@@ -55,6 +61,17 @@ export function internalConsoleEnabled(): boolean {
  * populate the allowlist, and it never travels over the wire to the client.
  */
 export function requireSuperAdmin(req: Request, res: Response, next: NextFunction): void {
+  // Express 4 does not adopt a returned promise, so an async middleware here
+  // would surface a rejection as an unhandled rejection rather than a response.
+  // authorise() therefore resolves for every outcome and never rejects; the
+  // catch is a belt-and-braces deny, not the expected path.
+  void authorise(req, res, next).catch((err: unknown) => {
+    logger.error({ err, path: req.originalUrl }, "internal_console_guard_threw");
+    if (!res.headersSent) res.status(404).json({ error: "not_found" });
+  });
+}
+
+async function authorise(req: Request, res: Response, next: NextFunction): Promise<void> {
   if (!internalConsoleEnabled()) {
     res.status(404).json({ error: "not_found" });
     return;
@@ -68,9 +85,10 @@ export function requireSuperAdmin(req: Request, res: Response, next: NextFunctio
     return;
   }
 
-  if (!ALLOWLIST.has(userId)) {
-    // The userId is the actionable half of this line: to grant access, copy it
-    // into INTERNAL_ADMIN_USER_IDS.
+  if (!(await isOperator(userId))) {
+    // The userId is the actionable half of this line: to grant access, either
+    // add it on the console's Access page or copy it into
+    // INTERNAL_ADMIN_USER_IDS.
     logger.warn({ userId, path: req.originalUrl }, "internal_console_denied_not_allowlisted");
     res.status(404).json({ error: "not_found" });
     return;

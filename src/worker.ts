@@ -11,6 +11,11 @@ import { startSyncScheduler, syncSchedulerQueue } from "./modules/queue/syncSche
 import { startSyncWorker } from "./modules/queue/syncWorker.js";
 import { startObservabilityRetention, stopObservabilityRetention } from "./modules/observability/retention.js";
 import { startSystemSampler, stopSystemSampler } from "./modules/observability/systemSampler.js";
+import { startAlertEvaluator, stopAlertEvaluator } from "./modules/observability/alerts.js";
+import { startSyntheticProber, stopSyntheticProber } from "./modules/observability/synthetics.js";
+import { startQueueDepthSampler, stopQueueDepthSampler } from "./modules/observability/queueDepthSampler.js";
+import { startCostSnapshotWriter, stopCostSnapshotWriter } from "./modules/observability/costSnapshot.js";
+import { startDigest, stopDigest } from "./modules/observability/digest.js";
 
 // Separate process from src/index.ts's HTTP server, deliberately. Running
 // sync jobs inline on the API server (the old behavior) meant a big backfill
@@ -58,6 +63,24 @@ const repairScheduler = startRepairScheduler();
 // to the one job whose entire purpose is to still work when things are unwell.
 startSystemSampler();
 startObservabilityRetention();
+// Same argument, one step further: the evaluator raises "the queue is stuck" and
+// "Redis is unreachable", so it must not be scheduled through either.
+startAlertEvaluator();
+// The outside view. Same process and the same argument one step further: the
+// only check that can still be true when the app is down must not be scheduled
+// by the app's own queue.
+startSyntheticProber();
+// BullMQ knows only NOW — getJobCounts keeps no history — so "141 waiting"
+// cannot distinguish a queue draining from one wedged since Tuesday. One row a
+// minute is what makes those two different pictures.
+startQueueDepthSampler();
+// Hourly rather than nightly, because the GCP half is prorated by elapsed time
+// and a daily step would leave every month short by up to a day of compute.
+startCostSnapshotWriter();
+// Everything true but not urgent, once a day. It exists so the PAGE bar can
+// stay high: without it, the only way to make an INFO-worthy fact visible is to
+// promote it to WARN, and a WARN that fires daily is how alerting gets muted.
+startDigest();
 
 // A liveness socket, and nothing more. This process does no HTTP work — every
 // line above talks to Postgres and Redis — but a container platform decides
@@ -100,6 +123,11 @@ async function shutdown(signal: string) {
     // Timers before the Prisma disconnect below, or a sample already in flight
     // writes into a client that is closing.
     stopSystemSampler();
+    stopAlertEvaluator();
+    stopSyntheticProber();
+    stopQueueDepthSampler();
+    stopCostSnapshotWriter();
+    stopDigest();
     stopObservabilityRetention();
     // Closed before the connections they use. The schedulers go first so no
     // new sweep can enqueue work into a queue that is about to disappear.

@@ -117,6 +117,28 @@ const schema = z.object({
   // make that look like a code bug.
   DIGEST_FROM_EMAIL: z.string().optional(),
 
+  // Where internal alerts go. BOTH OPTIONAL, and alerting works without either:
+  // evaluation stores and resolves alerts regardless, and the console shows
+  // them. These only decide whether anything is pushed to a human.
+  //
+  // A webhook is one URL and reaches Slack, Discord or anything else that
+  // accepts a JSON body with a `text` field. Email is the second channel
+  // because the two fail differently — the webhook host can be the thing that
+  // is down.
+  INTERNAL_ALERT_WEBHOOK: z.string().url().optional(),
+  INTERNAL_ALERT_EMAIL: z.string().optional(),
+
+  // The BigQuery dataset holding the Cloud Billing export, when one exists.
+  //
+  // Optional and expected to be absent: the export is a Cloud Console setting
+  // on the BILLING ACCOUNT with no configuration API, so it cannot be turned on
+  // from code. Absent means /internal/economics/billing reports "not
+  // configured" with the steps rather than an empty chart — see
+  // modules/observability/billingExport.ts on why those two must not look the
+  // same. The table name is discovered inside the dataset, because it embeds a
+  // billing account id this process has no way to know.
+  GCP_BILLING_BQ_DATASET: z.string().optional(),
+
   BACKEND_URL: z.string().default("http://localhost:4000"),
   FRONTEND_URL: z.string().default("http://localhost:3000"),
 

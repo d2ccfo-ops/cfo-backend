@@ -28,6 +28,7 @@ import { shiprocketConnectionRouter } from "./routes/connections/shiprocket.js";
 import { shopifyConnectionRouter } from "./routes/connections/shopify.js";
 import { zohoBooksConnectionRouter } from "./routes/connections/zohoBooks.js";
 import { healthRouter } from "./routes/health.js";
+import { telemetryRouter } from "./routes/telemetry.js";
 import { demoLoginRouter } from "./routes/demoLogin.js";
 import { inventoryRouter } from "./routes/inventory.js";
 import { legalEntitiesRouter } from "./routes/legalEntities.js";
@@ -181,6 +182,12 @@ export function createApp() {
   // a person against an allowlist rather than resolving a tenant, which is the
   // whole point of it. See routes/internal/index.ts. Inert — 404 on every path
   // — unless INTERNAL_ADMIN_USER_IDS names somebody.
+  // Beacons from the customer's browser. After clerkMiddleware so a signed-in
+  // caller is identifiable, but deliberately NOT behind requireOrganization —
+  // a page that fails to render is exactly the case where there is no usable
+  // session context, and that is the report worth having.
+  app.use(telemetryRouter);
+
   app.use("/internal", internalRouter);
 
   app.use("/organization", organizationRouter);
