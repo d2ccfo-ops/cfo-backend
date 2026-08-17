@@ -55,6 +55,16 @@ export interface EnrichedKeyFigure extends KeyFigure {
 export interface ToolResultRecord {
   name: string;
   result: unknown;
+  /**
+   * The arguments the model called the tool with.
+   *
+   * Optional because enrichFigures does not need them — a figure cites a tool
+   * by name and that is enough. answerCharts DOES need them: the same tool
+   * called with different arguments answers a different question, and
+   * deduplicating on the name alone made a "day by day" answer carry a
+   * six-month chart. See the note on answerCharts().
+   */
+  args?: unknown;
 }
 
 // The ONLY fields treated as a measured change.

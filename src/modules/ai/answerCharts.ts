@@ -10,11 +10,17 @@
 // figure because nobody audits a line the way they audit a number.
 //
 // So a chart is produced ONLY when a tool already returned the whole series
-// as its own output. Three tools do:
+// as its own output. Eight tools do — the registry at the bottom of this file
+// (EXTRACTORS) is the authority, not this comment:
 //
+//   get_revenue_trend        → series[]  net revenue per day/week/month (§11)
 //   get_contribution_margin  → layers[]  the CM ladder's measured cost layers
 //   get_cash_forecast        → days[]    the projected daily closing balance
+//   run_forecast_scenario    → days[]    the same shape, under a scenario
 //   get_product_profitability→ bottomByMargin[]  SKUs already ranked by CM0
+//   get_refund_analysis      → byGateway[]
+//   get_settlement_summary   → byProvider[]
+//   get_ad_spend_analysis    → byPlatform[]
 //
 // Every other tool returns scalars, and no chart is offered for them. There is
 // no "if it has three numbers, plot it" fallback: a shape this file does not
@@ -340,19 +346,55 @@ const EXTRACTORS: Record<string, (data: unknown) => AnswerChart | null> = {
 };
 
 /**
+ * A stable key for a tool call: the same arguments in a different order are
+ * the same call. JSON.stringify alone is not stable across key order, and the
+ * model does not emit its arguments in a fixed order.
+ */
+function callKey(name: string, args: unknown): string {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === "object") {
+      return Object.fromEntries(
+        Object.entries(v as Record<string, unknown>)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([k, val]) => [k, norm(val)])
+      );
+    }
+    return v;
+  };
+  return name + "|" + JSON.stringify(norm(args ?? null));
+}
+
+/**
  * Charts for the tools THIS run actually called, in call order.
  *
- * Deduplicated by source: a loop that called get_cash_forecast twice measured
- * the same forecast twice, and two identical lines stacked in one answer read
- * as two findings. The first is kept, because the later call may be a scenario
- * re-run whose assumptions are not stated on the chart.
+ * DEDUPLICATED BY CALL, NOT BY TOOL, and the difference is a bug that shipped.
+ *
+ * A loop that calls get_cash_forecast twice measures the same forecast twice,
+ * and two identical lines stacked in one answer read as two findings. That is
+ * what the deduplication is for, and keying on the tool NAME appeared to do it.
+ *
+ * But the same tool called with DIFFERENT arguments answers a different
+ * question. Measured on the live deployment, asking "show me net revenue day
+ * by day for the last 30 days as a graph" made the model call
+ * get_revenue_trend twice — once at its six-month default, then again with
+ * granularity=day for the window actually asked about. Name-keyed dedup kept
+ * the FIRST, so the answer's prose described 31 daily figures while the chart
+ * underneath it drew 6 monthly buckets. A chart that contradicts the answer it
+ * is attached to is worse than no chart: nobody audits a line the way they
+ * audit a number, so the reader simply believes it.
+ *
+ * Keying on (name + arguments) keeps the original protection — an identical
+ * repeat call still collapses — while letting a genuinely different window
+ * through.
  */
 export function answerCharts(toolResults: ToolResultRecord[]): AnswerChart[] {
   const charts: AnswerChart[] = [];
   const seen = new Set<string>();
   for (const record of toolResults) {
     const extract = EXTRACTORS[record.name];
-    if (!extract || seen.has(record.name)) continue;
+    const key = callKey(record.name, record.args);
+    if (!extract || seen.has(key)) continue;
     // Tool results are wrapped in the §19 envelope by tools.ts, so the payload
     // is under `data`. Falling back to the record itself keeps this working if
     // a tool is ever changed to return bare data.
@@ -360,7 +402,7 @@ export function answerCharts(toolResults: ToolResultRecord[]): AnswerChart[] {
     const payload = envelope && "data" in envelope ? envelope.data : record.result;
     const chart = extract(payload);
     if (!chart) continue;
-    seen.add(record.name);
+    seen.add(key);
     charts.push(chart);
   }
   return charts;

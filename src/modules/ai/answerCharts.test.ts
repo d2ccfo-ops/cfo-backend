@@ -292,6 +292,55 @@ describe("answerCharts — the rules that keep it from inventing", () => {
     ])).toHaveLength(1);
   });
 
+  it("still collapses an identical repeat when the arguments are also identical", () => {
+    const result = envelope({ days: [{ date: "d", closingMinor: "100" }] });
+    expect(answerCharts([
+      { name: "get_cash_forecast", result, args: { horizonDays: 30 } },
+      { name: "get_cash_forecast", result, args: { horizonDays: 30 } },
+    ])).toHaveLength(1);
+  });
+
+  it("collapses a repeat whose arguments differ only in key order", () => {
+    const result = envelope({ days: [{ date: "d", closingMinor: "100" }] });
+    expect(answerCharts([
+      { name: "get_cash_forecast", result, args: { from: "2026-01-01", to: "2026-02-01" } },
+      { name: "get_cash_forecast", result, args: { to: "2026-02-01", from: "2026-01-01" } },
+    ])).toHaveLength(1);
+  });
+
+  it("does NOT collapse the same tool called for a different window", () => {
+    // The bug this pins, seen on the live deployment: asking for revenue "day
+    // by day for the last 30 days" made the model call get_revenue_trend twice
+    // — once at its six-month default, then again at granularity=day. Keyed on
+    // the tool NAME, dedup kept the first, so the answer's prose described 31
+    // daily figures while the chart under it drew 6 monthly buckets.
+    //
+    // A chart that contradicts its own answer is worse than no chart: nobody
+    // audits a line the way they audit a number.
+    const monthly = envelope({
+      window: { granularity: "month" },
+      series: [
+        { label: "Jul", netRevenue: 10 },
+        { label: "Aug", netRevenue: 20 },
+      ],
+    });
+    const daily = envelope({
+      window: { granularity: "day" },
+      series: [
+        { label: "1 Aug", netRevenue: 1 },
+        { label: "2 Aug", netRevenue: 2 },
+        { label: "3 Aug", netRevenue: 3 },
+      ],
+    });
+    const charts = answerCharts([
+      { name: "get_revenue_trend", result: monthly, args: {} },
+      { name: "get_revenue_trend", result: daily, args: { granularity: "day", from: "2026-08-01", to: "2026-08-03" } },
+    ]);
+    expect(charts).toHaveLength(2);
+    expect(charts[1]!.subtitle).toContain("day");
+    expect(charts[1]!.series[0]!.points).toHaveLength(3);
+  });
+
   it("returns charts in the order the run called the tools", () => {
     const charts = answerCharts([
       { name: "get_cash_forecast", result: envelope({ days: [{ date: "d", closingMinor: "100" }] }) },

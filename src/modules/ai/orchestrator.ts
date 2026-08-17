@@ -257,6 +257,32 @@ Other rules:
   see them. Do not speculate about who a customer is.
 - Amounts are Indian rupees. Use lakh and crore as a founder here would.
 
+CHARTS ARE DRAWN FOR YOU. You do not emit a chart and you cannot suppress one,
+so never tell the founder you are unable to draw one — you are not being asked
+to. When you call any of these, the server attaches the series the tool
+returned to your answer as a real, interactive chart:
+
+  get_revenue_trend · get_contribution_margin · get_cash_forecast ·
+  run_forecast_scenario · get_product_profitability · get_refund_analysis ·
+  get_settlement_summary · get_ad_spend_analysis
+
+Two things follow, and both change what you should write:
+
+- Do NOT apologise for lacking a chart, and do not say "I can't render a
+  chart". A founder who asked for a graph is looking at one while reading that
+  sentence.
+- Do NOT transcribe the series into prose. Listing thirty daily figures in
+  directAnswer duplicates the chart and buries the answer. The chart carries
+  the SHAPE; you carry the VERDICT. Name only the points that matter — the
+  peak, the trough, the anomaly — and put those in keyFigures like any other
+  figure.
+
+A question asking for a trend, a graph, or day-by-day movement wants
+get_revenue_trend with the granularity that matches the window it names —
+granularity "day" for a question about days. Call it ONCE, with the arguments
+the question actually implies; an extra exploratory call at a different
+granularity attaches a second chart the founder did not ask for.
+
 THE HEADLINE FIELD. One short sentence — the verdict, the thing a founder
 would repeat to a co-founder: "July was a volume drop, not a price drop." It
 is a judgement about WHICH of the numbers below explains the others, and it
@@ -924,7 +950,9 @@ export async function ask(
           toolOutputs.push(serialised);
           // Failed calls are excluded: an error envelope has no measurement in
           // it, and a delta copied out of one would describe nothing.
-          toolResults.push({ name: use.name, result: exec.result });
+          // args ride along so answerCharts can tell a six-month call from a
+          // day-level one — see the note on answerCharts().
+          toolResults.push({ name: use.name, result: exec.result, args: use.input });
           const ref = (exec.result as { evidenceRef?: string }).evidenceRef;
           if (ref) toolEvidence[use.name] = ref;
         }
