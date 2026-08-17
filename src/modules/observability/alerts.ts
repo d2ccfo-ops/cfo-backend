@@ -279,32 +279,64 @@ export async function collectFindings(now = Date.now()): Promise<Finding[]> {
   }
 
   // ---- connector health, from sync_runs ----
+  //
+  // GROUPED BY TENANT AS WELL AS PROVIDER, and the reason is a failure mode this
+  // rule had in production on its first day: nine WARNs fired at once, every one
+  // of them a seeded DEMO organisation whose credentials cannot decrypt. Nine
+  // permanent warnings is how the whole list gets ignored, and the tenth — a
+  // real customer — would have arrived into a page nobody reads any more.
+  //
+  // The fix is NOT to exclude demo tenants. Their syncs failing is true, and a
+  // regression in the seed data is worth knowing about. It is to separate the
+  // two populations: a provider failing only for demo tenants is INFO, which
+  // reaches the daily digest and nothing else. One real tenant among them and it
+  // is a WARN again, and the count of real tenants is in the message.
   try {
     const since = new Date(now - DAY_MS);
-    const rows = await prisma.syncRun.groupBy({
-      by: ["provider", "status"],
-      where: { startedAt: { gte: since } },
-      _count: { _all: true },
-    });
-    const byProvider = new Map<string, { total: number; failed: number }>();
+    const [rows, orgs] = await Promise.all([
+      prisma.syncRun.groupBy({
+        by: ["provider", "status", "organizationId"],
+        where: { startedAt: { gte: since } },
+        _count: { _all: true },
+      }),
+      prisma.organization.findMany({ select: { id: true, name: true } }),
+    ]);
+    // The seeder prefixes every organisation it creates. A name test rather than
+    // a flag column because that prefix IS the marker the seeder guarantees —
+    // see the demo-data seeder; anything else would be a second thing to keep
+    // in step.
+    const demo = new Set(orgs.filter((o) => o.name.startsWith("DEMO")).map((o) => o.id));
+
+    const byProvider = new Map<string, { total: number; failed: number; realOrgs: Set<string>; demoOrgs: Set<string> }>();
     for (const r of rows) {
-      const p = byProvider.get(r.provider) ?? { total: 0, failed: 0 };
+      const p = byProvider.get(r.provider) ?? { total: 0, failed: 0, realOrgs: new Set<string>(), demoOrgs: new Set<string>() };
       p.total += r._count._all;
-      if (r.status === "FAILED") p.failed += r._count._all;
+      if (r.status === "FAILED") {
+        p.failed += r._count._all;
+        (demo.has(r.organizationId) ? p.demoOrgs : p.realOrgs).add(r.organizationId);
+      }
       byProvider.set(r.provider, p);
     }
+
     for (const [provider, p] of byProvider) {
       if (p.total < SYNC_MIN_RUNS) continue;
       const rate = p.failed / p.total;
-      if (rate > SYNC_FAIL_RATE_WARN) {
-        push({
-          key: `sync.failing:${provider}`,
-          rule: "sync.failing",
-          severity: "WARN",
-          title: `${provider} syncs are failing ${(rate * 100).toFixed(0)}% of the time`,
-          detail: `${p.failed} of ${p.total} runs in the last 24 hours. Customers on this connector are looking at stale figures.`,
-        });
-      }
+      if (rate <= SYNC_FAIL_RATE_WARN) continue;
+
+      const realCount = p.realOrgs.size;
+      push({
+        key: `sync.failing:${provider}`,
+        rule: "sync.failing",
+        severity: realCount > 0 ? "WARN" : "INFO",
+        title:
+          realCount > 0
+            ? `${provider} syncs are failing ${(rate * 100).toFixed(0)}% of the time`
+            : `${provider} syncs fail for demo tenants only`,
+        detail:
+          realCount > 0
+            ? `${p.failed} of ${p.total} runs in the last 24 hours, across ${realCount} real ${realCount === 1 ? "tenant" : "tenants"}${p.demoOrgs.size > 0 ? ` (and ${p.demoOrgs.size} demo)` : ""}. Customers on this connector are looking at stale figures.`
+            : `${p.failed} of ${p.total} runs failed, all of them for ${p.demoOrgs.size} seeded demo ${p.demoOrgs.size === 1 ? "organisation" : "organisations"}. No customer is affected, so this is INFO — it reaches the daily digest and nobody's phone.`,
+      });
     }
   } catch (err) {
     logger.warn({ err }, "alert_sync_failed");
