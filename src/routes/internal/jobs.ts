@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../../lib/prisma.js";
+import { readQueueInventory } from "../../modules/observability/queueInventory.js";
 import { daysParam, limitParam, since } from "./shared.js";
 import { classifySyncError } from "./syncErrorClass.js";
 
@@ -219,4 +220,22 @@ internalJobsRouter.get("/errors", async (req, res) => {
     errors: grouped,
     byClass: [...byClass.entries()].map(([cls, count]) => ({ class: cls, count })).sort((a, b) => b.count - a.count),
   });
+});
+
+/**
+ * THE QUEUES THEMSELVES, as opposed to the history of what came out of them.
+ *
+ * Every other route on this router reads sync_runs — the record of finished
+ * work. None of them can answer "is anything stuck right now", because a job
+ * that is waiting has not written a row yet. That gap is what this closes, and
+ * it is the difference between noticing a stall at 09:00 and noticing it in
+ * tomorrow's failure count.
+ *
+ * 503 rather than 500 when Redis is unreachable: the console renders the body's
+ * `error` next to a retry, and "the queue store is down" is a real answer to
+ * the question the panel asks, not an internal fault hidden behind a 500.
+ */
+internalJobsRouter.get("/queues", async (_req, res) => {
+  const inventory = await readQueueInventory();
+  res.status(inventory.error ? 503 : 200).json(inventory);
 });

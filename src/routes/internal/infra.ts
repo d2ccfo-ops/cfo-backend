@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { prisma } from "../../lib/prisma.js";
 import { measureCpuBusy, sampleSystem } from "../../modules/observability/systemSampler.js";
+import { readRedisStats } from "../../modules/observability/redisInfo.js";
+import { computeCloudCost } from "../../modules/observability/cloudCost.js";
 import {
   addHistogram,
   emptyHistogram,
@@ -346,4 +348,16 @@ internalInfraRouter.get("/database", async (_req, res) => {
     settings: Object.fromEntries(settings.map((s) => [s.name, s.setting])),
     tables: tables.map((t) => ({ table: t.table, bytes: t.bytes.toString(), rows: Number(t.rows) })),
   });
+});
+
+/**
+ * Redis, from its own INFO. See modules/observability/redisInfo.ts.
+ *
+ * The figure to watch is memoryUsedRatio against maxmemory, because the policy
+ * here is noeviction: a full instance does not shed old keys, it fails writes —
+ * and it would do so to the queue, the response cache and the rate limiter at
+ * the same time, presenting as three unrelated faults.
+ */
+internalInfraRouter.get("/redis", async (_req, res) => {
+  res.json(await readRedisStats());
 });
