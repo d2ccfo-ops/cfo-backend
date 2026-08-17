@@ -50,6 +50,21 @@ const schema = z.object({
   // before it issues anything — see routes/demoLogin.ts.
   DEMO_LOGIN_EMAIL: z.string().email().optional(),
 
+  // Comma-separated Clerk user IDs allowed to read /internal — the operations
+  // console, and the only surface in this API that reads across tenants.
+  //
+  // Its PRESENCE is the feature switch, same as DEMO_LOGIN_EMAIL above: unset
+  // means /internal 404s entirely, which is what every deployment should look
+  // like until somebody deliberately turns it on.
+  //
+  // Deliberately NOT a MembershipRole and deliberately NOT a database flag.
+  // MembershipRole is per-organisation, so granting a role inside one tenant
+  // must never be able to grant reads across all of them; and a row anybody
+  // with database access can flip is not a boundary. See
+  // middleware/requireSuperAdmin.ts. To find your own Clerk user id, call any
+  // /internal route while signed in and read it out of the denial log line.
+  INTERNAL_ADMIN_USER_IDS: z.string().optional(),
+
   // P4 AI CFO. Optional: absent means /ai returns a clear "not configured"
   // rather than a 500, and every other route is unaffected. Same
   // check-at-use pattern as every connector credential below.

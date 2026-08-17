@@ -126,6 +126,19 @@ model Membership {
   email          String
   role           MembershipRole @default(MEMBER)
   createdAt      DateTime       @default(now())
+  // Last time this person made an authenticated request, for "who is actually
+  // using this" on the internal console.
+  //
+  // A column rather than a derivation, because the obvious derivation is
+  // wrong: AuditLog only records WRITES, so a founder who reads dashboards
+  // every morning and changes nothing looks dormant in it. Undercounting
+  // exactly the behaviour the product is for would make every activity figure
+  // a lie in the same direction.
+  //
+  // Written at most once per five minutes per user (middleware/lastSeen.ts) —
+  // a write on every request would put a row update in front of all 89 read
+  // endpoints to gain five minutes of precision nobody reads.
+  lastSeenAt     DateTime?
 
   @@unique([organizationId, clerkUserId])
   @@index([organizationId])
@@ -218,6 +231,8 @@ model Connection {
   openingBalanceMinor BigInt?
   openingBalanceDate  DateTime?
 
+  syncRuns SyncRun[]
+
   // Defense-in-depth against duplicate connections from a double-click or a
   // racing callback — application code still does an explicit findFirst
   // before writing (see connections/shopify.ts), since Prisma can't upsert
@@ -227,8 +242,6 @@ model Connection {
   @@index([organizationId])
   @@index([legalEntityId])
   @@map("connections")
-
-  syncRuns SyncRun[]
 }
 
 enum ProcessingStatus {
@@ -675,18 +688,28 @@ model AdCampaignSpend {
   provider          Provider // META_ADS or GOOGLE_ADS
   externalAccountId String
   date              DateTime // the day this spend covers, UTC midnight
-  /** The provider's own campaign id — stable across renames. */
+  /**
+   * The provider's own campaign id — stable across renames.
+   */
   campaignId        String
-  /** The campaign's name at pull time. Renamed campaigns keep their id. */
+  /**
+   * The campaign's name at pull time. Renamed campaigns keep their id.
+   */
   campaignName      String?
-  /** Sales channel this campaign drove, where the provider states it. Null = not attributable. */
+  /**
+   * Sales channel this campaign drove, where the provider states it. Null = not attributable.
+   */
   channel           String?
   spendAmount       BigInt // paise
   impressions       Int?
   clicks            Int?
-  /** Conversions the ad platform claims. Platform-attributed, NOT our order count — see modules/calc/campaigns.ts. */
+  /**
+   * Conversions the ad platform claims. Platform-attributed, NOT our order count — see modules/calc/campaigns.ts.
+   */
   conversions       Int?
-  /** Revenue the ad platform claims it drove, paise. Same caveat as conversions. */
+  /**
+   * Revenue the ad platform claims it drove, paise. Same caveat as conversions.
+   */
   attributedRevenue BigInt?
   currency          String   @default("INR")
   raw               Json?
@@ -948,9 +971,9 @@ model EmailIngestAddress {
 
 enum InboundEmailStatus {
   PROCESSED // every attachment either imported or was a duplicate
-  PARTIAL   // some attachments imported, some failed or were unrecognised
-  FAILED    // attachments present, none imported
-  EMPTY     // no attachments worth trying (no PDF/CSV)
+  PARTIAL // some attachments imported, some failed or were unrecognised
+  FAILED // attachments present, none imported
+  EMPTY // no attachments worth trying (no PDF/CSV)
 }
 
 // One row per email received, whatever happened to it. This table is the
@@ -958,18 +981,22 @@ enum InboundEmailStatus {
 // silently-dropped attachment is indistinguishable from mail that never
 // arrived, and the merchant's only recourse is re-forwarding into the void.
 model InboundEmail {
-  id             String             @id @default(cuid())
-  organizationId String
-  addressId      String
-  /** RFC Message-ID when the provider passes one — the dedupe key for retries. */
-  messageId      String?
-  fromAddress    String?
-  subject        String?
+  id              String             @id @default(cuid())
+  organizationId  String
+  addressId       String
+  /**
+   * RFC Message-ID when the provider passes one — the dedupe key for retries.
+   */
+  messageId       String?
+  fromAddress     String?
+  subject         String?
   attachmentCount Int
-  status         InboundEmailStatus
-  /** Per-attachment outcomes: [{name, kind, ok, detail}] — what the log renders. */
-  outcomes       Json
-  createdAt      DateTime           @default(now())
+  status          InboundEmailStatus
+  /**
+   * Per-attachment outcomes: [{name, kind, ok, detail}] — what the log renders.
+   */
+  outcomes        Json
+  createdAt       DateTime           @default(now())
 
   address EmailIngestAddress @relation(fields: [addressId], references: [id], onDelete: Cascade)
 
@@ -999,19 +1026,31 @@ model FreightInvoice {
   organizationId  String
   legalEntityId   String
   connectionId    String
-  /** Courier's own invoice number, e.g. "2026709R00005458". */
+  /**
+   * Courier's own invoice number, e.g. "2026709R00005458".
+   */
   invoiceNo       String
   invoiceDate     DateTime?
-  /** The courier account billed, e.g. "NDA821166". */
+  /**
+   * The courier account billed, e.g. "NDA821166".
+   */
   customerAccount String?
-  /** e.g. "Etail Air COD" / "Etail Air Prepaid" — the COD/prepaid split. */
+  /**
+   * e.g. "Etail Air COD" / "Etail Air Prepaid" — the COD/prepaid split.
+   */
   product         String?
   carrier         String // normalised carrier slug, see connectors/courier.ts
-  /** paise — the freight subtotal the invoice itself states. */
+  /**
+   * paise — the freight subtotal the invoice itself states.
+   */
   statedTotal     BigInt?
-  /** paise — grand total incl. surcharges and GST. NOT the sum of the lines. */
+  /**
+   * paise — grand total incl. surcharges and GST. NOT the sum of the lines.
+   */
   grandTotal      BigInt?
-  /** paise — sum of the parsed lines. Equals statedTotal or the upload is refused. */
+  /**
+   * paise — sum of the parsed lines. Equals statedTotal or the upload is refused.
+   */
   lineTotal       BigInt
   lineCount       Int
   fileName        String?
@@ -1028,23 +1067,29 @@ model FreightInvoice {
 }
 
 model FreightInvoiceLine {
-  id              String    @id @default(cuid())
+  id              String   @id @default(cuid())
   organizationId  String
   invoiceId       String
   awb             String
-  /** Resolved at apply time. Null means the courier billed for a parcel we have no record of. */
+  /**
+   * Resolved at apply time. Null means the courier billed for a parcel we have no record of.
+   */
   shipmentId      String?
   shipDate        DateTime
   destination     String?
   serviceType     String?
   chargedWeightKg Float?
-  /** paise, SIGNED — negative rows are credits the courier issued back. */
+  /**
+   * paise, SIGNED — negative rows are credits the courier issued back.
+   */
   amount          BigInt
-  /** The courier's (R) prefix: a return leg, billed on top of the outbound one. */
-  isReturnLeg     Boolean   @default(false)
-  createdAt       DateTime  @default(now())
+  /**
+   * The courier's (R) prefix: a return leg, billed on top of the outbound one.
+   */
+  isReturnLeg     Boolean  @default(false)
+  createdAt       DateTime @default(now())
 
-  invoice  FreightInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoice FreightInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
   @@index([organizationId, awb])
   @@index([invoiceId])
@@ -1180,6 +1225,28 @@ enum ActorType {
   AI
 }
 
+// The durable half of calcCache — see lib/precomputedStore.ts. Holds the exact
+// response body an expensive metric endpoint already produced, keyed by the
+// same variant string calcCache builds, so a cold cache costs a table read
+// rather than an 810ms scan. Not time-bounded: rows are deleted by
+// invalidateOrgReads on every observable write, never aged out, because a
+// figure whose inputs changed is wrong rather than stale.
+model PrecomputedResponse {
+  id             String   @id @default(cuid())
+  organizationId String
+  // "<metric>|<legalEntityId>/<entityCount>|<canonical query>" — built by
+  // variantKey() so this and calcCache cannot drift apart.
+  variant        String
+  body           String
+  computedAt     DateTime @default(now())
+
+  @@unique([organizationId, variant])
+  // Invalidation deletes by organisation and nothing else, and it runs on
+  // every write path a user can observe.
+  @@index([organizationId])
+  @@map("precomputed_responses")
+}
+
 model AuditLog {
   id             String    @id @default(cuid())
   organizationId String
@@ -1248,7 +1315,7 @@ model Anomaly {
   // Rule-specific detail: which SKUs, which orders, the exact paise strings,
   // the query that produced the finding. What recommendedInvestigation below
   // tells a human to go look AT.
-  evidence               Json
+  evidence                 Json
   recommendedInvestigation String
 
   ownerId String? // Clerk user id — unassigned until a human claims it
@@ -1391,26 +1458,26 @@ model AgentMessage {
 }
 
 model AgentRun {
-  id             String         @id @default(cuid())
-  conversationId String
-  organizationId String
-  userId         String
-  question       String
-  status         AgentRunStatus @default(RUNNING)
-  model          String
-  turns          Int            @default(0)
+  id               String         @id @default(cuid())
+  conversationId   String
+  organizationId   String
+  userId           String
+  question         String
+  status           AgentRunStatus @default(RUNNING)
+  model            String
+  turns            Int            @default(0)
   // Billed at the full input rate. Excludes cache reads and cache writes,
   // which the API reports separately — see the note below.
-  inputTokens    Int            @default(0)
-  outputTokens   Int            @default(0)
+  inputTokens      Int            @default(0)
+  outputTokens     Int            @default(0)
   // Prompt-cache accounting, kept as three separate counters rather than one
   // input total, because they bill at three different rates (~0.1x, ~1.25x and
   // 1x of the input rate) and a sum would hide whether caching is working at
   // all. Rows written before caching was enabled carry 0 in both and are not
   // comparable to later ones: their whole prompt was billed as inputTokens.
-  cacheReadTokens  Int          @default(0)
-  cacheWriteTokens Int          @default(0)
-  error          String?
+  cacheReadTokens  Int            @default(0)
+  cacheWriteTokens Int            @default(0)
+  error            String?
   // P4.7's verdict on this run's own answer, computed at answer time rather
   // than only in the eval suite. Holds {figures, sources, pii} — which figures
   // could not be found in any tool result, which sources named a tool that
@@ -1418,9 +1485,9 @@ model AgentRun {
   // model made a number up" is the one failure this product cannot detect
   // later from the answer alone: the tool results that would disprove it are
   // on AgentToolCall, but matching them back up after the fact is guesswork.
-  verification   Json?
-  startedAt      DateTime       @default(now())
-  finishedAt     DateTime?
+  verification     Json?
+  startedAt        DateTime       @default(now())
+  finishedAt       DateTime?
 
   conversation AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   toolCalls    AgentToolCall[]
@@ -1553,38 +1620,38 @@ model ApprovalRequest {
   riskLevel      ApprovalRiskLevel
 
   // What is being asked for, in one line a reviewer reads first.
-  title       String
+  title      String
   // Why. Written by whoever raised it, not generated.
-  reason      String
+  reason     String
   // The money at stake, paise. Null when the action moves no money (a message).
-  amount      BigInt?
+  amount     BigInt?
   // What the reviewer needs to see, captured AT REQUEST TIME rather than
   // looked up at review time. A figure that changed between the request and
   // the review would be approved on the strength of a number nobody saw.
-  evidence    Json?
+  evidence   Json?
   // The thing being acted on: an order id, a product id, a conversation id.
-  entityType  String?
-  entityId    String?
+  entityType String?
+  entityId   String?
   // The payload the action needs if approved — the draft message text, the
   // write-off note. Stored so approval EXECUTES the request rather than
   // authorising a second, unverified attempt at it.
-  payload     Json?
+  payload    Json?
 
   // Who assembled it. Distinct from requestedBy because §22 allows the AI to
   // prepare a request a person then submits — "the model wrote this" is a fact
   // a reviewer is entitled to.
-  preparedBy       String
-  preparedByType   ActorType      @default(USER)
-  requestedBy      String
+  preparedBy     String
+  preparedByType ActorType      @default(USER)
+  requestedBy    String
   // The minimum role that may act on this. Stored rather than derived, so a
   // later change to the policy cannot silently lower the bar on requests that
   // are already open.
-  requiredRole     MembershipRole
+  requiredRole   MembershipRole
   // Nobody approves their own request. Enforced in code; recorded here so the
   // trail shows who could have.
-  decidedBy        String?
-  decidedAt        DateTime?
-  decisionNote     String?
+  decidedBy      String?
+  decidedAt      DateTime?
+  decisionNote   String?
 
   expiresAt DateTime
   createdAt DateTime @default(now())
@@ -1596,21 +1663,43 @@ model ApprovalRequest {
 }
 
 model AiDailyBrief {
-  id             String   @id @default(cuid())
-  organizationId String
+  id               String   @id @default(cuid())
+  organizationId   String
   // Day key in the organisation's timezone, YYYY-MM-DD. Not a DateTime: the
   // brief is about a calendar day in Asia/Kolkata, and an instant would shift
   // it by 5.5 hours on any server that thinks in UTC.
-  day            String
-  narrative      Json?
-  reason         String?
+  day              String
+  narrative        Json?
+  reason           String?
   // How many figures the P4.7 harness checked before this was stored. Shown
   // in the UI so it can say the figures were checked rather than assert it.
-  figuresChecked Int      @default(0)
-  model          String?
-  version        String   @default("v1")
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  figuresChecked   Int      @default(0)
+  model            String?
+  // What this brief cost, in tokens. Same four counters and the same reasoning
+  // as AgentRun — see lib/aiPricing.ts for why cached reads and cache writes
+  // stay separate from uncached input rather than being summed.
+  //
+  // These were missing until the internal console went to build a cost page and
+  // found the one AI job that runs unattended was also the only one nobody was
+  // counting. A question costs money when somebody chooses to ask it; this runs
+  // once per organisation per day forever, so its cost compounds on its own and
+  // is exactly the cost that most needs a number against it.
+  //
+  // NULLABLE, AND NOT DEFAULTED TO ZERO. Same rule as SyncRun.recordsFetched
+  // elsewhere in this file: 0 is a different fact from unknown. A brief that
+  // short-circuits before ever reaching the API — no snapshot history, nothing
+  // moved, no API key configured — genuinely spent nothing, and that zero is a
+  // real measurement worth keeping. Rows written before these columns existed
+  // spent something nobody counted. Defaulting to 0 would merge the two and
+  // quietly drag every average toward free, which is the one direction a cost
+  // figure must never be wrong in.
+  inputTokens      Int?
+  outputTokens     Int?
+  cacheReadTokens  Int?
+  cacheWriteTokens Int?
+  version          String   @default("v1")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   @@unique([organizationId, day])
   @@index([organizationId, day])
@@ -1618,24 +1707,179 @@ model AiDailyBrief {
 }
 
 model AgentToolCall {
-  id        String   @id @default(cuid())
-  runId     String
-  toolName  String
+  id         String   @id @default(cuid())
+  runId      String
+  toolName   String
   // Exactly what the model asked for. Kept verbatim, including arguments that
   // failed validation — a rejected call is the more interesting record, since
   // it is where a model tried to reach outside its permitted surface.
-  arguments Json
+  arguments  Json
   // What the tool returned, after PII masking. Never the pre-mask value: this
   // table would otherwise become the one place customer names and phone
   // numbers are retained indefinitely, defeating §27's minimisation.
-  result    Json?
-  ok        Boolean  @default(true)
-  error     String?
-  durationMs Int     @default(0)
-  createdAt DateTime @default(now())
+  result     Json?
+  ok         Boolean  @default(true)
+  error      String?
+  durationMs Int      @default(0)
+  createdAt  DateTime @default(now())
 
   run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
   @@index([runId, createdAt])
   @@map("agent_tool_calls")
+}
+
+// ---------------------------------------------------------------------------
+// Internal observability
+//
+// The only tables in this schema that are NOT scoped to an organisation.
+//
+// Everything else here answers a question a merchant is entitled to ask about
+// their own business. These two answer questions only we are entitled to ask —
+// how loaded is the box, how slow is an endpoint across all tenants — and a
+// tenant column on them would be meaningless at best and a way to leak one
+// customer's traffic shape to another at worst. They are read exclusively
+// through /internal, behind middleware/requireSuperAdmin.ts.
+// ---------------------------------------------------------------------------
+
+// One row per (minute, route, method). NOT one row per request.
+//
+// Per-request rows were the first design and would have out-written the orders
+// table inside a week: this API serves ~20 calls on a single dashboard load,
+// and the row would carry no information the aggregate does not. Aggregating in
+// memory and flushing once a minute turns unbounded write volume into a bounded
+// one — at most (routes x methods) upserts per minute per API process.
+//
+// The four API cluster workers each keep their own in-memory counters and each
+// flush into the same row, which is why every counter below is written with an
+// atomic `increment` rather than a read-modify-write. Two workers flushing the
+// same minute must add, not race.
+model RequestMetric {
+  id          String   @id @default(cuid())
+  // Truncated to the minute, UTC. The grain of the whole table.
+  bucketStart DateTime
+  // The Express ROUTE PATTERN, never the request URL: "/metrics/revenue", not
+  // "/metrics/revenue?from=2026-08-01". A URL-keyed table would grow a row per
+  // distinct query string and per resource id, which is the cardinality
+  // explosion that makes metrics tables unusable.
+  route       String
+  method      String
+
+  count     Int @default(0)
+  status2xx Int @default(0)
+  status3xx Int @default(0)
+  status4xx Int @default(0)
+  status5xx Int @default(0)
+
+  // Sum, not mean. A mean cannot be re-aggregated across buckets without
+  // weighting, and every reader here re-aggregates.
+  totalMs Int @default(0)
+  maxMs   Int @default(0)
+
+  // Response-cache outcome, read from the X-Calc-Cache header the cache
+  // middleware already sets. Counted here rather than in a separate Redis
+  // counter so hit rate and latency for a route come from one row and cannot
+  // disagree about how many requests there were.
+  cacheHit  Int @default(0)
+  cacheMiss Int @default(0)
+
+  // A LATENCY HISTOGRAM, because percentiles do not average.
+  //
+  // Storing a mean and calling p95 "mean x 2" is the standard way this table
+  // gets built and it is worthless on exactly the traffic that matters — a
+  // route that is 5ms for 95% of calls and 4s for the rest has a flattering
+  // mean and a terrible p95. These are NON-cumulative counts of requests
+  // falling in each band; readers cumulate them and interpolate. Bands are
+  // fixed, so buckets from different minutes and different processes add.
+  le10   Int @default(0)
+  le25   Int @default(0)
+  le50   Int @default(0)
+  le100  Int @default(0)
+  le250  Int @default(0)
+  le500  Int @default(0)
+  le1000 Int @default(0)
+  le2500 Int @default(0)
+  le5000 Int @default(0)
+  leInf  Int @default(0)
+
+  @@unique([bucketStart, route, method])
+  @@index([bucketStart])
+  @@index([route, bucketStart])
+  @@map("request_metrics")
+}
+
+// One sample of the machine, once a minute, taken by the worker process.
+//
+// WHY NOT THE GCP OPS AGENT. It is the better long-term answer and this does
+// not replace it — but it is an agent to install and maintain on a box we
+// otherwise deploy entirely through compose, and it cannot see inside the
+// containers. This reads /proc through Node's own os module, ships with the
+// image, and is enough to answer the question that prompted it: how much of
+// this machine are we paying for and not using.
+//
+// WHAT IT CANNOT SEE, stated here so nobody reads more into the numbers than
+// they hold: per-container CPU and memory need the Docker socket, which this
+// process deliberately does not have. loadavg and memory come from the host's
+// /proc and so describe the WHOLE VM, including Postgres, Redis, Caddy and
+// both Node processes together. That is the right denominator for "is the box
+// full" and the wrong one for "which container is at fault".
+model SystemSample {
+  id      String   @id @default(cuid())
+  takenAt DateTime @default(now())
+
+  // Host-wide, from /proc/loadavg. Divided by cpuCount at read time to get a
+  // saturation ratio — load 4.0 on 4 cores is full, on 8 cores is half.
+  load1    Float
+  load5    Float
+  load15   Float
+  cpuCount Int
+
+  // Host-wide, bytes. BigInt because 8GB in bytes overflows nothing here but
+  // the next machine size up is where a plain Int would start lying.
+  memTotal BigInt
+  memFree  BigInt
+
+  // The filesystem the containers write to, bytes. Disk is billed on
+  // PROVISIONED size, not used, so both halves are needed to price the waste.
+  diskTotal BigInt
+  diskFree  BigInt
+
+  // This process only. Useful for spotting a leak in the worker itself, which
+  // the host-wide figures above would hide inside 8GB of noise.
+  procRssBytes  BigInt
+  procHeapBytes BigInt
+
+  @@index([takenAt])
+  @@map("system_samples")
+}
+
+// One row per (organisation, user, UTC day) they were active on.
+//
+// Membership.lastSeenAt answers "is this person still around". It cannot answer
+// "how many people used this on the 4th", because it holds one instant per
+// person and is overwritten — yesterday's actives are unrecoverable the moment
+// they come back today. A daily-active chart needs presence recorded per day,
+// so this records exactly that and nothing more.
+//
+// PRESENCE ONLY — deliberately no request counter. The write is throttled to
+// once per five minutes per user per process (middleware/lastSeen.ts), and the
+// API runs four processes, so any counter here would be a count of throttle
+// windows multiplied by however many workers happened to serve the person. That
+// is a number that looks like engagement and is really a load-balancing
+// artefact. Presence is exact; a count would be noise wearing a number's
+// clothes.
+model UserActivityDay {
+  id             String   @id @default(cuid())
+  organizationId String
+  clerkUserId    String
+  // YYYY-MM-DD, UTC. Not the organisation's local day: this table is read only
+  // by the cross-tenant internal console, where a figure cut on each tenant's
+  // own midnight cannot be summed across tenants without double-counting the
+  // overlap.
+  day            String
+  lastSeenAt     DateTime
+
+  @@unique([organizationId, clerkUserId, day])
+  @@index([day])
+  @@map("user_activity_days")
 }

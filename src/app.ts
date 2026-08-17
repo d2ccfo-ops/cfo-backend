@@ -50,6 +50,8 @@ import { razorpayWebhookRouter } from "./routes/webhooks/razorpay.js";
 import { setuWebhookRouter } from "./routes/webhooks/setu.js";
 import { shiprocketWebhookRouter } from "./routes/webhooks/shiprocket.js";
 import { shopifyWebhookRouter } from "./routes/webhooks/shopify.js";
+import { internalRouter } from "./routes/internal/index.js";
+import { requestMetrics, startRequestMetricsFlush } from "./middleware/requestMetrics.js";
 import { httpSerializers, logger } from "./lib/logger.js";
 
 export function createApp() {
@@ -73,6 +75,15 @@ export function createApp() {
   // OAuth `?code=` and the Setu webhook's `?key=<secret>` were written in
   // plaintext on every request. See lib/logger.ts.
   app.use(pinoHttp({ logger, serializers: httpSerializers }));
+
+  // Before every route and after the logger, so it sees webhooks, uploads and
+  // health checks too — an endpoint's traffic is not less real for being
+  // machine-generated, and a webhook flood is exactly the kind of thing this
+  // exists to make visible. It records on the response's 'finish' event, so
+  // nothing here sits between the request and its answer; see
+  // middleware/requestMetrics.ts.
+  app.use(requestMetrics());
+  startRequestMetricsFlush();
   // maxAge, because the dashboard is on a DIFFERENT origin from this API and
   // every call carries an Authorization header — which makes each one a
   // "non-simple" request the browser must ask permission for first. Without a
@@ -164,6 +175,13 @@ export function createApp() {
   // Webhooks are deliberately outside it: they are mounted above
   // clerkMiddleware, carry no org claim, and throttling a provider's delivery
   // attempts converts our load problem into their retry storm.
+
+  // The operations console. Mounted after clerkMiddleware because it needs a
+  // verified session, but NOT part of the requireAuth family: it authenticates
+  // a person against an allowlist rather than resolving a tenant, which is the
+  // whole point of it. See routes/internal/index.ts. Inert — 404 on every path
+  // — unless INTERNAL_ADMIN_USER_IDS names somebody.
+  app.use("/internal", internalRouter);
 
   app.use("/organization", organizationRouter);
   app.use("/metrics", metricsRouter);

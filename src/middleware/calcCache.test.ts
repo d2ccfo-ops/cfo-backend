@@ -21,6 +21,22 @@ vi.mock("../lib/orgReadCache.js", () => ({
   },
 }));
 
+// The durable store is mocked too, and must be: without this, every miss in
+// these tests makes a real Postgres round trip, which is both slow and outside
+// what this file is about. The durable layer has its own tests below.
+const durable = new Map<string, string>();
+const durableWrites: Array<{ organizationId: string; variant: string }> = [];
+
+vi.mock("../lib/precomputedStore.js", () => ({
+  isPersistable: (name: string) => name !== "status" && name !== "cash-forecast" && name !== "reconciliation-summary",
+  readPrecomputed: async (organizationId: string, variant: string) =>
+    durable.get(`${organizationId}::${variant}`) ?? null,
+  writePrecomputed: (organizationId: string, variant: string, body: string) => {
+    durableWrites.push({ organizationId, variant });
+    durable.set(`${organizationId}::${variant}`, body);
+  },
+}));
+
 const { calcCache } = await import("./calcCache.js");
 
 interface Ctx {
@@ -88,6 +104,8 @@ async function call(mw: ReturnType<typeof calcCache>, ctx: Ctx, body: unknown, s
 }
 
 beforeEach(() => {
+  durable.clear();
+  durableWrites.length = 0;
   store.clear();
   writes.length = 0;
 });
@@ -191,5 +209,58 @@ describe("calcCache returns the same answer it stored", () => {
     const res = await call(mw, { organizationId: "org", legalEntityId: null, method: "POST" }, { ok: true });
     expect(res.ranHandler).toBe(true);
     expect(writes).toHaveLength(0);
+  });
+});
+
+// The durable layer. Redis' 60s TTL means an expensive metric is recomputed
+// every minute for as long as anyone watches the page; these rows survive that
+// expiry, so what matters is that they are written for the right things, read
+// only when Redis has nothing, and never written for anything a clock can move.
+describe("calcCache durable layer", () => {
+  it("serves from the durable store when Redis has expired, and refills Redis", async () => {
+    const mw = calcCache("contribution-margin");
+    const ctx = { organizationId: "org", legalEntityId: null };
+
+    const miss = await call(mw, ctx, { cm3: "1234" });
+    expect(miss.cacheHeader).toBe("miss");
+    expect(durableWrites).toHaveLength(1);
+
+    // Exactly what a TTL expiry looks like: Redis empty, the row still there.
+    store.clear();
+
+    const warm = await call(mw, ctx, { should: "not be computed" });
+    expect(warm.ranHandler).toBe(false);
+    // Distinguishable from a Redis hit, so the two layers can be told apart
+    // from outside the server.
+    expect(warm.cacheHeader).toBe("warm");
+    expect(warm.text).toBe(JSON.stringify({ cm3: "1234" }));
+    // Refilled, so the next sixty seconds do not touch Postgres either.
+    expect(store.size).toBe(1);
+  });
+
+  it("never persists a clock-driven metric", async () => {
+    // These move with the passage of time and no write, so nothing would ever
+    // invalidate a durable row. Redis' TTL is what keeps them honest.
+    for (const name of ["status", "cash-forecast", "reconciliation-summary"]) {
+      durableWrites.length = 0;
+      const out = await call(calcCache(name), { organizationId: "org", legalEntityId: null }, { v: name });
+      expect(out.cacheHeader).toBe("miss");
+      expect(durableWrites, `${name} must not be persisted`).toHaveLength(0);
+    }
+  });
+
+  it("never persists a non-200", async () => {
+    await call(calcCache("revenue"), { organizationId: "org", legalEntityId: null }, { error: "down" }, 503);
+    expect(durableWrites).toHaveLength(0);
+  });
+
+  it("keeps organisations apart in the durable store too", async () => {
+    const mw = calcCache("revenue");
+    await call(mw, { organizationId: "org-A", legalEntityId: null }, { who: "A" });
+    store.clear();
+    const b = await call(mw, { organizationId: "org-B", legalEntityId: null }, { who: "B" });
+    // org-B must compute its own answer, not inherit A's durable row.
+    expect(b.ranHandler).toBe(true);
+    expect(b.cacheHeader).toBe("miss");
   });
 });

@@ -31,6 +31,7 @@ import { getSalesSummary } from "../modules/calc/sales.js";
 import { getRtoRateSummary } from "../modules/calc/shipments.js";
 import { requireAuth } from "../middleware/auth.js";
 import { calcCache } from "../middleware/calcCache.js";
+import { runBounded, type BoundedTask } from "../lib/runBounded.js";
 
 export const metricsRouter = Router();
 
@@ -347,6 +348,129 @@ metricsRouter.get("/burn-runway", ...requireAuth, withDateRange, withEntityScope
 // it due" is a forward-looking position as of now, not a sum over a past window.
 metricsRouter.get("/payables", ...requireAuth, withDateRange, withEntityScope, calcCache("payables"), async (req, res) => {
   res.json(await getPayablesSummary(req.auth!.organizationId));
+});
+
+// ---------------------------------------------------------------------------
+// The batched Overview.
+//
+// WHY. The overview page fired SIXTEEN requests at once, each authenticating,
+// consuming rate-limit budget, doing its own Redis lookup, and taking its own
+// Postgres connection. Load testing on 2026-08-17 measured what that costs: the
+// same box that serves 60 concurrent users at 15% CPU on a warm cache goes to
+// 74% on ONE user with a cold one, because sixteen simultaneous aggregations
+// over ~25k orders queue against four cores. Thirteen of those requests collapse
+// into this one.
+//
+// The saving is not only the HTTP round trips:
+//
+//   * getDataStatusMap ran FIVE TIMES per page load — revenue, cash-received,
+//     revenue-ladder, contribution-margin and product-profitability each asked
+//     for it independently. Here it is read once and shared. It is
+//     single-flighted per process, but the API runs four children, so the old
+//     path could genuinely compute it four times over.
+//   * One cache entry instead of thirteen: one cold compute rather than
+//     thirteen independent ones, and one Redis round trip instead of thirteen.
+//   * One rate-limit token instead of thirteen, against the 600/60s per-org
+//     budget — the ceiling the load test actually hit.
+//
+// NOTHING IS RECOMPUTED HERE. Every figure comes from the same modules/calc
+// function the individual endpoint calls, with the same arguments. This file
+// must never grow its own arithmetic: the individual endpoints stay, and a
+// figure that disagreed between the two would be exactly the §1 failure the
+// finance engine exists to prevent.
+//
+// FRESHNESS IS DELIBERATELY NOT HERE. /metrics/freshness is the one metric
+// route with no calcCache, because it reports how stale the data is and a
+// cached staleness reading is a contradiction. Folding it into a 60s-cached
+// batch would quietly undo that. It stays a separate request.
+//
+// Reconciliation summary and anomalies are also absent — they live in other
+// routers and are implemented inline rather than as calc functions. Extracting
+// 148 lines of reconciliation SQL was not worth the risk in the same change.
+
+/**
+ * How many of the thirteen may touch the database at once.
+ *
+ * Not thirteen. Prisma's pool is connection_limit=10 PER CHILD, so an
+ * unbounded fan-out would let a single overview request exhaust its child's
+ * pool and stall every other request that child is serving — trading sixteen
+ * small queue-jumpers for one large one.
+ *
+ * Four matches the vCPU count, because this work is Postgres-bound and the
+ * fifth concurrent aggregation has no core to run on. Lower is slower for one
+ * viewer; higher is worse for everyone else.
+ */
+const OVERVIEW_CONCURRENCY = 4;
+
+metricsRouter.get("/overview", ...requireAuth, withDateRange, withEntityScope, calcCache("overview"), async (req, res) => {
+  const organizationId = req.auth!.organizationId;
+  const range = req.dateRange!;
+  const scope = req.entityScope;
+
+  // Read ONCE, before the fan-out, and hand the same object to every metric
+  // that needs it. This is the single biggest saving in the endpoint.
+  //
+  // Awaited rather than run alongside the rest on purpose: five of the tasks
+  // below need it, and starting them before it resolves would mean either
+  // passing a promise around or fetching it twice.
+  const statuses = await getDataStatusMap(organizationId);
+
+  // Keys are the URL segment of the endpoint each one replaces, exactly. Not
+  // camelCase: the point is that the correspondence is mechanical, so a reader
+  // — or a test diffing this against the individual routes — never has to
+  // guess which key answers which request.
+  const tasks: BoundedTask[] = [
+    { key: "revenue", run: async () => ({ ...(await getNetRevenueSummary(organizationId, range, scope)), dataStatus: statuses.revenue }) },
+    { key: "rto-rate", run: () => getRtoRateSummary(organizationId, range, scope) },
+    { key: "cash-received", run: async () => ({ ...(await getCashReceivedSummary(organizationId, range)), dataStatus: statuses.cash_received }) },
+    { key: "available-cash", run: () => getAvailableCashSummary(organizationId, range) },
+    { key: "ad-spend", run: () => getAdSpendSummary(organizationId, range) },
+    { key: "ad-efficiency", run: () => getAdEfficiencySummary(organizationId, range) },
+    { key: "sales", run: () => getSalesSummary(organizationId, range, scope) },
+    { key: "inventory-value", run: () => getInventoryValueSummary(organizationId) },
+    { key: "contribution-margin", run: async () => ({ ...(await getContributionMargin(organizationId, range, scope)), dataStatus: statuses.contribution_margin }) },
+    {
+      key: "revenue-ladder",
+      run: async () => {
+        const [ladder, trend] = await Promise.all([
+          getRevenueLadder(organizationId, range, scope),
+          getRevenueTrend(organizationId),
+        ]);
+        return {
+          ...ladder,
+          trend: trend.series,
+          trendWindow: trend.window,
+          cashCoverage: trend.cashCoverage,
+          dataStatus: statuses.revenue,
+        };
+      },
+    },
+    { key: "product-profitability", run: async () => ({ ...(await getProductProfitability(organizationId, range, undefined, scope)), dataStatus: statuses.product_profitability }) },
+    { key: "burn-runway", run: () => getBurnAndRunway(organizationId) },
+    { key: "payables", run: () => getPayablesSummary(organizationId) },
+  ];
+
+  const { ok, failed } = await runBounded(tasks, OVERVIEW_CONCURRENCY);
+  const failedKeys = Object.keys(failed);
+
+  // 200 only when every metric answered — and only a 200 is cached, so a
+  // partial result is never served to the next twelve viewers for a minute.
+  // That behaviour is calcCache's, not a special case added here.
+  //
+  // 207 Multi-Status is the honest code for "some of these worked": the client
+  // has usable data and must look at `failed` to see what is missing.
+  // 503 when nothing worked at all, because a page of thirteen holes is an
+  // outage and should not be dressed up as a successful response.
+  const status = failedKeys.length === 0 ? 200 : failedKeys.length === tasks.length ? 503 : 207;
+
+  res.status(status).json({
+    computedAt: new Date().toISOString(),
+    // Echoed so the caller can prove which window produced these figures
+    // rather than trusting that its own query string was honoured.
+    range: { from: range.from, to: range.to },
+    metrics: ok,
+    ...(failedKeys.length > 0 ? { failed } : {}),
+  });
 });
 
 // Pipeline state rather than a business number — see the caveat at the top of

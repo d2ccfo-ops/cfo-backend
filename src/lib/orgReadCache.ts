@@ -1,3 +1,4 @@
+import { invalidatePrecomputed } from "./precomputedStore.js";
 import { Redis } from "ioredis";
 import { env } from "../config/env.js";
 import { logger } from "./logger.js";
@@ -204,6 +205,11 @@ export async function writeCachedResponse(organizationId: string, variant: strin
  * triggered it — the TTL bounds the damage at 60 seconds.
  */
 export function invalidateOrgReads(organizationId: string): void {
+  // The durable store has no TTL underneath it, so this call is the ONLY thing
+  // that ends the life of a persisted answer. If it stops being reached, a
+  // stale figure survives indefinitely rather than for 60 seconds.
+  invalidatePrecomputed(organizationId);
+
   const named = [...registeredNames].map((name) => keyFor(name, organizationId));
   if (named.length > 0) cacheRedis.del(...named).catch(() => {});
 

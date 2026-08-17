@@ -9,6 +9,8 @@ import { repairSchedulerQueue, startRepairScheduler } from "./modules/queue/repa
 import { snapshotSchedulerQueue, startSnapshotScheduler } from "./modules/queue/snapshotScheduler.js";
 import { startSyncScheduler, syncSchedulerQueue } from "./modules/queue/syncScheduler.js";
 import { startSyncWorker } from "./modules/queue/syncWorker.js";
+import { startObservabilityRetention, stopObservabilityRetention } from "./modules/observability/retention.js";
+import { startSystemSampler, stopSystemSampler } from "./modules/observability/systemSampler.js";
 
 // Separate process from src/index.ts's HTTP server, deliberately. Running
 // sync jobs inline on the API server (the old behavior) meant a big backfill
@@ -46,6 +48,16 @@ const aiBriefScheduler = startAiBriefScheduler();
 // capture, deliberately. The snapshot should record the corrected belief
 // about yesterday, not the one repair exists to fix.
 const repairScheduler = startRepairScheduler();
+// Host sampling and observability retention, here rather than in the API for a
+// reason specific to each. The sampler must run EXACTLY once per machine, and
+// the API is four clustered processes that would each take an identical reading
+// of the same host every minute; this process is deliberately single. The
+// retention sweep is a bulk delete, and the API tier is the one place a
+// long-running statement must never land. Neither uses BullMQ — they need a
+// timer, not a distributed schedule, and a queue would add a Redis dependency
+// to the one job whose entire purpose is to still work when things are unwell.
+startSystemSampler();
+startObservabilityRetention();
 
 // A liveness socket, and nothing more. This process does no HTTP work — every
 // line above talks to Postgres and Redis — but a container platform decides
@@ -85,6 +97,10 @@ async function shutdown(signal: string) {
     // First, so the platform stops counting this instance as healthy while the
     // queues below are still draining.
     healthServer?.close();
+    // Timers before the Prisma disconnect below, or a sample already in flight
+    // writes into a client that is closing.
+    stopSystemSampler();
+    stopObservabilityRetention();
     // Closed before the connections they use. The schedulers go first so no
     // new sweep can enqueue work into a queue that is about to disappear.
     await scheduler.close();

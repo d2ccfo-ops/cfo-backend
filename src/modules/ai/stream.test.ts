@@ -324,7 +324,19 @@ describe("onEvent absent", () => {
 
   // Dates are the only legitimate difference between two runs of the same
   // scenario, and they are wall-clock, not behaviour.
-  const stable = (v: unknown) => JSON.stringify(v, (_k, value) => (value instanceof Date ? "<date>" : value));
+  //
+  // `this[key]`, NOT the `value` argument. JSON.stringify calls a Date's own
+  // toJSON() BEFORE handing the result to the replacer, so `value instanceof
+  // Date` is never true and the obvious version of this helper normalises
+  // nothing at all — it compared raw ISO strings and passed only when both runs
+  // landed on the same millisecond. Measured at roughly one failure in twelve
+  // full-suite runs. `this` is the holder object, and `this[key]` is the value
+  // before toJSON touched it. The same trap is documented in
+  // lib/orgReadCache.ts, which hit it first.
+  const stable = (v: unknown) =>
+    JSON.stringify(v, function (this: Record<string, unknown>, key: string, value: unknown) {
+      return this[key] instanceof Date ? "<date>" : value;
+    });
 
   it("produces an identical AskResult, identical writes and identical model calls", async () => {
     script.push(...scenario());

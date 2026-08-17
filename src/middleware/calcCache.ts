@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { readCachedResponse, writeCachedResponse } from "../lib/orgReadCache.js";
+import { isPersistable, readPrecomputed, writePrecomputed } from "../lib/precomputedStore.js";
 
 // Serves a metric endpoint's previous answer when nothing that feeds it has
 // changed. See the long note in lib/orgReadCache.ts for why this is the lever
@@ -45,6 +46,20 @@ function canonicalQuery(req: Request): string {
   return entries.map(([k, v]) => `${k}=${v}`).join("&");
 }
 
+/**
+ * The identity of an answer, built in ONE place.
+ *
+ * Exported because lib/precomputedStore.ts stores rows under this exact string.
+ * If the two ever built it separately they would drift, and a drifted key does
+ * not error — it silently stores rows nobody reads, so the durable cache would
+ * appear to work while doing nothing at all.
+ */
+export function variantKey(name: string, req: Request): string {
+  const scope = req.entityScope;
+  const scopeKey = `${scope?.legalEntityId ?? "-"}/${scope?.entityCount ?? "-"}`;
+  return `${name}|${scopeKey}|${canonicalQuery(req)}`;
+}
+
 export function calcCache(name: string) {
   return function calcCacheMiddleware(req: Request, res: Response, next: NextFunction): void {
     const organizationId = req.auth?.organizationId;
@@ -54,21 +69,43 @@ export function calcCache(name: string) {
       return;
     }
 
-    const scope = req.entityScope;
     // The resolved scope, including entityCount: a one-entity org that grows a
     // second entity changes what legalEntityId=null means, and that must not
     // be answered from a body computed under the old shape.
-    const scopeKey = `${scope?.legalEntityId ?? "-"}/${scope?.entityCount ?? "-"}`;
-    const variant = `${name}|${scopeKey}|${canonicalQuery(req)}`;
+    const variant = variantKey(name, req);
+    const persistable = isPersistable(name);
 
     readCachedResponse(organizationId, variant)
-      .then((hit) => {
+      .then(async (redisHit) => {
+        // Redis first, always — it is the faster of the two and holds the
+        // clock-driven metrics the durable store deliberately refuses.
+        let hit = redisHit;
+        let source = "hit";
+
+        if (hit === null && persistable) {
+          // SECOND CHANCE, and the reason this middleware changed at all.
+          // Redis' 60s TTL means an expensive metric is recomputed every
+          // minute for as long as anyone watches the page. This row survives
+          // that expiry and every restart, and only a write removes it.
+          const durable = await readPrecomputed(organizationId, variant);
+          if (durable !== null) {
+            hit = durable;
+            source = "warm";
+            // Put it back in Redis so the next sixty seconds are answered
+            // without touching Postgres at all.
+            writeCachedResponse(organizationId, variant, durable);
+          }
+        }
+
         if (hit !== null) {
           // Sent as a pre-serialised body rather than through res.json, which
           // would parse it only to stringify it again. The header is set by
           // hand for the same reason.
           res.setHeader("Content-Type", "application/json; charset=utf-8");
-          res.setHeader("X-Calc-Cache", "hit");
+          // "warm" distinguishes the durable store from Redis, so the two
+          // layers can be told apart from outside the server — the same way
+          // hit/miss already can.
+          res.setHeader("X-Calc-Cache", source);
           res.send(hit);
           return;
         }
@@ -81,7 +118,11 @@ export function calcCache(name: string) {
         res.json = ((body: unknown) => {
           if (res.statusCode === 200) {
             try {
-              void writeCachedResponse(organizationId, variant, JSON.stringify(body));
+              const serialised = JSON.stringify(body);
+              void writeCachedResponse(organizationId, variant, serialised);
+              // Only 200s, exactly as above: a persisted error would outlive
+              // the incident with no TTL to end it.
+              if (persistable) writePrecomputed(organizationId, variant, serialised);
             } catch {
               // A body that will not serialise is the handler's problem to
               // report, not this middleware's to swallow — fall through and

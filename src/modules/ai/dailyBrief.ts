@@ -225,6 +225,16 @@ export async function generateDailyBrief(
     if (existing) return readDailyBrief(organizationId, now);
   }
 
+  // What this brief actually spent. Declared out here, and read by `store`
+  // rather than passed to it, for one reason: a failure AFTER the model
+  // answered still cost money. The catch at the bottom of this function and
+  // the two discard paths (unsupported figures, PII) all store a null
+  // narrative, and every one of them has already been billed for the tokens
+  // that produced the narrative being thrown away. Those are the most
+  // important rows in this table — spend with nothing to show for it — and
+  // recording them as zero would hide exactly the waste worth finding.
+  let spent = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
   const store = async (narrative: BriefNarrative | null, reason: string | null, figuresChecked: number) => {
     // The row's OWN createdAt is returned, not `new Date()`. Reading a brief
     // back must produce the identical object the write produced, or the two
@@ -241,6 +251,7 @@ export async function generateDailyBrief(
         figuresChecked,
         model: env.AI_BRIEF_MODEL,
         version: DAILY_BRIEF_VERSION,
+        ...spent,
       },
       update: {
         narrative: (narrative ?? undefined) as never,
@@ -248,6 +259,7 @@ export async function generateDailyBrief(
         figuresChecked,
         model: env.AI_BRIEF_MODEL,
         version: DAILY_BRIEF_VERSION,
+        ...spent,
       },
     });
     return { day, narrative, reason, generatedAt: row.createdAt.toISOString(), figuresChecked, model: env.AI_BRIEF_MODEL };
@@ -283,6 +295,17 @@ export async function generateDailyBrief(
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: `Metrics as of ${day} (${timeZone}):\n\n${input}` }],
     });
+    // Stamped BEFORE anything can throw or discard below, so every path from
+    // here on carries the real cost. Same four counters as the agentic loop
+    // records — see lib/aiPricing.ts for why cache reads and cache writes are
+    // never folded into input.
+    spent = {
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+    };
+
     const text = response.content
       .filter((c): c is Anthropic.TextBlock => c.type === "text")
       .map((c) => c.text)

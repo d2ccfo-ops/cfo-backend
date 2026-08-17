@@ -2,6 +2,7 @@ import { getAuth } from "@clerk/express";
 import type { MembershipRole } from "@prisma/client";
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { markLastSeen } from "./lastSeen.js";
 import { enforceRateLimit } from "./rateLimit.js";
 import { enforceRbac, normaliseRole } from "./rbac.js";
 
@@ -45,7 +46,11 @@ declare global {
 // Two middlewares, always in this order, and the second one is why RBAC
 // cannot be forgotten on a new route: anything that authenticates is also
 // authorised. See the note at the top of middleware/rbac.ts.
-export const requireAuth = [resolveOrgContext, enforceRbac, enforceRateLimit];
+// markLastSeen is last, and belongs in this array for the same reason
+// enforceRbac does: a route added tomorrow is covered the moment it
+// authenticates. It is throttled and fire-and-forget, so it costs the request
+// nothing — see middleware/lastSeen.ts.
+export const requireAuth = [resolveOrgContext, enforceRbac, enforceRateLimit, markLastSeen];
 
 // Signed-in user, no organisation required. Exists for exactly one situation:
 // onboarding renders BEFORE the user has created an organisation, so an
