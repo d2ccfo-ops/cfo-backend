@@ -29,6 +29,7 @@ import { shopifyConnectionRouter } from "./routes/connections/shopify.js";
 import { zohoBooksConnectionRouter } from "./routes/connections/zohoBooks.js";
 import { healthRouter } from "./routes/health.js";
 import { telemetryRouter } from "./routes/telemetry.js";
+import { trackSession } from "./middleware/sessionTracker.js";
 import { demoLoginRouter } from "./routes/demoLogin.js";
 import { inventoryRouter } from "./routes/inventory.js";
 import { legalEntitiesRouter } from "./routes/legalEntities.js";
@@ -70,6 +71,24 @@ export function createApp() {
   // and /connections are one route, and only one of them matches a prefix
   // written without the slash.
   app.set("strict routing", false);
+
+  // EXACTLY ONE TRUSTED HOP, because there is exactly one: Caddy, on the same
+  // box, proxying to this container.
+  //
+  // Without this, req.ip is the Docker bridge address for every caller on
+  // earth. That is not only wrong for the session records this now feeds — it
+  // was already wrong for the rate limiter, which keys anonymous and
+  // unauthenticated traffic on req.ip and was therefore putting the entire
+  // internet in one bucket. Any single client could exhaust everyone's budget,
+  // and the graph of who was being limited was meaningless.
+  //
+  // The number matters and `true` would be a bug. Caddy APPENDS the peer
+  // address to X-Forwarded-For, so with one trusted hop Express takes the
+  // rightmost entry — the one Caddy wrote. `true` trusts the whole chain and
+  // takes the LEFTMOST, which is whatever the client typed: a caller could send
+  // `X-Forwarded-For: 1.2.3.4` and be rate-limited, logged and geolocated as
+  // that address instead of their own.
+  app.set("trust proxy", 1);
 
   // serializers, not just `logger`: pino-http installs pino-std-serializers by
   // default, whose req serializer logs originalUrl WITH the query string — so
@@ -164,6 +183,13 @@ export function createApp() {
   // Everything mounted after this point can read Clerk session state via
   // getAuth(req)/requireAuth from middleware/auth.ts.
   app.use(clerkMiddleware());
+
+  // WHO IS ON THE PRODUCT RIGHT NOW. Mounted here rather than inside
+  // requireAuth, so a user who has signed in but not yet chosen an organisation
+  // — the whole of onboarding — is visible too. Writes presence to Redis on
+  // every request and a durable row at most once a minute; nothing it does is
+  // awaited and nothing it does can fail a request. See sessionTracker.ts.
+  app.use(trackSession);
 
   // §27 rate limiting is NOT mounted here. It lives inside the requireAuth
   // chain (middleware/auth.ts), because a limiter mounted before

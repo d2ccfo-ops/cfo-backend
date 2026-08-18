@@ -2428,3 +2428,121 @@ model InternalOpsState {
 
   @@map("internal_ops_state")
 }
+
+// ---------------------------------------------------------------------------
+// WHO IS SIGNED IN, FROM WHERE, ON WHAT.
+//
+// Membership.lastSeenAt already answers "was this person here recently", and it
+// is deliberately coarse: one write per five minutes per person, no context.
+// That is the right shape for a DAU chart and useless for the question an
+// operator actually asks, which is "somebody just signed in — who, and does
+// that look like them".
+//
+// ONE ROW PER CLERK SESSION, not per person and not per request. Two browsers
+// is two rows, which is the point: a second session from a second country is
+// the signal, and a per-person row would average it away.
+//
+// signedInAt IS A REAL LOGIN. It is stamped the first time a session id is
+// seen, and never touched again — so it is the moment that session started
+// being used, not the moment of the newest request.
+// ---------------------------------------------------------------------------
+model UserSession {
+  id String @id @default(cuid())
+
+  /**
+   * Clerk's own session id. Unique, so a session is upserted rather than appended.
+   */
+  clerkSessionId String  @unique
+  clerkUserId    String
+  /**
+   * Null while a user is signed in but has not selected an organisation.
+   */
+  organizationId String?
+
+  signedInAt DateTime @default(now())
+  lastSeenAt DateTime
+  /**
+   * Authenticated requests attributed to this session. A crude activity weight.
+   */
+  requests   Int      @default(1)
+
+  /**
+   * The caller's address as the reverse proxy saw it.
+   * Trustworthy only because Express is configured with `trust proxy` 1 and
+   * Caddy APPENDS the peer address to X-Forwarded-For — so the rightmost entry
+   * is the one Caddy wrote and everything to its left is client-supplied. Any
+   * code here that took the leftmost entry would be recording an attacker's
+   * choice of address.
+   */
+  ip String?
+
+  /**
+   * APPROXIMATE, FROM IP, and every field here inherits that.
+   * IP geolocation is right about the country almost always and about the city
+   * often enough to be misleading — a mobile connection commonly resolves to
+   * the carrier's gateway in a different state. These are stored and rendered
+   * as "roughly where the address is registered", never as where the person is.
+   */
+  city        String?
+  region      String?
+  country     String?
+  countryCode String?
+  timezone    String?
+  /**
+   * The network the address belongs to: an ISP, a mobile carrier, or a datacenter.
+   */
+  network     String?
+  /**
+   * True when the address belongs to a hosting provider — i.e. probably a VPN or a bot.
+   */
+  hosting     Boolean?
+
+  /**
+   * Verbatim, because every parse below is a guess and this is the evidence.
+   */
+  userAgent  String?
+  browser    String?
+  os         String?
+  deviceKind String?
+
+  @@index([clerkUserId, signedInAt])
+  @@index([lastSeenAt])
+  @@index([organizationId, lastSeenAt])
+  @@map("user_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// IP -> PLACE, LOOKED UP ONCE.
+//
+// The lookup is a network call to a third party, and doing one per request
+// would put an internet round trip on the hot path and exhaust any free tier
+// within an hour. One row per address, reused forever — a handful of distinct
+// addresses covers every session this product will have for a long time.
+//
+// FAILURES ARE CACHED TOO, with their error. Otherwise an unreachable provider
+// is retried on every single request, turning one outage into a stall on every
+// authenticated call.
+// ---------------------------------------------------------------------------
+model IpGeo {
+  ip String @id
+
+  city        String?
+  region      String?
+  country     String?
+  countryCode String?
+  timezone    String?
+  network     String?
+  hosting     Boolean?
+
+  /**
+   * Which provider answered, so a wrong result can be attributed.
+   */
+  source     String
+  /**
+   * Set when the lookup failed. The row still exists, to stop a retry storm.
+   */
+  error      String?
+  lookedUpAt DateTime @default(now())
+
+  @@map("ip_geo")
+}

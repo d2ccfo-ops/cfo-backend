@@ -139,6 +139,20 @@ const schema = z.object({
   // billing account id this process has no way to know.
   GCP_BILLING_BQ_DATASET: z.string().optional(),
 
+  // Turning a customer's IP address into a place means sending that address to
+  // a third party. That is ordinary for operational session logging and it is
+  // still a disclosure, so it is a switch rather than an assumption. Off, the
+  // session record keeps the address and carries no place — it degrades, it does
+  // not break. IP_GEO_TOKEN buys a paid tier from the same provider; without one
+  // the free tier answers about a thousand distinct addresses a day, which is
+  // far more than this product will produce.
+  IP_GEO_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== "false")
+    .pipe(z.boolean()),
+  IP_GEO_TOKEN: z.string().optional(),
+
   BACKEND_URL: z.string().default("http://localhost:4000"),
   FRONTEND_URL: z.string().default("http://localhost:3000"),
 

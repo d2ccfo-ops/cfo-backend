@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../../lib/prisma.js";
 import { lookupUsers } from "../../lib/clerkDirectory.js";
+import { readPresence } from "../../middleware/sessionTracker.js";
 import { daysParam, since } from "./shared.js";
 
 export const internalUsersRouter = Router();
@@ -179,4 +180,185 @@ internalUsersRouter.get("/live", async (req, res) => {
 internalUsersRouter.get("/roles", async (_req, res) => {
   const rows = await prisma.membership.groupBy({ by: ["role"], _count: { _all: true } });
   res.json({ roles: rows.map((r) => ({ role: r.role, members: r._count._all })).sort((a, b) => b.members - a.members) });
+});
+
+/**
+ * WHO IS ON THE PRODUCT RIGHT NOW — presence, not history.
+ *
+ * Read from REDIS, not Postgres, and that is the whole point of the endpoint.
+ * /live above reads Membership.lastSeenAt, which is written at most once every
+ * five minutes; a "live" panel built on it is up to five minutes behind and
+ * cannot show somebody who signed in thirty seconds ago. This reads the key the
+ * session tracker sets on every single authenticated request, so it is current
+ * to the caller's last click.
+ *
+ * WHAT IT STILL CANNOT DO, said here so nobody expects otherwise: it sees
+ * REQUESTS. A person reading a page and not clicking generates none and stops
+ * moving. That ceiling belongs to the product, not the transport — which is why
+ * the console polls this every few seconds instead of holding a websocket open
+ * for an update that would not arrive any sooner.
+ */
+internalUsersRouter.get("/online", async (_req, res) => {
+  const presence = await readPresence();
+  const now = Date.now();
+
+  // The durable rows carry everything the Redis key does not: where the address
+  // resolves to, what browser, and — the one that matters — when this session
+  // actually started, as opposed to when it was last used.
+  const sessions = presence.length
+    ? await prisma.userSession.findMany({ where: { clerkSessionId: { in: presence.map((p) => p.sessionId) } } })
+    : [];
+  const byId = new Map(sessions.map((s) => [s.clerkSessionId, s]));
+
+  const userIds = [...new Set(presence.map((p) => p.userId))];
+  const orgIds = [...new Set(presence.map((p) => p.organizationId).filter((x): x is string => x !== null))];
+  const [directory, orgs] = await Promise.all([
+    lookupUsers(userIds),
+    orgIds.length ? prisma.organization.findMany({ where: { id: { in: orgIds } }, select: { id: true, name: true } }) : Promise.resolve([]),
+  ]);
+  const orgName = new Map(orgs.map((o) => [o.id, o.name]));
+
+  // "Have they been here from this country before" needs their history, not
+  // just this session. One query for every user currently online.
+  const priorCountries = userIds.length
+    ? await prisma.userSession.groupBy({ by: ["clerkUserId", "countryCode"], where: { clerkUserId: { in: userIds } } })
+    : [];
+  const seenCountries = new Map<string, Set<string>>();
+  for (const r of priorCountries) {
+    if (!r.countryCode) continue;
+    const set = seenCountries.get(r.clerkUserId) ?? new Set<string>();
+    set.add(r.countryCode);
+    seenCountries.set(r.clerkUserId, set);
+  }
+
+  const rows = presence
+    .map((p) => {
+      const s = byId.get(p.sessionId) ?? null;
+      const person = directory.get(p.userId);
+      const countries = seenCountries.get(p.userId);
+      return {
+        sessionId: p.sessionId,
+        clerkUserId: p.userId,
+        email: person?.email ?? null,
+        name: person?.name ?? null,
+        imageUrl: person?.imageUrl ?? null,
+        organizationId: p.organizationId,
+        organizationName: p.organizationId ? (orgName.get(p.organizationId) ?? null) : null,
+        /** Seconds since their last request. Zero means they are clicking right now. */
+        secondsSinceRequest: Math.max(0, Math.round((now - p.at) / 1000)),
+        lastPath: p.path,
+        signedInAt: s?.signedInAt.toISOString() ?? null,
+        // FROM REDIS, not from the durable row. The Postgres count is written
+        // at most once a minute and is therefore up to a minute behind; this
+        // one is exact as of the caller's last request, which is the whole
+        // reason this endpoint exists.
+        requests: p.requests,
+        /** The durable total, which lags. Shown apart so neither is mistaken for the other. */
+        recordedRequests: s?.requests ?? null,
+        ip: p.ip,
+        /**
+         * APPROXIMATE, and the field names say so nowhere so the console must.
+         * IP geolocation is right about the country almost always and about the
+         * city often enough to mislead — a mobile connection resolves to the
+         * carrier's gateway, which is regularly in another state.
+         */
+        city: s?.city ?? null,
+        region: s?.region ?? null,
+        country: s?.country ?? null,
+        countryCode: s?.countryCode ?? null,
+        timezone: s?.timezone ?? null,
+        network: s?.network ?? null,
+        /** Probably a VPN or a bot. Inferred from the network's name, so a guess. */
+        hosting: s?.hosting ?? null,
+        browser: s?.browser ?? null,
+        os: s?.os ?? null,
+        deviceKind: s?.deviceKind ?? null,
+        userAgent: s?.userAgent ?? null,
+        /**
+         * TRUE when this is the only country we have ever seen for them AND
+         * they have more than one session on record — i.e. a genuinely new
+         * place, not merely their first ever sign-in.
+         */
+        newCountryForUser:
+          s?.countryCode != null && countries != null && countries.size > 1,
+      };
+    })
+    .sort((a, b) => a.secondsSinceRequest - b.secondsSinceRequest);
+
+  res.json({
+    at: new Date().toISOString(),
+    /** Sessions, not people: two browsers is two rows, deliberately. */
+    sessions: rows.length,
+    people: new Set(rows.map((r) => r.clerkUserId)).size,
+    organizations: new Set(rows.map((r) => r.organizationId).filter(Boolean)).size,
+    /** Presence expires on its own after this long without a request. */
+    presenceTtlSeconds: 900,
+    online: rows,
+  });
+});
+
+/**
+ * SIGN-IN HISTORY.
+ *
+ * One row per Clerk session, newest first. signedInAt is stamped once, when the
+ * session id is first seen, and never updated — so this is a list of logins,
+ * not a list of "most recent activity", which lastSeenAt already covers.
+ */
+internalUsersRouter.get("/sessions", async (req, res) => {
+  const days = daysParam(req, 30, 365);
+  const from = since(days * DAY_MS);
+
+  const [rows, first] = await Promise.all([
+    prisma.userSession.findMany({ where: { signedInAt: { gte: from } }, orderBy: { signedInAt: "desc" }, take: 300 }),
+    prisma.userSession.findFirst({ orderBy: { signedInAt: "asc" }, select: { signedInAt: true } }),
+  ]);
+
+  const userIds = [...new Set(rows.map((r) => r.clerkUserId))];
+  const orgIds = [...new Set(rows.map((r) => r.organizationId).filter((x): x is string => x !== null))];
+  const [directory, orgs] = await Promise.all([
+    lookupUsers(userIds),
+    orgIds.length ? prisma.organization.findMany({ where: { id: { in: orgIds } }, select: { id: true, name: true } }) : Promise.resolve([]),
+  ]);
+  const orgName = new Map(orgs.map((o) => [o.id, o.name]));
+
+  // Which (user, country) pairs have been seen before this row. Computed over
+  // the whole table rather than the window, so a sign-in from a country that is
+  // new IN THIS WINDOW but familiar overall is not flagged as new.
+  const everSeen = await prisma.userSession.groupBy({
+    by: ["clerkUserId", "countryCode"],
+    _min: { signedInAt: true },
+  });
+  const firstSeenIn = new Map(
+    everSeen.filter((r) => r.countryCode).map((r) => [`${r.clerkUserId}|${r.countryCode}`, r._min.signedInAt?.getTime() ?? 0]),
+  );
+
+  res.json({
+    windowDays: days,
+    /** Recording began here. An empty list before this is absence, not calm. */
+    recordingSince: first?.signedInAt.toISOString() ?? null,
+    sessions: rows.map((r) => {
+      const person = directory.get(r.clerkUserId);
+      const key = `${r.clerkUserId}|${r.countryCode}`;
+      return {
+        id: r.id,
+        clerkSessionId: r.clerkSessionId,
+        clerkUserId: r.clerkUserId,
+        email: person?.email ?? null,
+        name: person?.name ?? null,
+        imageUrl: person?.imageUrl ?? null,
+        organizationId: r.organizationId,
+        organizationName: r.organizationId ? (orgName.get(r.organizationId) ?? null) : null,
+        signedInAt: r.signedInAt.toISOString(),
+        lastSeenAt: r.lastSeenAt.toISOString(),
+        requests: r.requests,
+        ip: r.ip,
+        city: r.city, region: r.region, country: r.country, countryCode: r.countryCode,
+        timezone: r.timezone, network: r.network, hosting: r.hosting,
+        browser: r.browser, os: r.os, deviceKind: r.deviceKind, userAgent: r.userAgent,
+        /** This session is the FIRST this person ever signed in from that country. */
+        firstFromThisCountry:
+          r.countryCode != null && firstSeenIn.get(key) === r.signedInAt.getTime(),
+      };
+    }),
+  });
 });
